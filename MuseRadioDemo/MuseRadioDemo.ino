@@ -1049,10 +1049,10 @@ void setup() {
 //  tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_WHITE);
-  drawImage("/raspiaudio.png", 40, 100);
+  drawImage("/raspiaudio.png", 0, 0);
   tft.setTextColor(TFT_BLUE, TFT_WHITE);
   tft.drawString(version, 280, 220, 2);
-  delay(2000);
+  delay(1000);
 
 if (mode == '0') {
   // 4G activation  
