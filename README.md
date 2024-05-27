@@ -8,3 +8,7 @@ Upload your data directory unsing the LittleFS, you might need to use the hidden
 to load a precompiled firmware using ESPtool use the command adjusted with you serial com port and file name:
 
 esptool -p COM16 -b 1000000 write_flash 0 myfirmware.bin
+
+To recompile use following Arduino parameters:
+![Arduino Compilation Parameters](Arduino%20compilation%20parameters.png)
+
