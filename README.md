@@ -10,5 +10,8 @@ to load a precompiled firmware using ESPtool use the command adjusted with you s
 esptool -p COM16 -b 1000000 write_flash 0 myfirmware.bin
 
 To recompile use following Arduino parameters:
+
+
+
 ![Arduino Compilation Parameters](Arduino%20compilation%20parameters.png)
 
