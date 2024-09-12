@@ -26,7 +26,7 @@ PNG png;
 #include <IRrecv.h>
 #include <IRutils.h>
 
-#define version "V0.0"
+#define version "V1.0"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
