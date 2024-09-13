@@ -67,7 +67,7 @@ PNG png;
 #define sw2             2
 #define sw3             3
 
-static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPIAUDIO/ota/main/maria4GLast.ota";
+static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPIAUDIO/ota/main/RadioLast.ota";
 
 xTaskHandle radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiInitH;
 
@@ -1046,7 +1046,7 @@ void WiFiConnected(const char *ssid, const char *password)
 }
 static void improvWiFiInit(void* data)
 {
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "RadioMaria", "1.0", "Raspiaudio Radio");  
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.0", "Raspiaudio Radio");  
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
 
