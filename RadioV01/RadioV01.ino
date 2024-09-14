@@ -2,7 +2,7 @@
 #include <Audio.h>
 #include <LittleFS.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>    //////////////////////////////////
+#include <WiFiMulti.h>
 #include <Wire.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
@@ -14,8 +14,9 @@
 #include "qrcodeR.h"
 #include <Arduino_ESP32_OTA.h>
 #include "root_ca.h"
-
 //#include "USB.h"
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 
 
@@ -73,7 +74,7 @@ xTaskHandle radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiIn
 
 
 Arduino_ESP32_OTA ota;
-Arduino_ESP32_OTA::Error ota_err = Arduino_ESP32_OTA::Error::None; 
+Arduino_ESP32_OTA::Error ota_err = Arduino_ESP32_OTA::Error::None;
 
 Audio audio;
 WiFiMulti wifiMulti;              //////////////////////////////////////
@@ -104,8 +105,8 @@ bool Bdonate = false;
 #define TEMPO 30000
 int displayT = TEMPO;
 
-  IRrecv irrecv(IR);
-  decode_results results;
+IRrecv irrecv(IR);
+decode_results results;
 
 void displayON(void)
 {
@@ -132,10 +133,10 @@ uint8_t ES8388_Write_Reg(uint8_t reg, uint8_t val)
 // init CODEC chip ES8388 (via I2C)
 //
 ////////////////////////////////////////////////////////////////////
-// 
+//
 int ES8388_Init(void)
 {
-// provides MCLK
+  // provides MCLK
   //    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);
   //    WRITE_PERI_REG(PIN_CTRL, READ_PERI_REG(PIN_CTRL)& 0xFFFFFFF0);
   int st;
@@ -196,7 +197,7 @@ int ES8388_Init(void)
   ES8388_Write_Reg(10, 0xFC);
   ES8388_Write_Reg(11, 0x02);
 
-  
+
   //Select LIN2and RIN2 as differential input pairs
   //ES8388_Write_Reg(11,0x82);
 
@@ -222,8 +223,8 @@ int ES8388_Init(void)
   ES8388_Write_Reg( 0x16, 0xc3); // Reg 0x16 = 0xc3(nose gate = -40.5dB, NGG = 0x01(mute ADC))
   ES8388_Write_Reg( 0x02, 0x55); // Reg 0x16 = 0x55 (Start up DLL, STM and Digital block for recording);
 
- // ES8388_Write_Reg(3, 0x09);
- ES8388_Write_Reg(3, 0x00);
+  // ES8388_Write_Reg(3, 0x09);
+  ES8388_Write_Reg(3, 0x00);
 
   // reset power DAC and ADC
   st += ES8388_Write_Reg(2 , 0xF0);
@@ -236,7 +237,7 @@ int ES8388_Init(void)
   st += ES8388_Write_Reg(46, 15);
   st += ES8388_Write_Reg(47, 15);
   st += ES8388_Write_Reg(48, 33);
-  st += ES8388_Write_Reg(49, 33);   
+  st += ES8388_Write_Reg(49, 33);
   return st;
 
 }
@@ -244,13 +245,13 @@ int ES8388_Init(void)
 
 int delay1 = 10;
 int delay2 = 500;
-i2s_pin_config_t pin_configR=
-      {
-        .bck_io_num   =   I2S_BCLK,     
-        .ws_io_num    =   I2S_LRC ,     
-        .data_out_num =   I2S_DOUT,  
-        .data_in_num  =   I2S_DIN     
-      };
+i2s_pin_config_t pin_configR =
+{
+  .bck_io_num   =   I2S_BCLK,
+  .ws_io_num    =   I2S_LRC ,
+  .data_out_num =   I2S_DOUT,
+  .data_in_num  =   I2S_DIN
+};
 
 int station = 0;
 int previousStation;
@@ -297,7 +298,7 @@ bool jaugeB = false;
 
 
 #define MAX_IMAGE_WDITH 320
-#define TFT_GREY 0x5AEB    
+#define TFT_GREY 0x5AEB
 #define TFT_STATION 0x2BFF
 
 TFT_eSPI tft = TFT_eSPI();
@@ -315,49 +316,49 @@ ESP32Encoder staEncoder;
 ////////////////////////////////////////////////////////////////////////
 
 void ES8388vol_Set(uint8_t volx)
-{ 
-  
-// mute
-    ES8388_Write_Reg(25, 0x04);  
-#define lowVol   16 
+{
+
+  // mute
+  ES8388_Write_Reg(25, 0x04);
+#define lowVol   16
   if (volx > maxVol) volx = maxVol;
   if (volx == 0)ES8388_Write_Reg(25, 0x04); else ES8388_Write_Reg(25, 0x00);
 
-//    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);    
-//    printf("VOLX = %d  %d\n",volx, jackON);
-    if(jackON == true)
-    {
-// LOUT2/ROUT2    
+  //    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);
+  //    printf("VOLX = %d  %d\n",volx, jackON);
+  if (jackON == true)
+  {
+    // LOUT2/ROUT2
     audio.setVolume(maxVol);
-    ES8388_Write_Reg(46, 0);    
+    ES8388_Write_Reg(46, 0);
     ES8388_Write_Reg(47, 0);
-    ES8388_Write_Reg(48, volx+2);    
-    ES8388_Write_Reg(49, volx+2);    
-    }
-    else
-    {
-// ROUT1/LOUT1   
-    ES8388_Write_Reg(48, 0);    
+    ES8388_Write_Reg(48, volx + 2);
+    ES8388_Write_Reg(49, volx + 2);
+  }
+  else
+  {
+    // ROUT1/LOUT1
+    ES8388_Write_Reg(48, 0);
     ES8388_Write_Reg(49, 0);
-    if(volx > lowVol)
+    if (volx > lowVol)
     {
       audio.setVolume(maxVol);
-      ES8388_Write_Reg(46, volx+2);    
-      ES8388_Write_Reg(47, volx+2);    
+      ES8388_Write_Reg(46, volx + 2);
+      ES8388_Write_Reg(47, volx + 2);
     }
     else
     {
-      audio.setVolume(maxVol*volx/lowVol);
+      audio.setVolume(maxVol * volx / lowVol);
       ES8388_Write_Reg(46, lowVol);
-      ES8388_Write_Reg(47, lowVol);      
+      ES8388_Write_Reg(47, lowVol);
     }
-    }
-// RDAC/LDAC (digital)       
-    ES8388_Write_Reg(26, 0x00);
-    ES8388_Write_Reg(27, 0x00);   
-// unmute
-    ES8388_Write_Reg(25, 0x00);
-    
+  }
+  // RDAC/LDAC (digital)
+  ES8388_Write_Reg(26, 0x00);
+  ES8388_Write_Reg(27, 0x00);
+  // unmute
+  ES8388_Write_Reg(25, 0x00);
+
 }
 //////////////////////////////////////////////////////////////////////////
 // Print the header for a display screen
@@ -376,7 +377,7 @@ void headerL(const char *string1, const char *string2, uint16_t color)
   tft.fillScreen(color);
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE
-  , TFT_BLUE);
+                   , TFT_BLUE);
   tft.fillRect(0, 0, 320, 60, TFT_BLUE);
   tft.setTextDatum(TC_DATUM);
   tft.drawString(string1, 160, 10, 4);
@@ -388,13 +389,13 @@ void headerL(const char *string1, const char *string2, uint16_t color)
 ////////////////////////////////////////////////////////////////////////////////////////
 void refreshVolume(void)
 {
-// audio.setVolume(vol, 0);  
-  if(gpio_get_level(JACK_DETECT) == 1)
+  // audio.setVolume(vol, 0);
+  if (gpio_get_level(JACK_DETECT) == 1)
   {
-    if(vol == 0) gpio_set_level(PA, 0);
+    if (vol == 0) gpio_set_level(PA, 0);
     else gpio_set_level(PA, 1);
   }
-  audio.setVolume(maxVol/2, 0);
+  audio.setVolume(maxVol / 2, 0);
   ES8388vol_Set(vol);
 }
 
@@ -418,11 +419,11 @@ void drawImage(char* f, int x, int y)
 {
   xpos = x; ypos = y;
   int16_t rc = png.open(f, pngOpen, pngClose, pngRead, pngSeek, pngDraw);
-  printf("%s\n",f);
-//  printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType());   
+  printf("%s\n", f);
+  //  printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType());
   if (rc == PNG_SUCCESS) {
     tft.startWrite();
-    printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType());    
+    printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType());
     rc = png.decode(NULL, 0);
     png.close();
     tft.endWrite();
@@ -432,19 +433,19 @@ void drawImage(char* f, int x, int y)
 
 }
 //////////////////////////////////////////////////////////////////////
-//adc buttons 
+//adc buttons
 //////////////////////////////////////////////////////////////////////
 
 int button_get_level(int nb)
 {
-#define THRESHOLD 200  
+#define THRESHOLD 200
 #define maxB 3
   static int adcB[] = {1850, 2350, 450, 930};
   int adcValue, V;
-  if((nb > maxB) || (nb < 0))return -1;
-  adcValue = analogRead(KEYs_ADC);  
+  if ((nb > maxB) || (nb < 0))return -1;
+  adcValue = analogRead(KEYs_ADC);
   V = adcB[nb];
-  if(abs(V - adcValue) < THRESHOLD ) return 0; else return 1; 
+  if (abs(V - adcValue) < THRESHOLD ) return 0; else return 1;
 }
 
 ///////////////////////////////////////////////////////////////////////
@@ -456,7 +457,7 @@ static void keyb(void* pdata)
 
   while (1)
   {
-//   printf("CLICK1 = %d   CLICK2 = %d\n", gpio_get_level(CLICK1), gpio_get_level(CLICK2));
+    //   printf("CLICK1 = %d   CLICK2 = %d\n", gpio_get_level(CLICK1), gpio_get_level(CLICK2));
     if ((gpio_get_level(CLICK1) == 0) && (CLICK1B == false)) CLICK1E = true;
     if ((gpio_get_level(CLICK1) == 1) && (CLICK1E == true)) {
       CLICK1B = true;
@@ -472,9 +473,15 @@ static void keyb(void* pdata)
     }
 
 
-    if(REMOTE_KEY == MUTE_rem){muteB = true; REMOTE_KEY = 0;}
-    if(REMOTE_KEY == OK_rem){CLICK2B = true; REMOTE_KEY = 0;}
- 
+    if (REMOTE_KEY == MUTE_rem) {
+      muteB = true;
+      REMOTE_KEY = 0;
+    }
+    if (REMOTE_KEY == OK_rem) {
+      CLICK2B = true;
+      REMOTE_KEY = 0;
+    }
+
     delay(100);
   }
 }
@@ -504,8 +511,8 @@ char* Rlink(int st)
     i++;
   } while (b[i - 1] != 0x0a);
   b[i - 1] = 0;
-//to suppress extra char 0x0d (rc)  (for Windows users) 
-  if(b[i - 2] == 0x0d) b[i - 2] = 0;    
+  //to suppress extra char 0x0d (rc)  (for Windows users)
+  if (b[i - 2] == 0x0d) b[i - 2] = 0;
   ln.close();
   return b;
 }
@@ -533,8 +540,8 @@ char* Rname(int st)
     i++;
   } while (b[i - 1] != 0x0a);
   b[i - 1] = 0;
-//to suppress extra char 0x0d (rc)  (for Windows users) 
-  if(b[i - 2] == 0x0d) b[i - 2] = 0;      
+  //to suppress extra char 0x0d (rc)  (for Windows users)
+  if (b[i - 2] == 0x0d) b[i - 2] = 0;
   ln.close();
   return b;
 }
@@ -589,15 +596,15 @@ static void playRadio(void* data)
       audio.connecttohost(linkS);
       previousStation = station;
       refreshVolume();
-      tft.setRotation(1);  
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK); 
+      tft.setRotation(1);
+      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
       tft.setTextColor(TFT_STATION);
       tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(station), 180, 105, 4);  
-  
-  //    staEncoder.setCount(station);
+      tft.drawString(Rname(station), 180, 105, 4);
+
+      //    staEncoder.setCount(station);
       if (connected == false) delay(50);
-      toDisplay = 2;  
+      toDisplay = 2;
     }
     audio.loop();
     delay(1);
@@ -607,38 +614,38 @@ static void playRadio(void* data)
 // Task managing the audio jack
 //////////////////////////////////////////////////////////////////
 static void jack(void* data)
-{ 
-  while(true)
+{
+  while (true)
   {
-    //printf("----------------- %d\n",gpio_get_level(JACK_DETECT));   
+    //printf("----------------- %d\n",gpio_get_level(JACK_DETECT));
 
-  if(gpio_get_level(JACK_DETECT) == 0) 
-  {
-   
-    if(jackON == false)
+    if (gpio_get_level(JACK_DETECT) == 0)
     {
-    printf("Jack ON\n");
-    gpio_set_level(PA, 0);          // amp off   
-    ES8388_Write_Reg(29, 0x00);     // stereo
-    ES8388_Write_Reg(28, 0x08);     // no phase inversion + click free power up/down
-    ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2     
-    jackON = true;   
-    refreshVolume();
+
+      if (jackON == false)
+      {
+        printf("Jack ON\n");
+        gpio_set_level(PA, 0);          // amp off
+        ES8388_Write_Reg(29, 0x00);     // stereo
+        ES8388_Write_Reg(28, 0x08);     // no phase inversion + click free power up/down
+        ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2
+        jackON = true;
+        refreshVolume();
+      }
     }
-  }
-  else
-  {
-    if(jackON == true)
+    else
     {
-    printf("Jack OFF\n");
-    gpio_set_level(PA, 1);          // amp on
-    ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
-    ES8388_Write_Reg(28, 0x18);     // Right DAC phase inversion + click free power up/down    
-    ES8388_Write_Reg(4, 0x30);      // Rout1/Lout1    
-    jackON = false;
-    refreshVolume();
+      if (jackON == true)
+      {
+        printf("Jack OFF\n");
+        gpio_set_level(PA, 1);          // amp on
+        ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
+        ES8388_Write_Reg(28, 0x18);     // Right DAC phase inversion + click free power up/down
+        ES8388_Write_Reg(4, 0x30);      // Rout1/Lout1
+        jackON = false;
+        refreshVolume();
+      }
     }
-  } 
     delay(1000);
   }
 }
@@ -650,54 +657,54 @@ static void battery(void* data)
 {
 #define nominalVal 2700
 #define alertVal  350
-#define zeroVal   2000  
-  
+#define zeroVal   2000
+
   int adcValue;
   int PadcValue = 0;
   bool display;
- 
-  while(true)
+
+  while (true)
   {
     display = false;
-    adcValue = analogRead(BAT_GAUGE_PIN)- zeroVal;   
- /*   
-    printf("adcValue = %d\n", adcValue);
-    tft.fillRect(140, 50, 30, 20, TFT_BLACK);
-    tft.setCursor(140, 50);
-    tft.println(adcValue);
- */   
-    if((gpio_get_level(USB_DETECT) == 1) && (PadcValue != 1))
+    adcValue = analogRead(BAT_GAUGE_PIN) - zeroVal;
+    /*
+       printf("adcValue = %d\n", adcValue);
+       tft.fillRect(140, 50, 30, 20, TFT_BLACK);
+       tft.setCursor(140, 50);
+       tft.println(adcValue);
+    */
+    if ((gpio_get_level(USB_DETECT) == 1) && (PadcValue != 1))
     {
-      display = true;   
-      PadcValue = 1;  
+      display = true;
+      PadcValue = 1;
     }
 
-    if(gpio_get_level(USB_DETECT) == 0)
+    if (gpio_get_level(USB_DETECT) == 0)
     {
-      if((PadcValue > (adcValue * 110 /100)) || (PadcValue < (adcValue * 90 / 100)))
+      if ((PadcValue > (adcValue * 110 / 100)) || (PadcValue < (adcValue * 90 / 100)))
       {
         display = true;
         PadcValue = adcValue;
       }
     }
-    
-  if(display == true)
- {     
-    tft.setRotation(1); 
-    tft.fillCircle(280, 35, 40, TFT_BLACK);
-    tft.fillRect(260, 25, 32, 18,TFT_WHITE);
-    tft.fillRect(292, 30, 4, 8,TFT_WHITE);
-    if(gpio_get_level(USB_DETECT) == 0)
-      if(adcValue > alertVal)
-        tft.fillRect(263, 28, 26*adcValue/(nominalVal - zeroVal), 12, TFT_BLUE);
-      else
-        tft.fillRect(263, 28, 26*adcValue/(nominalVal - zeroVal), 12, TFT_RED);      
-    else
+
+    if (display == true)
     {
-      tft.fillTriangle(264,34,280,34,280,40, TFT_GREY);
-      tft.fillTriangle(272,34,272,28,288,34, TFT_GREY);
+      tft.setRotation(1);
+      tft.fillCircle(280, 35, 40, TFT_BLACK);
+      tft.fillRect(260, 25, 32, 18, TFT_WHITE);
+      tft.fillRect(292, 30, 4, 8, TFT_WHITE);
+      if (gpio_get_level(USB_DETECT) == 0)
+        if (adcValue > alertVal)
+          tft.fillRect(263, 28, 26 * adcValue / (nominalVal - zeroVal), 12, TFT_BLUE);
+        else
+          tft.fillRect(263, 28, 26 * adcValue / (nominalVal - zeroVal), 12, TFT_RED);
+      else
+      {
+        tft.fillTriangle(264, 34, 280, 34, 280, 40, TFT_GREY);
+        tft.fillTriangle(272, 34, 272, 28, 288, 34, TFT_GREY);
+      }
     }
- }
     display = false;
     delay(10000);
   }
@@ -707,17 +714,17 @@ static void battery(void* data)
 ////////////////////////////////////////////////////////////////////////
 static void remote(void* data)
 {
-  while(true)
+  while (true)
   {
     if (irrecv.decode(&results)) {
-    if(results.decode_type == NEC)
-    {
-      uint32_t v = results.value;
-      if(v != 0xffffffff)REMOTE_KEY = v & 0xFFFF;
+      if (results.decode_type == NEC)
+      {
+        uint32_t v = results.value;
+        if (v != 0xffffffff)REMOTE_KEY = v & 0xFFFF;
+      }
+      irrecv.resume();  // Receive the next value
     }
-    irrecv.resume();  // Receive the next value
-  }
-  delay(100);     
+    delay(100);
   }
 }
 //////////////////////////////////////////////////////////////////////
@@ -725,11 +732,11 @@ static void remote(void* data)
 ////////////////////////////////////////////////////////////////////////
 static void displayONOFF(void* data)
 {
-  while(true)
+  while (true)
   {
     displayT -= 100;
-    if(displayT > 0) gpio_set_level(backLight, 1); else gpio_set_level(backLight, 0);
-    delay(100); 
+    if (displayT > 0) gpio_set_level(backLight, 1); else gpio_set_level(backLight, 0);
+    delay(100);
   }
 }
 ////////////////////////////////////////////////////////////////////
@@ -737,47 +744,47 @@ static void displayONOFF(void* data)
 ////////////////////////////////////////////////////////////////////
 void retrieveDisplay(void)
 {
- 
-// draw "wallpaper screen" and internet source
-      tft.setRotation(2);
-      tft.fillScreen(TFT_BLACK);
-      drawImage("/screenV.png", 0, 5);  
-      tft.setRotation(1);
-      tft.fillCircle(50, 50, 40, TFT_BLACK);
-      tft.setTextColor(TFT_WHITE);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawCircle(50, 35, 18, TFT_WHITE);
-      if(mode == '0')  tft.drawString("4G", 50, 27, 2);   
-      else tft.drawString("WiFi", 50, 27, 2);  
-      tft.setTextColor(TFT_GREY, TFT_BLACK);
-      tft.drawString(version, 300, 220, 2);       
- // restart battery display and display on/off     
-      xTaskCreatePinnedToCore(battery, "battery", 5000, NULL, 5, &batteryH, 1);      
-      xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);     
- // write station name         
-      tft.setRotation(1);  
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK); 
-      tft.setTextColor(TFT_STATION);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(station), 180, 105, 4);     
- // draw mute/unmute icon     
-      if(muteON == true)
-      {
-        tft.setRotation(1);
-        tft.fillRect(80, 180, 160, 40, TFT_BLACK);  
-        tft.fillCircle(160, 190, 17, TFT_WHITE);
-        tft.fillTriangle(150, 175, 150, 205, 175, 190, TFT_GREY);
-        jaugeB = false;    
-      }
-      else
-      {
-        tft.setRotation(1);
-        tft.fillRect(80, 180, 160, 40, TFT_BLACK);  
-        tft.fillCircle(160, 190, 17, TFT_WHITE);             
-        tft.fillRect(150, 179, 21, 24, TFT_GREY);
-        tft.fillRect(156, 175, 9, 30, TFT_WHITE);
-        jaugeB = false;      
-      }
+
+  // draw "wallpaper screen" and internet source
+  tft.setRotation(2);
+  tft.fillScreen(TFT_BLACK);
+  drawImage("/screenV.png", 0, 5);
+  tft.setRotation(1);
+  tft.fillCircle(50, 50, 40, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawCircle(50, 35, 18, TFT_WHITE);
+  if (mode == '0')  tft.drawString("4G", 50, 27, 2);
+  else tft.drawString("WiFi", 50, 27, 2);
+  tft.setTextColor(TFT_GREY, TFT_BLACK);
+  tft.drawString(version, 300, 220, 2);
+  // restart battery display and display on/off
+  xTaskCreatePinnedToCore(battery, "battery", 5000, NULL, 5, &batteryH, 1);
+  xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);
+  // write station name
+  tft.setRotation(1);
+  tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+  tft.setTextColor(TFT_STATION);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString(Rname(station), 180, 105, 4);
+  // draw mute/unmute icon
+  if (muteON == true)
+  {
+    tft.setRotation(1);
+    tft.fillRect(80, 180, 160, 40, TFT_BLACK);
+    tft.fillCircle(160, 190, 17, TFT_WHITE);
+    tft.fillTriangle(150, 175, 150, 205, 175, 190, TFT_GREY);
+    jaugeB = false;
+  }
+  else
+  {
+    tft.setRotation(1);
+    tft.fillRect(80, 180, 160, 40, TFT_BLACK);
+    tft.fillCircle(160, 190, 17, TFT_WHITE);
+    tft.fillRect(150, 179, 21, 24, TFT_GREY);
+    tft.fillRect(156, 175, 9, 30, TFT_WHITE);
+    jaugeB = false;
+  }
 
 }
 
@@ -785,17 +792,17 @@ void retrieveDisplay(void)
 
 void settingsDisplay(int pos)
 {
-  tft.setTextDatum(TL_DATUM); 
+  tft.setTextDatum(TL_DATUM);
   /*
-  if(pos == 0)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);    
-  tft.drawString("- 4G", 110, 90, 4);
-  if(pos > 1) tft.setTextColor(TFT_GREEN);else tft.setTextColor(TFT_WHITE);  
-  tft.drawString("- WiFi :", 110, 140, 4);
+    if(pos == 0)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
+    tft.drawString("- 4G", 110, 90, 4);
+    if(pos > 1) tft.setTextColor(TFT_GREEN);else tft.setTextColor(TFT_WHITE);
+    tft.drawString("- WiFi :", 110, 140, 4);
   */
-  if(pos == 0)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);    
-  tft.drawString("- New connection", 10, 90, 4); 
-  if(pos == 1)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);  
-  tft.drawString("- Dismiss", 10, 140, 4);   
+  if (pos == 0)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
+  tft.drawString("- New connection", 10, 90, 4);
+  if (pos == 1)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
+  tft.drawString("- Dismiss", 10, 140, 4);
 }
 ///////////////////////////////////////////////////////////////////////
 // settings init
@@ -805,217 +812,217 @@ void settings(void)
   int j;
   int pos;
   char charSet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
-  gpio_set_level(backLight, 1);  
+  gpio_set_level(backLight, 1);
   printf("SETTINGS!!!\n");
   tft.setRotation(1);
   headerL("SETTINGS", "1- Select your WiFi access", TFT_NAVY);
   settingsDisplay(0);
-//  delay(2000);
+  //  delay(2000);
   pos = 0;
   staEncoder.setCount(0);
-  while(gpio_get_level(CLICK2) == 1)
+  while (gpio_get_level(CLICK2) == 1)
   {
-/*    
-    if(button_get_level(sw0) == 0)
-    {
-      if(button_get_level(sw0) == 0) delay(50);
-      retrieveDisplay(); 
-      return;
-    }
-*/    
+    /*
+        if(button_get_level(sw0) == 0)
+        {
+          if(button_get_level(sw0) == 0) delay(50);
+          retrieveDisplay();
+          return;
+        }
+    */
     int V;
     V = staEncoder.getCount();
-    if(V > 0)
+    if (V > 0)
     {
       pos++;
-      if(pos > 1)pos = 1;
-      settingsDisplay(pos);  
-      staEncoder.setCount(0);  
+      if (pos > 1)pos = 1;
+      settingsDisplay(pos);
+      staEncoder.setCount(0);
     }
 
-    if(V < 0)
+    if (V < 0)
     {
       pos--;
-      if(pos < 0) pos = 0;
-      settingsDisplay(pos);    
-      staEncoder.setCount(0);  
-    }  
-    delay(100);  
+      if (pos < 0) pos = 0;
+      settingsDisplay(pos);
+      staEncoder.setCount(0);
+    }
+    delay(100);
   }
-  
+
 
   uint8_t bm = 0x31;
   File ln = LittleFS.open("/mode", FILE_WRITE);
   ln.write(&bm, 1);
-  ln.close();  
-  
-  if(pos == 0)
-  {
-  headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);    
-  tft.setTextColor(TFT_RED);
-  tft.setTextDatum(TC_DATUM);
-  tft.setFreeFont(FSB9);
-  tft.drawString("First, select your SSID", 160, 60, GFXFF);
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(500);
-
-  int nSsid = WiFi.scanNetworks();
-  printf("ssid# %d\n", nSsid);
-  if (nSsid > 6) nSsid = 6;
-  staEncoder.setCount(0);
-  while (gpio_get_level(CLICK2) == 1)
-  {
-    for (int i = 0; i < nSsid; i++)
-    {
-      j = staEncoder.getCount()/2;
-      if (j > (nSsid - 1)) {
-        j = nSsid - 1;
-        staEncoder.setCount(j);
-      }
-      if (j < 0) {
-        j = 0;
-        staEncoder.setCount(j);
-      }
-      printf("j = %d\n", j);
-      tft.setTextDatum(TL_DATUM);
-      if (i == j)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
-      tft.setFreeFont(FSB12);
-      sprintf(s, "%d- %s", i + 1, WiFi.SSID(i).c_str());
-      tft.drawString(s, 20, 80 + i * 25, GFXFF);
-    }
-    delay(100);
-  }
-  strcpy((char*)ssid, WiFi.SSID(j).c_str());
-  printf("ssid = %s\n", ssid);  
-  ln = LittleFS.open("/ssid", FILE_WRITE);
-  ln.write(ssid, strlen((char*)ssid) + 1);
   ln.close();
-  
-  delay(1000);
-  headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);    
-  tft.setTextColor(TFT_RED);
-  tft.setTextDatum(TC_DATUM);
-  tft.setFreeFont(FSB9);
-  tft.drawString("Then, Enter your password", 160, 60, GFXFF);
-  c[1] = 0;
-  pwd[0] = 0;
-  staEncoder.setCount(0);
-  Bvalid = false;
-  while( (button_get_level(sw3) == 1) && (Bvalid == false))
+
+  if (pos == 0)
   {
-    tft.setTextColor(TFT_YELLOW);
-    tft.setTextDatum(TL_DATUM);
-    tft.setFreeFont(FSB12);
-    tft.drawString("ssid:", 20, 80, GFXFF);
-    tft.setTextColor(TFT_GREEN);
-    tft.drawString((char*)ssid, 80, 80, GFXFF);
-    tft.setTextColor(TFT_YELLOW);
-    tft.fillRect(20, 120, 300, 30, TFT_NAVY);
-    tft.drawString("pwd:", 20, 120, GFXFF);
-    tft.setTextColor(TFT_GREEN);
-    tft.drawString((char*)pwd, 80, 120, GFXFF);
+    headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
+    tft.setTextColor(TFT_RED);
+    tft.setTextDatum(TC_DATUM);
+    tft.setFreeFont(FSB9);
+    tft.drawString("First, select your SSID", 160, 60, GFXFF);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(500);
 
-
-    tft.setTextColor(TFT_YELLOW);
-    tft.setTextDatum(TL_DATUM);
-  
-    while ((gpio_get_level(CLICK2) == 1) && (button_get_level(sw1) == 1) && (button_get_level(sw3) == 1))
+    int nSsid = WiFi.scanNetworks();
+    printf("ssid# %d\n", nSsid);
+    if (nSsid > 6) nSsid = 6;
+    staEncoder.setCount(0);
+    while (gpio_get_level(CLICK2) == 1)
     {
-      PL = staEncoder.getCount()/2;
-      if (PL < 0) {
-        PL = 0;
-        staEncoder.setCount(PL);
-      }
-      if (PL > (strlen(charSet) - 1)) {
-        PL = strlen(charSet) - 1;
-        staEncoder.setCount(PL*2);
-      }
-      if (PL != PPL)
+      for (int i = 0; i < nSsid; i++)
       {
-        PPL = PL;
-        c[0] = charSet[PL];
-        tft.fillRect(150, 170, 40, 40, TFT_BLACK);
-        if(PL != (strlen(charSet) - 1)) 
-        {  
-          tft.setTextColor(TFT_YELLOW);    
-          tft.drawString(c, 160, 180, 4); 
-        } 
-        else 
-        {
-          tft.setTextColor(TFT_GREEN);
-          tft.drawString("ok", 156, 180, 4);  
+        j = staEncoder.getCount() / 2;
+        if (j > (nSsid - 1)) {
+          j = nSsid - 1;
+          staEncoder.setCount(j);
         }
+        if (j < 0) {
+          j = 0;
+          staEncoder.setCount(j);
+        }
+        printf("j = %d\n", j);
+        tft.setTextDatum(TL_DATUM);
+        if (i == j)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
+        tft.setFreeFont(FSB12);
+        sprintf(s, "%d- %s", i + 1, WiFi.SSID(i).c_str());
+        tft.drawString(s, 20, 80 + i * 25, GFXFF);
       }
       delay(100);
     }
-    if (gpio_get_level(CLICK2) == 0)
-    {
-      if(PL != (strlen(charSet) - 1))
-      {
-      strcat((char*)pwd, c);
-      printf("pwd = %s\n", pwd);
-      }
-      else 
-      {
-        Bvalid = true;
-        printf("Bvalid\n");
-      }
-      while(gpio_get_level(CLICK2) == 0) delay(10);
-    }
-    if (button_get_level(sw1) == 0)
-    {
-      if (strlen((char*)pwd) > 0) pwd[strlen((char*)pwd) - 1] = 0;
-      while(button_get_level(sw1) == 0) delay(10);
-    }
-  
-  }
-  printf("ssid: %s   pwd: %s\n", ssid, pwd);
+    strcpy((char*)ssid, WiFi.SSID(j).c_str());
+    printf("ssid = %s\n", ssid);
+    ln = LittleFS.open("/ssid", FILE_WRITE);
+    ln.write(ssid, strlen((char*)ssid) + 1);
+    ln.close();
 
-  ln = LittleFS.open("/pwd", "w");
-  ln.write(pwd, strlen((char*)pwd) + 1);
-  ln.close();           
+    delay(1000);
+    headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
+    tft.setTextColor(TFT_RED);
+    tft.setTextDatum(TC_DATUM);
+    tft.setFreeFont(FSB9);
+    tft.drawString("Then, Enter your password", 160, 60, GFXFF);
+    c[1] = 0;
+    pwd[0] = 0;
+    staEncoder.setCount(0);
+    Bvalid = false;
+    while ( (button_get_level(sw3) == 1) && (Bvalid == false))
+    {
+      tft.setTextColor(TFT_YELLOW);
+      tft.setTextDatum(TL_DATUM);
+      tft.setFreeFont(FSB12);
+      tft.drawString("ssid:", 20, 80, GFXFF);
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString((char*)ssid, 80, 80, GFXFF);
+      tft.setTextColor(TFT_YELLOW);
+      tft.fillRect(20, 120, 300, 30, TFT_NAVY);
+      tft.drawString("pwd:", 20, 120, GFXFF);
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString((char*)pwd, 80, 120, GFXFF);
+
+
+      tft.setTextColor(TFT_YELLOW);
+      tft.setTextDatum(TL_DATUM);
+
+      while ((gpio_get_level(CLICK2) == 1) && (button_get_level(sw1) == 1) && (button_get_level(sw3) == 1))
+      {
+        PL = staEncoder.getCount() / 2;
+        if (PL < 0) {
+          PL = 0;
+          staEncoder.setCount(PL);
+        }
+        if (PL > (strlen(charSet) - 1)) {
+          PL = strlen(charSet) - 1;
+          staEncoder.setCount(PL * 2);
+        }
+        if (PL != PPL)
+        {
+          PPL = PL;
+          c[0] = charSet[PL];
+          tft.fillRect(150, 170, 40, 40, TFT_BLACK);
+          if (PL != (strlen(charSet) - 1))
+          {
+            tft.setTextColor(TFT_YELLOW);
+            tft.drawString(c, 160, 180, 4);
+          }
+          else
+          {
+            tft.setTextColor(TFT_GREEN);
+            tft.drawString("ok", 156, 180, 4);
+          }
+        }
+        delay(100);
+      }
+      if (gpio_get_level(CLICK2) == 0)
+      {
+        if (PL != (strlen(charSet) - 1))
+        {
+          strcat((char*)pwd, c);
+          printf("pwd = %s\n", pwd);
+        }
+        else
+        {
+          Bvalid = true;
+          printf("Bvalid\n");
+        }
+        while (gpio_get_level(CLICK2) == 0) delay(10);
+      }
+      if (button_get_level(sw1) == 0)
+      {
+        if (strlen((char*)pwd) > 0) pwd[strlen((char*)pwd) - 1] = 0;
+        while (button_get_level(sw1) == 0) delay(10);
+      }
+
+    }
+    printf("ssid: %s   pwd: %s\n", ssid, pwd);
+
+    ln = LittleFS.open("/pwd", "w");
+    ln.write(pwd, strlen((char*)pwd) + 1);
+    ln.close();
   }
-//  }
+  //  }
   tft.fillScreen(TFT_NAVY);
-  tft.setTextDatum(TC_DATUM); 
-  tft.setTextColor(TFT_GREEN);   
-  tft.drawString("Restarting...", 150, 105, 4); 
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_GREEN);
+  tft.drawString("Restarting...", 150, 105, 4);
 
   delay(1000);
   esp_restart();
 
-/*
-  gpio_set_level(backLight, 1);  
-  tft.fillScreen(TFT_NAVY);
-  tft.setTextDatum(TC_DATUM); 
-  tft.setTextColor(TFT_GREEN);   
-  tft.drawString("Settings modified!", 150, 85, 4);   
-  tft.setTextColor(TFT_RED);   
-  tft.drawString("Please, restart!", 150, 125, 4); 
-  tft.setTextColor(TFT_YELLOW);     
-  tft.drawString("(power switch => OFF/ON)", 150, 155, 2);  
-  for(;;); 
-*/  
+  /*
+    gpio_set_level(backLight, 1);
+    tft.fillScreen(TFT_NAVY);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("Settings modified!", 150, 85, 4);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("Please, restart!", 150, 125, 4);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("(power switch => OFF/ON)", 150, 155, 2);
+    for(;;);
+  */
 }
 ///////////////////////////////////////////////////////////////////////
 // init WiFi credentials using Improv
 ////////////////////////////////////////////////////////////////////////
-  ImprovWiFi improvSerial(&USBSerial); 
+ImprovWiFi improvSerial(&USBSerial);
 
 void WiFiConnected(const char *ssid, const char *password)
 {
-//  printf("%s   %s\n", ssid, password);
+  //  printf("%s   %s\n", ssid, password);
   uint8_t bm = '1';
   File ln = LittleFS.open("/mode", FILE_WRITE);
   ln.write(&bm, 1);
-  ln.close();  
+  ln.close();
   ln = LittleFS.open("/pwd", "w");
   ln.write((uint8_t*)password, strlen(password) + 1);
-  ln.close();   
+  ln.close();
   ln = LittleFS.open("/ssid", FILE_WRITE);
   ln.write((uint8_t*)ssid, strlen(ssid) + 1);
-  ln.close();     
+  ln.close();
   vTaskDelete(radioH);
   vTaskDelete(keybH);
   vTaskDelete(batteryH);
@@ -1025,34 +1032,34 @@ void WiFiConnected(const char *ssid, const char *password)
 
 
   tft.fillScreen(TFT_NAVY);
-  tft.setTextDatum(TC_DATUM); 
-  tft.setTextColor(TFT_GREEN);   
-  tft.drawString("Restarting...", 150, 105, 4); 
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_GREEN);
+  tft.drawString("Restarting...", 150, 105, 4);
 
   delay(1000);
   esp_restart();
- /* 
-  gpio_set_level(backLight, 1);  
-  tft.fillScreen(TFT_NAVY);
-  tft.setTextDatum(TC_DATUM); 
-  tft.setTextColor(TFT_GREEN);   
-  tft.drawString("Settings modified!", 150, 85, 4);  
-  tft.setTextColor(TFT_RED);   
-  tft.drawString("Please, restart!", 150, 125, 4); 
-  tft.setTextColor(TFT_YELLOW);     
-  tft.drawString("(power switch => OFF/ON)", 150, 155, 2);   
-  for(;;);
+  /*
+    gpio_set_level(backLight, 1);
+    tft.fillScreen(TFT_NAVY);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("Settings modified!", 150, 85, 4);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("Please, restart!", 150, 125, 4);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("(power switch => OFF/ON)", 150, 155, 2);
+    for(;;);
   */
 }
 static void improvWiFiInit(void* data)
 {
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.0", "Raspiaudio Radio");  
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.0", "Raspiaudio Radio");
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
 
-  while(true)
+  while (true)
   {
-    improvSerial.handleSerial();   
+    improvSerial.handleSerial();
     delay(10);
   }
 }
@@ -1063,11 +1070,11 @@ static void improvWiFiInit(void* data)
 void loadLastOTA(void)
 {
   delay(1000);
- // Configure custom Root CA 
-    tft.fillRect(0, 0, 320, 240, TFT_BLACK); 
-    tft.setTextColor(TFT_RED);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString("Loading last binary...", 180, 105, 4);  
+  // Configure custom Root CA
+  tft.fillRect(0, 0, 320, 240, TFT_BLACK);
+  tft.setTextColor(TFT_RED);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Loading last binary...", 180, 105, 4);
   ota.setCACert(root_ca);
   printf("6\n");
   printf("Initializing OTA storage\n");
@@ -1086,7 +1093,7 @@ void loadLastOTA(void)
     return;
   }
   printf  ("%d bytes stored \n", ota_download);
-  
+
 
   printf("Verify update integrity and apply ...\n");
   if ((ota_err = ota.update()) != Arduino_ESP32_OTA::Error::None)
@@ -1096,12 +1103,12 @@ void loadLastOTA(void)
   }
 
   printf("Performing a reset after which the bootloader will start the new firmware.\n");
-    tft.fillRect(0, 0, 320, 240, TFT_BLACK); 
-    tft.setTextColor(TFT_BLUE);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString("Restarting...", 180, 105, 4); 
-  delay(2000); // Make sure the serial message gets out before the reset. 
-  ota.reset();  
+  tft.fillRect(0, 0, 320, 240, TFT_BLACK);
+  tft.setTextColor(TFT_BLUE);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Restarting...", 180, 105, 4);
+  delay(2000); // Make sure the serial message gets out before the reset.
+  ota.reset();
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1112,9 +1119,9 @@ void setup() {
   uint8_t res;
   USBSerial.begin(115200);
 
-/////////////////////////////////////////////////////  
-// Little FS init
-/////////////////////////////////////////////////////
+  /////////////////////////////////////////////////////
+  // Little FS init
+  /////////////////////////////////////////////////////
   if (!LittleFS.begin()) {
     Serial.println("LittleFS initialisation failed!");
     while (1) for (;;);
@@ -1128,9 +1135,9 @@ void setup() {
     delay(100);
   }
 
-//////////////////////////////////////////////////
-//Encoders init
-//////////////////////////////////////////////////
+  //////////////////////////////////////////////////
+  //Encoders init
+  //////////////////////////////////////////////////
   ESP32Encoder::useInternalWeakPullResistors = UP;
   volEncoder.attachHalfQuad(ENC_B1, ENC_A1);
   staEncoder.attachHalfQuad(ENC_A2, ENC_B2);
@@ -1140,25 +1147,25 @@ void setup() {
   ///////////////////////////////////////////////////////
   //gpio_reset_pin
   gpio_reset_pin(CLICK1);
-  gpio_reset_pin(CLICK2); 
+  gpio_reset_pin(CLICK2);
   gpio_reset_pin(JACK_DETECT);
-  gpio_reset_pin(USB_DETECT);    
+  gpio_reset_pin(USB_DETECT);
   gpio_pullup_dis(USB_DETECT);
   gpio_pulldown_dis(USB_DETECT);
-  gpio_reset_pin(EN_4G); 
+  gpio_reset_pin(EN_4G);
   gpio_reset_pin(PA);
   gpio_reset_pin(backLight);
-  
+
   //gpio_set_direction
   gpio_set_direction(CLICK1, GPIO_MODE_INPUT);
   gpio_set_direction(CLICK2, GPIO_MODE_INPUT);
   gpio_set_direction(JACK_DETECT, GPIO_MODE_INPUT);
   gpio_set_direction(USB_DETECT, GPIO_MODE_INPUT);
-      
+
   gpio_set_direction(EN_4G, GPIO_MODE_OUTPUT);
   gpio_set_direction(PA, GPIO_MODE_OUTPUT);
   gpio_set_direction(backLight, GPIO_MODE_OUTPUT);
-     
+
   //gpio_set_pull_mode
   gpio_set_pull_mode(CLICK1, GPIO_PULLUP_ONLY);
   gpio_set_pull_mode(CLICK2, GPIO_PULLUP_ONLY);
@@ -1166,32 +1173,32 @@ void setup() {
 
   gpio_set_pull_mode(EN_4G, GPIO_PULLUP_ONLY);
 
-//////////////////////////////////////////////////////
-// request to load the last version
-//////////////////////////////////////////////////////
-   delay(100);
-   BOTA = false;
-   if(gpio_get_level(CLICK1) == 0) BOTA = true;
+  //////////////////////////////////////////////////////
+  // request to load the last version
+  //////////////////////////////////////////////////////
+  delay(100);
+  BOTA = false;
+  if (gpio_get_level(CLICK1) == 0) BOTA = true;
 
-///////////////////////////////////////////////////////
-//enable remote
-///////////////////////////////////////////////////////
- irrecv.enableIRIn(); 
+  ///////////////////////////////////////////////////////
+  //enable remote
+  ///////////////////////////////////////////////////////
+  irrecv.enableIRIn();
   tft.init();
 
 
 
   File ln = LittleFS.open("/mode", FILE_READ);
-// if mode not defined ==> settings
-  if(!ln) settings();
+  // if mode not defined ==> settings
+  if (!ln) settings();
   ln.read(&mode, 1);
-  ln.close(); 
+  ln.close();
   printf("mode = %c\n", mode);
-//////////////////////////////////////////////////////
-//Screen init
-//////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////
+  //Screen init
+  //////////////////////////////////////////////////////
   printf("screen init...\n");
-//  tft.init();
+  //  tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_WHITE);
   drawImage("/Raspiaudio.png", 0, 0);
@@ -1199,170 +1206,173 @@ void setup() {
   tft.drawString(version, 280, 220, 2);
   delay(2000);
 
-{
-  printf("WiFi\n");
-  gpio_set_level(EN_4G, 0);   
-  ln = LittleFS.open("/ssid", FILE_READ);
-  if(!ln) settings();
-  ln.read(ssid, 80);
-  ssid[ln.size() - 1] = 0;
-  ln.close();
-  ln = LittleFS.open("/pwd", FILE_READ);
-  if(!ln) settings();
-  ln.read(pwd, 80);
-  pwd[ln.size() - 1] = 0;  
-  ln.close();
-}
-////////////////////////////////////////////////
-// WiFi init
-////////////////////////////////////////////////
+  {
+    printf("WiFi\n");
+    gpio_set_level(EN_4G, 0);
+    ln = LittleFS.open("/ssid", FILE_READ);
+    if (!ln) settings();
+    ln.read(ssid, 80);
+    ssid[ln.size() - 1] = 0;
+    ln.close();
+    ln = LittleFS.open("/pwd", FILE_READ);
+    if (!ln) settings();
+    ln.read(pwd, 80);
+    pwd[ln.size() - 1] = 0;
+    ln.close();
+  }
+  ////////////////////////////////////////////////
+  // WiFi init
+  ////////////////////////////////////////////////
   started = false;
   printf("%s    %s\n", ssid, pwd);
 
-    WiFi.useStaticBuffers(true);
-    WiFi.mode(WIFI_STA);
- //   WiFi.begin((char*)ssid, (char*)pwd);   
-    wifiMulti.addAP((char*)ssid, (char*)pwd);    /////////////////////////////////////:
- //   wifiMulti.run();   
-   const uint32_t connectTimeoutMs = 20000;
-   if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
+  WiFi.useStaticBuffers(true);
+  WiFi.mode(WIFI_STA);
+  //   WiFi.begin((char*)ssid, (char*)pwd);
+  wifiMulti.addAP((char*)ssid, (char*)pwd);    /////////////////////////////////////:
+  //   wifiMulti.run();
+  const uint32_t connectTimeoutMs = 20000;
+  if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
     USBSerial.print("WiFi connected: ");
     USBSerial.print(WiFi.SSID());
     USBSerial.print(" ");
     USBSerial.println(WiFi.RSSI());
-    started = true;  
+    started = true;
 
-////////////////////////////////////////////////////////////////
-//last version .ota loading    
-////////////////////////////////////////////////////////////////
-    if(BOTA == true)loadLastOTA();
-    
+    ////////////////////////////////////////////////////////////////
+    //last version .ota loading
+    ////////////////////////////////////////////////////////////////
+    if (BOTA == true)loadLastOTA();
+
+    fetchStationList();
+
+
   }
   else {
     Serial.println("WiFi not connected!");
-    tft.fillRect(0, 0, 320, 240, TFT_BLACK); 
+    tft.fillRect(0, 0, 320, 240, TFT_BLACK);
     tft.setTextColor(TFT_RED);
     tft.setTextDatum(TC_DATUM);
-    tft.drawString("Connection failed...", 180, 105, 4);     
+    tft.drawString("Connection failed...", 180, 105, 4);
     settings();                                           //////////////////////////////
-    delay(2000);   
-  }   
- 
- // Task to initialize WiFi credentials (Improv Serial)  
-  xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);  
-//  delay(2000);
-///////////////////////////////////////////////////////////////
-// Audio init
-//////////////////////////////////////////////////////////////
-//ES8388 codec init
+    delay(2000);
+  }
+
+  // Task to initialize WiFi credentials (Improv Serial)
+  xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
+  //  delay(2000);
+  ///////////////////////////////////////////////////////////////
+  // Audio init
+  //////////////////////////////////////////////////////////////
+  //ES8388 codec init
   Wire.setPins(SDA, SCL);
   Wire.begin();
   res = ES8388_Init();
   if (res == 0)printf("Codec init OK\n"); else printf("Codec init failed\n");
 
-// audio lib init
+  // audio lib init
   i2s_set_pin((i2s_port_t)0, &pin_configR);
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  audio.setVolumeSteps(maxVol+1);
+  audio.setVolumeSteps(maxVol + 1);
   audio.setVolume(maxVol);
 
-// connections init
-if(gpio_get_level(JACK_DETECT) == 0) 
+  // connections init
+  if (gpio_get_level(JACK_DETECT) == 0)
   {
     printf("Jack ON\n");
-    gpio_set_level(PA, 0);          // amp off   
+    gpio_set_level(PA, 0);          // amp off
     ES8388_Write_Reg(29, 0x00);     // stereo
     ES8388_Write_Reg(28, 0x04);     // no phase inversion + click free power up/down
-    ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2     
-    jackON = true; 
-    refreshVolume();  
+    ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2
+    jackON = true;
+    refreshVolume();
   }
   else
   {
     printf("Jack OFF\n");
     gpio_set_level(PA, 1);          // amp on
     ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
-    ES8388_Write_Reg(28, 0x14);     // Right DAC phase inversion + click free power up/down    
+    ES8388_Write_Reg(28, 0x14);     // Right DAC phase inversion + click free power up/down
     ES8388_Write_Reg(4, 0x30);      // Rout1/Lout1
-    jackON = false;  
-    refreshVolume(); 
-  }    
+    jackON = false;
+    refreshVolume();
+  }
 
-///////////////////////////////////////////////////////////////
-// recovering params (station & vol)
-///////////////////////////////////////////////////////////////
+  ///////////////////////////////////////////////////////////////
+  // recovering params (station & vol)
+  ///////////////////////////////////////////////////////////////
 
-// previous station
+  // previous station
   ln = LittleFS.open("/station", "r");
   ln.read((uint8_t*)b, 2);
   b[2] = 0;
   station = atoi(b);
   ln.close();
-// previous volume 
+  // previous volume
   ln = LittleFS.open("/volume", "r");
   ln.read((uint8_t*)b, 2);
   b[2] = 0;
-  vol = atoi(b); 
-   
+  vol = atoi(b);
+
   ln.close();
   MS = maxStation() - 1;
   previousStation = -1;
-  printf("station = %d    vol = %d\n", station, vol);   
-// volume encoder init
-  V = vol * pos360 /maxVol;
+  printf("station = %d    vol = %d\n", station, vol);
+  // volume encoder init
+  V = vol * pos360 / maxVol;
   volEncoder.setCount(V);
   PV = V;
   refreshVolume();
-// station encoder init
-  staEncoder.setCount(station*2);
+  // station encoder init
+  staEncoder.setCount(station * 2);
   S = VS = 0;
-  
-//////////////////////////////////////////////////////////////// 
-// draw "wallpaper screen" and internet 
-////////////////////////////////////////////////////////////////
+
+  ////////////////////////////////////////////////////////////////
+  // draw "wallpaper screen" and internet
+  ////////////////////////////////////////////////////////////////
   tft.setRotation(2);
   tft.fillScreen(TFT_BLACK);
-  drawImage("/screenV.png", 0, 5);  
+  drawImage("/screenV.png", 0, 5);
   tft.setRotation(1);
   tft.fillCircle(50, 50, 40, TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
   tft.setTextDatum(TC_DATUM);
- // tft.fillCircle(50, 35, 18, TFT_WHITE);
+  // tft.fillCircle(50, 35, 18, TFT_WHITE);
   //tft.fillCircle(50, 35, 16, TFT_BLACK);
   tft.drawCircle(50, 35, 18, TFT_WHITE);
-  if(mode == '0')  tft.drawString("4G", 50, 27, 2);   
-  else tft.drawString("WiFi", 50, 27, 2);   
+  if (mode == '0')  tft.drawString("4G", 50, 27, 2);
+  else tft.drawString("WiFi", 50, 27, 2);
   tft.setTextColor(TFT_GREY, TFT_BLACK);
-  tft.drawString(version, 300, 220, 2);  
+  tft.drawString(version, 300, 220, 2);
   toDisplay = 0;
   displayON();
   Bdonate = false;
-/////////////////////////////////////////////////////////////////////////
-// Starting tasks
-/////////////////////////////////////////////////////////////////////////  
-// Task playing radio station (core 0)
+  /////////////////////////////////////////////////////////////////////////
+  // Starting tasks
+  /////////////////////////////////////////////////////////////////////////
+  // Task playing radio station (core 0)
   xTaskCreatePinnedToCore(playRadio, "radio", 5000, NULL, 5, &radioH, 0);
-// Task managing buttons  (core 1)
-  xTaskCreatePinnedToCore(keyb, "keyb", 5000, NULL, 5, &keybH, 1);  
-// Task monitoring the battery
-  xTaskCreatePinnedToCore(battery, "battery", 5000, NULL, 5, &batteryH, 1);   
-// Task managing the jack switch
-  xTaskCreatePinnedToCore(jack, "jack", 5000, NULL, 5, &jackH, 1);   
-// Task managing the IR remote
-  xTaskCreatePinnedToCore(remote, "remote", 5000, NULL, 5, &remoteH, 1);  
-// Task managing display turn on:turn off
-  xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);           
+  // Task managing buttons  (core 1)
+  xTaskCreatePinnedToCore(keyb, "keyb", 5000, NULL, 5, &keybH, 1);
+  // Task monitoring the battery
+  xTaskCreatePinnedToCore(battery, "battery", 5000, NULL, 5, &batteryH, 1);
+  // Task managing the jack switch
+  xTaskCreatePinnedToCore(jack, "jack", 5000, NULL, 5, &jackH, 1);
+  // Task managing the IR remote
+  xTaskCreatePinnedToCore(remote, "remote", 5000, NULL, 5, &remoteH, 1);
+  // Task managing display turn on:turn off
+  xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);
 }
 
 
 void loop() {
 
-  
-  
-//////////////////////////////////////////////////////////////////////
-// Volume via encoder
-//////////////////////////////////////////////////////////////////////
-//  printf("------%x\n",REMOTE_KEY);
+
+
+  //////////////////////////////////////////////////////////////////////
+  // Volume via encoder
+  //////////////////////////////////////////////////////////////////////
+  //  printf("------%x\n",REMOTE_KEY);
   V = volEncoder.getCount();
   if (V != PV)
   {
@@ -1379,29 +1389,32 @@ void loop() {
     ln.close();
     toDisplay = 3;
   }
-//////////////////////////////////////////////////////////////////////
-// volume via remote keys
-//////////////////////////////////////////////////////////////////////
-  if((REMOTE_KEY == VOLP_rem) || (REMOTE_KEY == VOLM_rem))
+  //////////////////////////////////////////////////////////////////////
+  // volume via remote keys
+  //////////////////////////////////////////////////////////////////////
+  if ((REMOTE_KEY == VOLP_rem) || (REMOTE_KEY == VOLM_rem))
   {
-    if(muteON == true) {vol = Pvol; muteON = false;}
-    if(REMOTE_KEY == VOLP_rem)vol++;
-    if(REMOTE_KEY == VOLM_rem)vol--; 
-    REMOTE_KEY = 0;   
-    if(vol > maxVol) vol = maxVol;
-    if(vol < 0) vol = 0;
+    if (muteON == true) {
+      vol = Pvol;
+      muteON = false;
+    }
+    if (REMOTE_KEY == VOLP_rem)vol++;
+    if (REMOTE_KEY == VOLM_rem)vol--;
+    REMOTE_KEY = 0;
+    if (vol > maxVol) vol = maxVol;
+    if (vol < 0) vol = 0;
     refreshVolume();
-    volEncoder.setCount(vol*pos360/maxVol);
+    volEncoder.setCount(vol * pos360 / maxVol);
     sprintf(b, "%02d", vol);
     File ln = LittleFS.open("/volume", "w");
     ln.write((uint8_t*)b, 2);
     ln.close();
-    toDisplay = 3;    
+    toDisplay = 3;
   }
 
-///////////////////////////////////////////////////////////////////////  
-// mute / unmute
-//////////////////////////////////////////////////////////////////////
+  ///////////////////////////////////////////////////////////////////////
+  // mute / unmute
+  //////////////////////////////////////////////////////////////////////
   if ((muteB == true) && (muteON == false))
   {
     Pvol = vol;
@@ -1421,193 +1434,215 @@ void loop() {
   }
 
 
-  if(Bdonate == false)
-  {  
-////////////////////////////////////////////////////////////////////////
-//  station search via encoder    
-////////////////////////////////////////////////////////////////////////
-  S = staEncoder.getCount();
-  delay(50);
-  if((S != VS) && (S == staEncoder.getCount()))
+  if (Bdonate == false)
   {
-    printf(">>>> %d\n", S);
-    displayON();
-    modSta = true;
-    CLICK2B = false;
-    lastModTime = millis();
-    if(S > MS*2) S = 0;
-    if(S < 0) S = MS*2;
-    VS = S;
-    staEncoder.setCount(S);
-    tft.setRotation(1);  
-    tft.fillRect(80, 90, 240, 60, TFT_BLACK); 
-    tft.setTextColor(TFT_SILVER);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString(Rname(S/2), 180, 105, 4); 
-  }
-
-  
-////////////////////////////////////////////////////////////////////////////
-// station search via remote keys
-////////////////////////////////////////////////////////////////////////////
-  if((REMOTE_KEY == LEFT_rem) || (REMOTE_KEY == RIGHT_rem))
-  {
-    displayON();
-    if(modSta == false) S = station*2;
-    if(REMOTE_KEY == LEFT_rem) S -= 2;
-    if(REMOTE_KEY == RIGHT_rem) S += 2;
-    REMOTE_KEY = 0;
-    modSta = true;
-    CLICK2B = false;
-    lastModTime = millis();
-    if(S > MS*2) S = 0;
-    if(S < 0) S = MS*2;
-    staEncoder.setCount(S);
-    VS = S;
-    tft.setRotation(1);  
-    tft.fillRect(80, 90, 240, 60, TFT_BLACK); 
-    tft.setTextColor(TFT_SILVER);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString(Rname(S/2), 180, 105, 4); 
-  }
-  
-  
-/////////////////////////////////////////////////////////////////////////
-// new station validation
-/////////////////////////////////////////////////////////////////////////    
-  if(CLICK2B == true)
-  {
-    displayON();
-    if(modSta == true)
+    ////////////////////////////////////////////////////////////////////////
+    //  station search via encoder
+    ////////////////////////////////////////////////////////////////////////
+    S = staEncoder.getCount();
+    delay(50);
+    if ((S != VS) && (S == staEncoder.getCount()))
     {
-    modSta = false;
-    station = S/2;
-    printf("station = %d\n", station);
-    staEncoder.setCount(S);
-    char b[4];
-    sprintf(b, "%02d", station);
-    File ln = LittleFS.open("/station", "w");
-    ln.write((uint8_t*)b, 2);
-    ln.close();    
-    CLICK2B = false;
-    if (muteON == true)
-    {
-      vol = Pvol;
-      refreshVolume();
-      muteB = false;
-      muteON = false;
-    }   
+      printf(">>>> %d\n", S);
+      displayON();
+      modSta = true;
+      CLICK2B = false;
+      lastModTime = millis();
+      if (S > MS * 2) S = 0;
+      if (S < 0) S = MS * 2;
+      VS = S;
+      staEncoder.setCount(S);
+      tft.setRotation(1);
+      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+      tft.setTextColor(TFT_SILVER);
+      tft.setTextDatum(TC_DATUM);
+      tft.drawString(Rname(S / 2), 180, 105, 4);
     }
-  }
-////////////////////////////////////////////////////////////////////////
-// new station search give up
-////////////////////////////////////////////////////////////////////////
-  if(modSta == true)
-  {
-    if(millis() > (lastModTime + 4000))
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    // station search via remote keys
+    ////////////////////////////////////////////////////////////////////////////
+    if ((REMOTE_KEY == LEFT_rem) || (REMOTE_KEY == RIGHT_rem))
     {
       displayON();
-      modSta = false;
-      tft.setRotation(1);  
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK); 
-      tft.setTextColor(TFT_STATION);
+      if (modSta == false) S = station * 2;
+      if (REMOTE_KEY == LEFT_rem) S -= 2;
+      if (REMOTE_KEY == RIGHT_rem) S += 2;
+      REMOTE_KEY = 0;
+      modSta = true;
+      CLICK2B = false;
+      lastModTime = millis();
+      if (S > MS * 2) S = 0;
+      if (S < 0) S = MS * 2;
+      staEncoder.setCount(S);
+      VS = S;
+      tft.setRotation(1);
+      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+      tft.setTextColor(TFT_SILVER);
       tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(station), 180, 105, 4);  
+      tft.drawString(Rname(S / 2), 180, 105, 4);
     }
-  }
-  
-////////////////////////////////////////////////////////////////////////
-// explicit call of Settings (sw0)
-////////////////////////////////////////////////////////////////////////  
-   if ((button_get_level(sw0) == 0) && (BSettings == false))
+
+
+    /////////////////////////////////////////////////////////////////////////
+    // new station validation
+    /////////////////////////////////////////////////////////////////////////
+    if (CLICK2B == true)
     {
-      while(button_get_level(sw0) == 0) delay(50);
+      displayON();
+      if (modSta == true)
+      {
+        modSta = false;
+        station = S / 2;
+        printf("station = %d\n", station);
+        staEncoder.setCount(S);
+        char b[4];
+        sprintf(b, "%02d", station);
+        File ln = LittleFS.open("/station", "w");
+        ln.write((uint8_t*)b, 2);
+        ln.close();
+        CLICK2B = false;
+        if (muteON == true)
+        {
+          vol = Pvol;
+          refreshVolume();
+          muteB = false;
+          muteON = false;
+        }
+      }
+    }
+    ////////////////////////////////////////////////////////////////////////
+    // new station search give up
+    ////////////////////////////////////////////////////////////////////////
+    if (modSta == true)
+    {
+      if (millis() > (lastModTime + 4000))
+      {
+        displayON();
+        modSta = false;
+        tft.setRotation(1);
+        tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+        tft.setTextColor(TFT_STATION);
+        tft.setTextDatum(TC_DATUM);
+        tft.drawString(Rname(station), 180, 105, 4);
+      }
+    }
+
+    ////////////////////////////////////////////////////////////////////////
+    // explicit call of Settings (sw0)
+    ////////////////////////////////////////////////////////////////////////
+    if ((button_get_level(sw0) == 0) && (BSettings == false))
+    {
+      while (button_get_level(sw0) == 0) delay(50);
       BSettings = true;
-      displayON(); 
+      displayON();
       vTaskDelete(radioH);
       vTaskDelete(keybH);
       vTaskDelete(batteryH);
       vTaskDelete(jackH);
       vTaskDelete(remoteH);
-      vTaskDelete(displayONOFFH);       
+      vTaskDelete(displayONOFFH);
       settings();
     }
   }
 
-/////////////////////////////////////////////////////////////////////////
-// Display refresh
-/////////////////////////////////////////////////////////////////////////
-  if((toDisplay != 0) && (Bdonate == false))
+  if (button_get_level(sw1) == 0)
+  {
+    while (button_get_level(sw1) == 0) delay(10);
+    displayON();
+    Bdonate = !Bdonate;
+    delay(100);
+    if (Bdonate == true)
+    {
+
+      // stop battery display and display ON/OFF
+      vTaskDelete(batteryH);
+      vTaskDelete(displayONOFFH);
+      QRcreate();
+    }
+    else
+    {
+      retrieveDisplay();
+    }
+  }
+
+
+
+  /////////////////////////////////////////////////////////////////////////
+  // Display refresh
+  /////////////////////////////////////////////////////////////////////////
+  if ((toDisplay != 0) && (Bdonate == false))
   {
     displayON();
     switch (toDisplay)
     {
       case 1 :
-// playing...      
+        // playing...
         tft.setRotation(1);
-        tft.fillRect(80, 180, 160, 40, TFT_BLACK);  
-//        tft.fillCircle(160, 190, 22, TFT_GREY);        
-//        tft.fillCircle(160, 190, 20, TFT_NAVY);
+        tft.fillRect(80, 180, 160, 40, TFT_BLACK);
+        //        tft.fillCircle(160, 190, 22, TFT_GREY);
+        //        tft.fillCircle(160, 190, 20, TFT_NAVY);
         tft.fillCircle(160, 190, 17, TFT_WHITE);
         tft.fillTriangle(150, 175, 150, 205, 175, 190, TFT_GREY);
         jaugeB = false;
         toDisplay = 0;
         break;
       case 2 :
-// waiting...      
+        // waiting...
         tft.setRotation(1);
-        tft.fillRect(80, 180, 160, 40, TFT_BLACK);  
- //       tft.fillCircle(160, 190, 22, TFT_NAVY);       
-//        tft.fillCircle(160, 190, 20, TFT_NAVY);
-        tft.fillCircle(160, 190, 17, TFT_WHITE);             
+        tft.fillRect(80, 180, 160, 40, TFT_BLACK);
+        //       tft.fillCircle(160, 190, 22, TFT_NAVY);
+        //        tft.fillCircle(160, 190, 20, TFT_NAVY);
+        tft.fillCircle(160, 190, 17, TFT_WHITE);
         tft.fillRect(150, 179, 21, 24, TFT_GREY);
         tft.fillRect(156, 175, 9, 30, TFT_WHITE);
         jaugeB = false;
         toDisplay = 0;
         break;
       case 3 :
-// modifiying volume...      
-        if(jaugeB == false)
+        // modifiying volume...
+        if (jaugeB == false)
         {
           tft.setRotation(1);
-          tft.fillCircle(160, 190, 25, TFT_BLACK);  
-          tft.fillRoundRect(80, 180, 160, 20, 10, TFT_WHITE);         
+          tft.fillCircle(160, 190, 25, TFT_BLACK);
+          tft.fillRoundRect(80, 180, 160, 20, 10, TFT_WHITE);
           jaugeB = true;
-        }   
+        }
         int V2;
- //       V2 = V + V;
+        //       V2 = V + V;
         V2 = V;
-        if(V2 > pos360) V2 = pos360;
-           
-        tft.fillRect(90+140*V2/pos360, 182, 140-140*V2/pos360, 16, TFT_WHITE);
+        if (V2 > pos360) V2 = pos360;
 
-        tft.fillRect(90, 182, 140*V2/pos360, 16, TFT_GREY);
+        tft.fillRect(90 + 140 * V2 / pos360, 182, 140 - 140 * V2 / pos360, 16, TFT_WHITE);
+
+        tft.fillRect(90, 182, 140 * V2 / pos360, 16, TFT_GREY);
         N = 0;
         toDisplay = 4;
-        break;   
+        break;
       case 4 :
-//      
+        //
         N++;
-        if(N > 20)toDisplay = 2;
-        break;        
+        if (N > 20)toDisplay = 2;
+        break;
     }
 
-  
+
   }
-/*
-///////////////////////////////////////////////////////////////////////////////////
-//test remote keys
-///////////////////////////////////////////////////////////////////////////////////
- if (irrecv.decode(&results)) {
-    if(results.decode_type == NEC)
-    {
-      uint32_t v = results.value;
-      if(v != 0xffffffff)printf("%08x %04x %04x\n", v, v>>16, v&0xffff);
+  /*
+    ///////////////////////////////////////////////////////////////////////////////////
+    //test remote keys
+    ///////////////////////////////////////////////////////////////////////////////////
+    if (irrecv.decode(&results)) {
+      if(results.decode_type == NEC)
+      {
+        uint32_t v = results.value;
+        if(v != 0xffffffff)printf("%08x %04x %04x\n", v, v>>16, v&0xffff);
+      }
+      irrecv.resume();  // Receive the next value
     }
-    irrecv.resume();  // Receive the next value
-  }
-*/
-delay(100);  
+  */
+  delay(100);
 }
 
 void audio_info(const char *info) {
@@ -1621,29 +1656,81 @@ void audio_info(const char *info) {
   connected = true;
   if (strstr(info, "failed") > 0) {
     connected = false;
-    printf("failed\n"); 
-    
-    tft.fillRect(80, 90, 240, 60, TFT_BLACK); 
+    printf("failed\n");
+
+    tft.fillRect(80, 90, 240, 60, TFT_BLACK);
     tft.setTextColor(TFT_RED);
     tft.setTextDatum(TC_DATUM);
     tft.drawString("Connecting...", 200, 105, 4);
-    delay(500);  
-    printf("RSSI = %d dB\n", WiFi.RSSI());  
+    delay(500);
+    printf("RSSI = %d dB\n", WiFi.RSSI());
 
 
-//    printf("RSSI = %d dB\n", WiFi.RSSI()); 
+    //    printf("RSSI = %d dB\n", WiFi.RSSI());
     wifiMulti.run();
-  
 
-    if(WiFi.status() != WL_CONNECTED )
+
+    if (WiFi.status() != WL_CONNECTED )
     {
-    WiFi.disconnect(true);
-    wifiMulti.run();
-     delay(1500);  
-    }   
- 
+      WiFi.disconnect(true);
+      wifiMulti.run();
+      delay(1500);
+    }
+
   }
 }
+
+void QRcreate(void)
+{
+  tft.fillScreen(TFT_NAVY);
+
+  // Lire l'URL stockée dans le fichier
+  File ln = LittleFS.open("/QR", FILE_READ);
+  if (!ln) {
+    printf("Erreur : Impossible d'ouvrir le fichier /QR\n");
+    return;
+  }
+
+  // Lire les données du fichier et stocker l'URL dans un buffer
+  char baseUrl[120];  // Taille maximale de l'URL
+  ln.read((uint8_t*)baseUrl, sizeof(baseUrl) - 1);
+  baseUrl[ln.size()] = 0;  // Terminer la chaîne
+  ln.close();
+
+  // Récupérer l'adresse MAC de l'ESP32
+  String macAddress = WiFi.macAddress();
+  macAddress.replace(":", "");  // Supprimer les deux-points
+
+  // Construire l'URL complète avec l'adresse MAC
+  String fullUrl = String(baseUrl) + "?serial=" + macAddress;
+
+  // Log pour vérifier l'URL complète
+  printf("URL complète : %s\n", fullUrl.c_str());
+
+  // Convertir la chaîne en tableau de caractères (c-string) pour l'utiliser avec la librairie QRCode
+  char qrData[256];  // Taille maximale du buffer QR, à augmenter si nécessaire
+  fullUrl.toCharArray(qrData, sizeof(qrData));
+
+  // Générer le QR code à partir de l'URL complète
+  QRCode qrcode;
+  uint8_t qrcodeData[qrcode_getBufferSize(4)];  // Utiliser la version 4 pour plus de capacité
+  qrcode_initText(&qrcode, qrcodeData, 4, 0, qrData);
+
+  // Affichage du QR code sur l'écran TFT
+  uint16_t scale = 6;  // Augmenter l'échelle pour rendre le QR code plus lisible
+  uint16_t offsetX = (tft.width() - qrcode.size * scale) / 2;
+  uint16_t offsetY = (tft.height() - qrcode.size * scale) / 2;
+
+  tft.fillScreen(TFT_WHITE); // Fond blanc pour le QR code
+  for (uint8_t y = 0; y < qrcode.size; y++) {
+    for (uint8_t x = 0; x < qrcode.size; x++) {
+      uint16_t color = qrcode_getModule(&qrcode, x, y) ? TFT_BLACK : TFT_WHITE;
+      tft.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, color);
+    }
+  }
+}
+
+
 void audio_id3data(const char *info) { //id3 metadata
   //Serial.print("id3data     ");Serial.println(info);
 }
@@ -1660,7 +1747,7 @@ void audio_showstreamtitle(const char *info) {
   Serial.print("streamtitle "); Serial.println(info);
   if (strlen(info) != 0)
   {
-  //  convToAscii((char*)info, mes);
+    //  convToAscii((char*)info, mes);
     iMes = 0;
   }
   else mes[0] = 0;
@@ -1679,4 +1766,104 @@ void audio_lasthost(const char *info) { //stream URL played
 }
 void audio_eof_speech(const char *info) {
   //Serial.print("eof_speech  ");Serial.println(info);
+}
+
+void fetchStationList() {
+    // Lire l'URL de base à partir du fichier /QR
+    File ln = LittleFS.open("/QR", FILE_READ);
+    if (!ln) {
+        printf("Erreur : Impossible d'ouvrir le fichier /QR\n");
+        return;
+    }
+    char baseUrl[120];  // Ajustez la taille si nécessaire
+    size_t len = ln.readBytes(baseUrl, sizeof(baseUrl) - 1);
+    baseUrl[len] = '\0';  // Terminer la chaîne de caractères
+    ln.close();
+
+    // Obtenir l'adresse MAC
+    String macAddress = WiFi.macAddress();
+    macAddress.replace(":", "");  // Supprimer les deux-points
+
+    // Construire l'URL complète
+    String fullUrl = String(baseUrl) + "?serial=" + macAddress + "&action=get";
+
+    printf("Récupération de la liste des stations à partir de: %s\n", fullUrl.c_str());
+
+    // Effectuer une requête HTTP GET
+    HTTPClient http;
+    http.begin(fullUrl);
+
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+        printf("Code retour HTTP GET : %d\n", httpCode);
+
+        // Si le serveur retourne un code 302 (Redirection)
+        if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) { // 302 is HTTP_CODE_FOUND
+            String newLocation = http.header("Location"); // Lire l'en-tête "Location"
+            if (newLocation.length() > 0) {
+                printf("Redirection vers: %s\n", newLocation.c_str());
+
+                // Suivre la redirection
+                http.end(); // Fermer la première connexion
+                http.begin(newLocation); // Effectuer une nouvelle requête vers la nouvelle URL
+
+                httpCode = http.GET(); // Envoyer la nouvelle requête
+                printf("Code retour après redirection: %d\n", httpCode);
+            } else {
+                printf("Erreur: Aucun en-tête 'Location' trouvé pour la redirection\n");
+                http.end();
+                return;
+            }
+        }
+
+        if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            printf("Payload reçu :\n%s\n", payload.c_str());
+
+            // Parser la réponse JSON
+            DynamicJsonDocument doc(2048);  // Ajustez la taille si nécessaire
+
+            DeserializationError error = deserializeJson(doc, payload);
+            if (error) {
+                printf("Erreur de désérialisation JSON: %s\n", error.c_str());
+                return;
+            }
+
+            if (doc.is<JsonArray>()) {
+                JsonArray stations = doc.as<JsonArray>();
+                if (stations.size() > 0) {
+                    // Mettre à jour les fichiers /linkS et /nameS
+                    File linkFile = LittleFS.open("/linkS", FILE_WRITE);
+                    File nameFile = LittleFS.open("/nameS", FILE_WRITE);
+                    if (!linkFile || !nameFile) {
+                        printf("Erreur : Impossible d'ouvrir les fichiers /linkS ou /nameS en écriture\n");
+                        return;
+                    }
+
+                    for (JsonObject station : stations) {
+                        const char* name = station["name"];
+                        const char* url = station["url"];
+                        // Écrire dans les fichiers
+                        nameFile.println(name);
+                        linkFile.println(url);
+                    }
+
+                    linkFile.close();
+                    nameFile.close();
+
+                    printf("Liste des stations mise à jour depuis le serveur\n");
+                } else {
+                    printf("Aucune station trouvée dans la réponse du serveur, utilisation des stations par défaut\n");
+                }
+            } else {
+                printf("La réponse du serveur n'est pas un tableau JSON\n");
+            }
+
+        } else {
+            printf("Code HTTP inattendu après redirection: %d\n", httpCode);
+        }
+    } else {
+        printf("Échec de la requête HTTP GET, erreur: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
 }
