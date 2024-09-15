@@ -757,7 +757,11 @@ void retrieveDisplay(void)
   if (mode == '0')  tft.drawString("4G", 50, 27, 2);
   else tft.drawString("WiFi", 50, 27, 2);
   tft.setTextColor(TFT_GREY, TFT_BLACK);
-  tft.drawString(version, 300, 220, 2);
+  tft.drawString("1-Settings  2-Radio select", 20, 220, 2);  // Draw at (10, 220)
+
+  tft.setTextDatum(TR_DATUM);  // Set text datum to top-right
+  tft.drawString(version, 300, 220, 2);  // Draw at (310, 220) to align right
+
   // restart battery display and display on/off
   xTaskCreatePinnedToCore(battery, "battery", 5000, NULL, 5, &batteryH, 1);
   xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);
@@ -812,6 +816,8 @@ void settings(void)
   int j;
   int pos;
   char charSet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
+  int charSetLength = strlen(charSet);
+  char selectedChar[2] = {0}; // To store the currently selected character
   gpio_set_level(backLight, 1);
   printf("SETTINGS!!!\n");
   tft.setRotation(1);
@@ -862,7 +868,7 @@ void settings(void)
     tft.setTextColor(TFT_RED);
     tft.setTextDatum(TC_DATUM);
     tft.setFreeFont(FSB9);
-    tft.drawString("First, select your SSID", 160, 60, GFXFF);
+
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(500);
@@ -904,7 +910,7 @@ void settings(void)
     tft.setTextColor(TFT_RED);
     tft.setTextDatum(TC_DATUM);
     tft.setFreeFont(FSB9);
-    tft.drawString("Then, Enter your password", 160, 60, GFXFF);
+    tft.drawString("2 = delete   check = done ", 160, 60, GFXFF);
     c[1] = 0;
     pwd[0] = 0;
     staEncoder.setCount(0);
@@ -934,33 +940,54 @@ void settings(void)
           PL = 0;
           staEncoder.setCount(PL);
         }
-        if (PL > (strlen(charSet) - 1)) {
-          PL = strlen(charSet) - 1;
+        if (PL > (charSetLength - 1)) {
+          PL = charSetLength - 1;
           staEncoder.setCount(PL * 2);
         }
+
+        // Update the selected character
+        selectedChar[0] = (PL != charSetLength - 1) ? charSet[PL] : 'X';
+
         if (PL != PPL)
         {
           PPL = PL;
-          c[0] = charSet[PL];
-          tft.fillRect(150, 170, 40, 40, TFT_BLACK);
-          if (PL != (strlen(charSet) - 1))
-          {
-            tft.setTextColor(TFT_YELLOW);
-            tft.drawString(c, 160, 180, 4);
-          }
-          else
-          {
-            tft.setTextColor(TFT_GREEN);
-            tft.drawString("ok", 156, 180, 4);
+
+          // Display current password
+          tft.fillRect(20, 120, 300, 30, TFT_NAVY);
+          tft.setTextColor(TFT_YELLOW);
+          tft.setTextDatum(TL_DATUM);
+          tft.setFreeFont(FSB12);
+          tft.drawString("pwd:", 20, 120, GFXFF);
+          tft.setTextColor(TFT_GREEN);
+          tft.drawString((char*)pwd, 80, 120, GFXFF);
+
+          // Display carousel
+          tft.fillRect(100, 170, 120, 40, TFT_NAVY);
+          for (int i = -2; i <= 2; i++) {
+            int index = (PL + i + charSetLength) % charSetLength;
+            char displayChar = charSet[index];
+            int xPos = 160 + i * 25;
+            int yPos = 180;
+            int textSize = (i == 0) ? 4 : 2;
+
+            if (index == charSetLength - 1) {
+              // Special case for 'X' (end of charSet)
+              tft.setTextColor(TFT_GREEN);
+              tft.drawString("ok", xPos - 10, yPos, textSize);
+            } else {
+              tft.setTextColor((i == 0) ? TFT_YELLOW : TFT_WHITE);
+              tft.drawChar(displayChar, xPos, yPos, textSize);
+            }
           }
         }
         delay(100);
       }
+
       if (gpio_get_level(CLICK2) == 0)
       {
-        if (PL != (strlen(charSet) - 1))
+        if (PL != (charSetLength - 1))
         {
-          strcat((char*)pwd, c);
+          strcat((char*)pwd, selectedChar);
           printf("pwd = %s\n", pwd);
         }
         else
@@ -970,6 +997,8 @@ void settings(void)
         }
         while (gpio_get_level(CLICK2) == 0) delay(10);
       }
+
+
       if (button_get_level(sw1) == 0)
       {
         if (strlen((char*)pwd) > 0) pwd[strlen((char*)pwd) - 1] = 0;
@@ -1342,7 +1371,10 @@ void setup() {
   tft.drawCircle(50, 35, 18, TFT_WHITE);
   if (mode == '0')  tft.drawString("4G", 50, 27, 2);
   else tft.drawString("WiFi", 50, 27, 2);
+
   tft.setTextColor(TFT_GREY, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
+  tft.drawString("1-Settings  2-Radio select", 20, 220, 2);
   tft.drawString(version, 300, 220, 2);
   toDisplay = 0;
   displayON();
@@ -1682,46 +1714,54 @@ void audio_info(const char *info) {
 
 void QRcreate(void)
 {
-  tft.fillScreen(TFT_NAVY);
+  tft.fillScreen(TFT_WHITE);  // Changed to white background for better contrast
 
-  // Lire l'URL stockée dans le fichier
+  // Read the URL stored in the file
   File ln = LittleFS.open("/QR", FILE_READ);
   if (!ln) {
-    printf("Erreur : Impossible d'ouvrir le fichier /QR\n");
+    printf("Error: Unable to open file /QR\n");
     return;
   }
 
-  // Lire les données du fichier et stocker l'URL dans un buffer
-  char baseUrl[120];  // Taille maximale de l'URL
+  // Read file data and store URL in a buffer
+  char baseUrl[120];  // Maximum URL size
   ln.read((uint8_t*)baseUrl, sizeof(baseUrl) - 1);
-  baseUrl[ln.size()] = 0;  // Terminer la chaîne
+  baseUrl[ln.size()] = 0;  // Terminate the string
   ln.close();
 
-  // Récupérer l'adresse MAC de l'ESP32
+  // Get ESP32 MAC address
   String macAddress = WiFi.macAddress();
-  macAddress.replace(":", "");  // Supprimer les deux-points
+  macAddress.replace(":", "");  // Remove colons
 
-  // Construire l'URL complète avec l'adresse MAC
+  // Build complete URL with MAC address
   String fullUrl = String(baseUrl) + "?serial=" + macAddress;
 
-  // Log pour vérifier l'URL complète
-  printf("URL complète : %s\n", fullUrl.c_str());
+  // Log to verify complete URL
+  printf("Complete URL: %s\n", fullUrl.c_str());
 
-  // Convertir la chaîne en tableau de caractères (c-string) pour l'utiliser avec la librairie QRCode
-  char qrData[256];  // Taille maximale du buffer QR, à augmenter si nécessaire
+  // Convert string to char array for QRCode library
+  char qrData[256];  // Maximum QR buffer size, increase if necessary
   fullUrl.toCharArray(qrData, sizeof(qrData));
 
-  // Générer le QR code à partir de l'URL complète
+  // Generate QR code from complete URL
   QRCode qrcode;
-  uint8_t qrcodeData[qrcode_getBufferSize(4)];  // Utiliser la version 4 pour plus de capacité
+  uint8_t qrcodeData[qrcode_getBufferSize(4)];  // Use version 4 for more capacity
   qrcode_initText(&qrcode, qrcodeData, 4, 0, qrData);
 
-  // Affichage du QR code sur l'écran TFT
-  uint16_t scale = 6;  // Augmenter l'échelle pour rendre le QR code plus lisible
-  uint16_t offsetX = (tft.width() - qrcode.size * scale) / 2;
-  uint16_t offsetY = (tft.height() - qrcode.size * scale) / 2;
+  // Display text above QR code
 
-  tft.fillScreen(TFT_WHITE); // Fond blanc pour le QR code
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.setTextDatum(TC_DATUM);
+
+  tft.setCursor((tft.width() - tft.textWidth("Scan to add radio stations")) / 2, 20);
+  tft.print("Scan to add radio stations");
+  tft.setTextSize(1);
+  // Display QR code on TFT screen
+  uint16_t scale = 5;  // Increase scale to make QR code more readable
+  uint16_t offsetX = (tft.width() - qrcode.size * scale) / 2;
+  uint16_t offsetY = (tft.height() - qrcode.size * scale) / 2 + 20;  // Add 20 pixels to move QR code down
+
   for (uint8_t y = 0; y < qrcode.size; y++) {
     for (uint8_t x = 0; x < qrcode.size; x++) {
       uint16_t color = qrcode_getModule(&qrcode, x, y) ? TFT_BLACK : TFT_WHITE;
@@ -1729,7 +1769,6 @@ void QRcreate(void)
     }
   }
 }
-
 
 void audio_id3data(const char *info) { //id3 metadata
   //Serial.print("id3data     ");Serial.println(info);
@@ -1769,101 +1808,101 @@ void audio_eof_speech(const char *info) {
 }
 
 void fetchStationList() {
-    // Lire l'URL de base à partir du fichier /QR
-    File ln = LittleFS.open("/QR", FILE_READ);
-    if (!ln) {
-        printf("Erreur : Impossible d'ouvrir le fichier /QR\n");
+  // Lire l'URL de base à partir du fichier /QR
+  File ln = LittleFS.open("/QR", FILE_READ);
+  if (!ln) {
+    printf("Erreur : Impossible d'ouvrir le fichier /QR\n");
+    return;
+  }
+  char baseUrl[120];  // Ajustez la taille si nécessaire
+  size_t len = ln.readBytes(baseUrl, sizeof(baseUrl) - 1);
+  baseUrl[len] = '\0';  // Terminer la chaîne de caractères
+  ln.close();
+
+  // Obtenir l'adresse MAC
+  String macAddress = WiFi.macAddress();
+  macAddress.replace(":", "");  // Supprimer les deux-points
+
+  // Construire l'URL complète
+  String fullUrl = String(baseUrl) + "?serial=" + macAddress + "&action=get";
+
+  printf("Récupération de la liste des stations à partir de: %s\n", fullUrl.c_str());
+
+  // Effectuer une requête HTTP GET
+  HTTPClient http;
+  http.begin(fullUrl);
+
+  int httpCode = http.GET();
+  if (httpCode > 0) {
+    printf("Code retour HTTP GET : %d\n", httpCode);
+
+    // Si le serveur retourne un code 302 (Redirection)
+    if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) { // 302 is HTTP_CODE_FOUND
+      String newLocation = http.header("Location"); // Lire l'en-tête "Location"
+      if (newLocation.length() > 0) {
+        printf("Redirection vers: %s\n", newLocation.c_str());
+
+        // Suivre la redirection
+        http.end(); // Fermer la première connexion
+        http.begin(newLocation); // Effectuer une nouvelle requête vers la nouvelle URL
+
+        httpCode = http.GET(); // Envoyer la nouvelle requête
+        printf("Code retour après redirection: %d\n", httpCode);
+      } else {
+        printf("Erreur: Aucun en-tête 'Location' trouvé pour la redirection\n");
+        http.end();
         return;
+      }
     }
-    char baseUrl[120];  // Ajustez la taille si nécessaire
-    size_t len = ln.readBytes(baseUrl, sizeof(baseUrl) - 1);
-    baseUrl[len] = '\0';  // Terminer la chaîne de caractères
-    ln.close();
 
-    // Obtenir l'adresse MAC
-    String macAddress = WiFi.macAddress();
-    macAddress.replace(":", "");  // Supprimer les deux-points
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      printf("Payload reçu :\n%s\n", payload.c_str());
 
-    // Construire l'URL complète
-    String fullUrl = String(baseUrl) + "?serial=" + macAddress + "&action=get";
+      // Parser la réponse JSON
+      DynamicJsonDocument doc(2048);  // Ajustez la taille si nécessaire
 
-    printf("Récupération de la liste des stations à partir de: %s\n", fullUrl.c_str());
+      DeserializationError error = deserializeJson(doc, payload);
+      if (error) {
+        printf("Erreur de désérialisation JSON: %s\n", error.c_str());
+        return;
+      }
 
-    // Effectuer une requête HTTP GET
-    HTTPClient http;
-    http.begin(fullUrl);
+      if (doc.is<JsonArray>()) {
+        JsonArray stations = doc.as<JsonArray>();
+        if (stations.size() > 0) {
+          // Mettre à jour les fichiers /linkS et /nameS
+          File linkFile = LittleFS.open("/linkS", FILE_WRITE);
+          File nameFile = LittleFS.open("/nameS", FILE_WRITE);
+          if (!linkFile || !nameFile) {
+            printf("Erreur : Impossible d'ouvrir les fichiers /linkS ou /nameS en écriture\n");
+            return;
+          }
 
-    int httpCode = http.GET();
-    if (httpCode > 0) {
-        printf("Code retour HTTP GET : %d\n", httpCode);
+          for (JsonObject station : stations) {
+            const char* name = station["name"];
+            const char* url = station["url"];
+            // Écrire dans les fichiers
+            nameFile.println(name);
+            linkFile.println(url);
+          }
 
-        // Si le serveur retourne un code 302 (Redirection)
-        if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) { // 302 is HTTP_CODE_FOUND
-            String newLocation = http.header("Location"); // Lire l'en-tête "Location"
-            if (newLocation.length() > 0) {
-                printf("Redirection vers: %s\n", newLocation.c_str());
+          linkFile.close();
+          nameFile.close();
 
-                // Suivre la redirection
-                http.end(); // Fermer la première connexion
-                http.begin(newLocation); // Effectuer une nouvelle requête vers la nouvelle URL
-
-                httpCode = http.GET(); // Envoyer la nouvelle requête
-                printf("Code retour après redirection: %d\n", httpCode);
-            } else {
-                printf("Erreur: Aucun en-tête 'Location' trouvé pour la redirection\n");
-                http.end();
-                return;
-            }
-        }
-
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            printf("Payload reçu :\n%s\n", payload.c_str());
-
-            // Parser la réponse JSON
-            DynamicJsonDocument doc(2048);  // Ajustez la taille si nécessaire
-
-            DeserializationError error = deserializeJson(doc, payload);
-            if (error) {
-                printf("Erreur de désérialisation JSON: %s\n", error.c_str());
-                return;
-            }
-
-            if (doc.is<JsonArray>()) {
-                JsonArray stations = doc.as<JsonArray>();
-                if (stations.size() > 0) {
-                    // Mettre à jour les fichiers /linkS et /nameS
-                    File linkFile = LittleFS.open("/linkS", FILE_WRITE);
-                    File nameFile = LittleFS.open("/nameS", FILE_WRITE);
-                    if (!linkFile || !nameFile) {
-                        printf("Erreur : Impossible d'ouvrir les fichiers /linkS ou /nameS en écriture\n");
-                        return;
-                    }
-
-                    for (JsonObject station : stations) {
-                        const char* name = station["name"];
-                        const char* url = station["url"];
-                        // Écrire dans les fichiers
-                        nameFile.println(name);
-                        linkFile.println(url);
-                    }
-
-                    linkFile.close();
-                    nameFile.close();
-
-                    printf("Liste des stations mise à jour depuis le serveur\n");
-                } else {
-                    printf("Aucune station trouvée dans la réponse du serveur, utilisation des stations par défaut\n");
-                }
-            } else {
-                printf("La réponse du serveur n'est pas un tableau JSON\n");
-            }
-
+          printf("Liste des stations mise à jour depuis le serveur\n");
         } else {
-            printf("Code HTTP inattendu après redirection: %d\n", httpCode);
+          printf("Aucune station trouvée dans la réponse du serveur, utilisation des stations par défaut\n");
         }
+      } else {
+        printf("La réponse du serveur n'est pas un tableau JSON\n");
+      }
+
     } else {
-        printf("Échec de la requête HTTP GET, erreur: %s\n", http.errorToString(httpCode).c_str());
+      printf("Code HTTP inattendu après redirection: %d\n", httpCode);
     }
-    http.end();
+  } else {
+    printf("Échec de la requête HTTP GET, erreur: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
 }
