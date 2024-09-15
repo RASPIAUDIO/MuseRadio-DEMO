@@ -756,11 +756,12 @@ void retrieveDisplay(void)
   tft.drawCircle(50, 35, 18, TFT_WHITE);
   if (mode == '0')  tft.drawString("4G", 50, 27, 2);
   else tft.drawString("WiFi", 50, 27, 2);
-  tft.setTextColor(TFT_GREY, TFT_BLACK);
-  tft.drawString("1-Settings  2-Radio select", 20, 220, 2);  // Draw at (10, 220)
 
-  tft.setTextDatum(TR_DATUM);  // Set text datum to top-right
-  tft.drawString(version, 300, 220, 2);  // Draw at (310, 220) to align right
+
+  tft.setTextColor(TFT_GREY, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
+  tft.drawString("1-Settings  2-Radio select", 20, 220, 2);
+  tft.drawString(version, 280, 220, 2);
 
   // restart battery display and display on/off
   xTaskCreatePinnedToCore(battery, "battery", 5000, NULL, 5, &batteryH, 1);
@@ -1375,7 +1376,7 @@ void setup() {
   tft.setTextColor(TFT_GREY, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
   tft.drawString("1-Settings  2-Radio select", 20, 220, 2);
-  tft.drawString(version, 300, 220, 2);
+  tft.drawString(version, 280, 220, 2);
   toDisplay = 0;
   displayON();
   Bdonate = false;
