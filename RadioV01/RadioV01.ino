@@ -816,7 +816,7 @@ void settings(void)
 {
   int j;
   int pos;
-  char charSet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
+  char charSet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
   int charSetLength = strlen(charSet);
   char selectedChar[2] = {0}; // To store the currently selected character
   gpio_set_level(backLight, 1);
@@ -1086,11 +1086,10 @@ static void improvWiFiInit(void* data)
   improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.0", "Raspiaudio Radio");
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
-
   while (true)
   {
     improvSerial.handleSerial();
-    delay(10);
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Use FreeRTOS delay
   }
 }
 
@@ -1148,6 +1147,12 @@ void setup() {
 
   uint8_t res;
   USBSerial.begin(115200);
+
+    // Start the Improv Wi-Fi over Serial task immediately
+  xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
+
+  // Small delay to ensure Improv Serial is ready
+  vTaskDelay(100 / portTICK_PERIOD_MS);
 
   /////////////////////////////////////////////////////
   // Little FS init
@@ -1288,8 +1293,7 @@ void setup() {
     delay(2000);
   }
 
-  // Task to initialize WiFi credentials (Improv Serial)
-  xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
+
   //  delay(2000);
   ///////////////////////////////////////////////////////////////
   // Audio init
