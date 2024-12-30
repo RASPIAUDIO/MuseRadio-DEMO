@@ -1200,7 +1200,7 @@ void setup() {
   //////////////////////////////////////////////////
   //Encoders init
   //////////////////////////////////////////////////
-  ESP32Encoder::useInternalWeakPullResistors = UP;
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
   volEncoder.attachHalfQuad(ENC_B1, ENC_A1);
   staEncoder.attachHalfQuad(ENC_A2, ENC_B2);
 
@@ -1982,7 +1982,7 @@ int vol = 20;
 IRrecv irrecv(IR);
 decode_results results;
 // MQTT Broker
-Audio audio;
+
 const char *mqtt_broker = "test.mosquitto.org";
 const char *topic = "raspiaudioRadioMaria";
 const char *mqtt_username = "";
@@ -2100,7 +2100,7 @@ i2s_pin_config_t pin_config_read = {
   //////////////////////////////////////////////////
   //Encoders init
   //////////////////////////////////////////////////
-  ESP32Encoder::useInternalWeakPullResistors = UP;
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
   volEncoder.attachHalfQuad(ENC_A1, ENC_B1);
   staEncoder.attachHalfQuad(ENC_A2, ENC_B2);
 
