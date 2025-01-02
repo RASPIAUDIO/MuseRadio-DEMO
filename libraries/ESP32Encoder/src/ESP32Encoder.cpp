@@ -6,12 +6,23 @@
  */
 
 #include <ESP32Encoder.h>
+#ifdef ARDUINO
+#include <Arduino.h>
+#else
+#include <rom/gpio.h>
+#define delay(ms) vTaskDelay(pdMS_TO_TICKS(ms))
+#endif
+
 #include <soc/soc_caps.h>
 #if SOC_PCNT_SUPPORTED
 // Not all esp32 chips support the pcnt (notably the esp32c3 does not)
 #include <soc/pcnt_struct.h>
 #include "esp_log.h"
 #include "esp_ipc.h"
+#if ( defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3) )
+	#include <freertos/FreeRTOS.h>
+	#include <rom/gpio.h>
+#endif
 
 static const char* TAG_ENCODER = "ESP32Encoder";
 
@@ -23,7 +34,7 @@ static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 //static ESP32Encoder *gpio2enc[48];
 //
 //
-enum puType ESP32Encoder::useInternalWeakPullResistors=DOWN;
+puType ESP32Encoder::useInternalWeakPullResistors = puType::down;
 uint32_t ESP32Encoder::isrServiceCpuCore = ISR_CORE_USE_DEFAULT;
 ESP32Encoder *ESP32Encoder::encoders[MAX_ESP32_ENCODERS] = { NULL, };
 
@@ -43,6 +54,10 @@ ESP32Encoder::ESP32Encoder(bool always_interrupt_, enc_isr_cb_t enc_isr_cb, void
 	direction{false},
 	working{false}
 {
+	if (enc_isr_cb_data == nullptr)
+	{
+		_enc_isr_cb_data = this;
+	}
 }
 
 ESP32Encoder::~ESP32Encoder() {}
@@ -74,15 +89,15 @@ static void esp32encoder_pcnt_intr_handler(void *arg) {
 	pcnt_unit_t unit = esp32enc->r_enc_config.unit;
 	_ENTER_CRITICAL();
 	if(PCNT.status_unit[unit].COUNTER_H_LIM){
-		esp32enc->count += esp32enc->r_enc_config.counter_h_lim;
+		esp32enc->count = esp32enc->count + esp32enc->r_enc_config.counter_h_lim;
 		pcnt_counter_clear(unit);
 	} else if(PCNT.status_unit[unit].COUNTER_L_LIM){
-		esp32enc->count += esp32enc->r_enc_config.counter_l_lim;
+		esp32enc->count = esp32enc->count + esp32enc->r_enc_config.counter_l_lim;
 		pcnt_counter_clear(unit);
 	} else if(esp32enc->always_interrupt && (PCNT.status_unit[unit].thres0_lat || PCNT.status_unit[unit].thres1_lat)) {
 		int16_t c;
 		pcnt_get_counter_value(unit, &c);
-		esp32enc->count += c;
+		esp32enc->count = esp32enc->count + c;
 		pcnt_set_event_value(unit, PCNT_EVT_THRES_0, -1);
 		pcnt_set_event_value(unit, PCNT_EVT_THRES_1, 1);
 		pcnt_event_enable(unit, PCNT_EVT_THRES_0);
@@ -103,6 +118,7 @@ void ESP32Encoder::detach(){
 	pcnt_counter_pause(unit);
 	pcnt_isr_handler_remove(this->r_enc_config.unit);
 	ESP32Encoder::encoders[unit]=NULL;
+	attached = false;
 }
 
 void ESP32Encoder::detatch(){
@@ -114,7 +130,7 @@ static IRAM_ATTR void ipc_install_isr_on_core(void *arg) {
     *result = pcnt_isr_service_install(0);
 }
 
-void ESP32Encoder::attach(int a, int b, enum encType et) {
+void ESP32Encoder::attach(int a, int b, encType et) {
 	if (attached) {
 		ESP_LOGE(TAG_ENCODER, "attach: already attached");
 		return;
@@ -127,8 +143,11 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 		}
 	}
 	if (index == MAX_ESP32_ENCODERS) {
-		ESP_LOGE(TAG_ENCODER, "Too many encoders, FAIL!");
-		return;
+		while(1){
+			ESP_LOGE(TAG_ENCODER, "Too many encoders, FAIL!");
+			delay(100);
+		}
+		
 	}
 
 	// Set data now that pin attach checks are done
@@ -141,11 +160,11 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 	gpio_pad_select_gpio(bPinNumber);
 	gpio_set_direction(aPinNumber, GPIO_MODE_INPUT);
 	gpio_set_direction(bPinNumber, GPIO_MODE_INPUT);
-	if(useInternalWeakPullResistors==DOWN){
+	if(useInternalWeakPullResistors == puType::down){
 		gpio_pulldown_en(aPinNumber);
 		gpio_pulldown_en(bPinNumber);
 	}
-	if(useInternalWeakPullResistors==UP){
+	if(useInternalWeakPullResistors == puType::up){
 		gpio_pullup_en(aPinNumber);
 		gpio_pullup_en(bPinNumber);
 	}
@@ -157,7 +176,7 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 	r_enc_config.unit = unit;
 	r_enc_config.channel = PCNT_CHANNEL_0;
 
-	r_enc_config.pos_mode = et != single ? PCNT_COUNT_DEC : PCNT_COUNT_DIS; //Count Only On Rising-Edges
+	r_enc_config.pos_mode = et != encType::single ? PCNT_COUNT_DEC : PCNT_COUNT_DIS; //Count Only On Rising-Edges
 	r_enc_config.neg_mode = PCNT_COUNT_INC;   // Discard Falling-Edge
 
 	r_enc_config.lctrl_mode = PCNT_MODE_KEEP;    // Rising A on HIGH B = CW Step
@@ -180,7 +199,7 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 	r_enc_config.lctrl_mode = PCNT_MODE_DISABLE;    // disabling channel 1
 	r_enc_config.hctrl_mode = PCNT_MODE_DISABLE; // disabling channel 1
 
-	if (et == full) {
+	if (et == encType::full) {
 		// set up second channel for full quad
 
 		r_enc_config.pos_mode = PCNT_COUNT_DEC; //Count Only On Rising-Edges
@@ -200,6 +219,12 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 	pcnt_counter_pause(unit); // Initial PCNT init
 	/* Register ISR service and enable interrupts for PCNT unit */
 	if(! attachedInterrupt){
+#ifdef CONFIG_IDF_TARGET_ESP32S2 // esp32-s2 is single core, no ipc call
+			esp_err_t er = pcnt_isr_service_install(0);
+			if (er != ESP_OK){
+				ESP_LOGE(TAG_ENCODER, "Encoder install isr service failed");
+			}
+#else
 		if (isrServiceCpuCore == ISR_CORE_USE_DEFAULT || isrServiceCpuCore == xPortGetCoreID()) {
 			esp_err_t er = pcnt_isr_service_install(0);
 			if (er != ESP_OK){
@@ -209,12 +234,13 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 			esp_err_t ipc_ret_code = ESP_FAIL;
 			esp_err_t er = esp_ipc_call_blocking(isrServiceCpuCore, ipc_install_isr_on_core, &ipc_ret_code);
 			if (er != ESP_OK){
-				ESP_LOGE(TAG_ENCODER, "IPC call to install isr service on core %d failed", isrServiceCpuCore);
+				ESP_LOGE(TAG_ENCODER, "IPC call to install isr service on core %ud failed", isrServiceCpuCore);
 			}
 			if (ipc_ret_code != ESP_OK){
-				ESP_LOGE(TAG_ENCODER, "Encoder install isr service on core %d failed", isrServiceCpuCore);
+				ESP_LOGE(TAG_ENCODER, "Encoder install isr service on core %ud failed", isrServiceCpuCore);
 			}
 		}
+#endif
 
 		attachedInterrupt=true;
 	}
@@ -239,14 +265,14 @@ void ESP32Encoder::attach(int a, int b, enum encType et) {
 }
 
 void ESP32Encoder::attachHalfQuad(int aPintNumber, int bPinNumber) {
-	attach(aPintNumber, bPinNumber, half);
+	attach(aPintNumber, bPinNumber, encType::half);
 
 }
 void ESP32Encoder::attachSingleEdge(int aPintNumber, int bPinNumber) {
-	attach(aPintNumber, bPinNumber, single);
+	attach(aPintNumber, bPinNumber, encType::single);
 }
 void ESP32Encoder::attachFullQuad(int aPintNumber, int bPinNumber) {
-	attach(aPintNumber, bPinNumber, full);
+	attach(aPintNumber, bPinNumber, encType::full);
 }
 
 void ESP32Encoder::setCount(int64_t value) {

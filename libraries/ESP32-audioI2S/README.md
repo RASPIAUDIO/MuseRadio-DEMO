@@ -71,9 +71,9 @@ void setup() {
 //  audio.connecttospeech("Wenn die Hunde schlafen, kann der Wolf gut Schafe stehlen.", "de"); // Google TTS
 }
 
-void loop()
-{
+void loop(){
     audio.loop();
+    vTaskDelay(1);
 }
 
 // optional
@@ -109,9 +109,30 @@ void audio_eof_speech(const char *info){
 }
 
 ````
+
+<br>
+
+|Codec       |ESP32  |ESP32 PSRAM  |ESP32-S3 PSRAM |                          |
+|------------|-------|-------------|---------------|--------------------------|
+| mp3        | y     | y           | y             |                          |
+| aac        | n     | y           | y             |                          |
+| aacp       | n     | y (mono)    | y (+SBR, +PS) |                          |
+| wav        | y     | y           | y             |                          |
+| flac       | n     | y           | y             |blocksize max 16384 bytes |
+| vorbis     | n     | y           | y             | <=196Kbit/s              |
+| m4a        | n     | y           | y             |                          |
+| opus       | n     | y           | y             |celt only                 |
+
+<br>
+
 Breadboard
 ![Breadboard](https://github.com/schreibfaul1/ESP32-audioI2S/blob/master/additional_info/Breadboard.jpg)
 Wiring
 ![Wiring](https://github.com/schreibfaul1/ESP32-audioI2S/blob/master/additional_info/ESP32_I2S_PCM5102A.JPG)
 Impulse diagram
 ![Impulse diagram](https://github.com/schreibfaul1/ESP32-audioI2S/blob/master/additional_info/Impulsdiagramm.jpg)
+***
+Yellobyte has developed an all-in-one board. It includes an ESP32-S3 N8R2, 2x MAX98357 and an SD card adapter.
+Documentation, circuit diagrams and examples can be found here: https://github.com/yellobyte/ESP32-DevBoards-Getting-Started
+![image](https://github.com/user-attachments/assets/4002d09e-8e76-4e08-9265-188fed7628d3)
+

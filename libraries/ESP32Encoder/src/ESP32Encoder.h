@@ -1,21 +1,28 @@
 #pragma once
 #include <driver/gpio.h>
 #include <driver/pcnt.h>
+#ifndef ARDUINO
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/portable.h>
+#include <freertos/semphr.h>
+#endif
+
 #define MAX_ESP32_ENCODERS PCNT_UNIT_MAX
 #define 	_INT16_MAX 32766
 #define  	_INT16_MIN -32766
 #define ISR_CORE_USE_DEFAULT (0xffffffff)
 
-enum encType {
+enum class encType {
 	single,
 	half,
 	full
 };
 
-enum puType {
-	UP,
-	DOWN,
-	NONE
+enum class puType {
+	up,
+	down,
+	none
 };
 
 class ESP32Encoder;
@@ -54,14 +61,14 @@ public:
 	int countsMode = 2;
 	volatile int64_t count=0;
 	pcnt_config_t r_enc_config;
-	static enum puType useInternalWeakPullResistors;
+	static puType useInternalWeakPullResistors;
 	static uint32_t isrServiceCpuCore;
 	enc_isr_cb_t _enc_isr_cb;
 	void* _enc_isr_cb_data;
 
 private:
 	static bool attachedInterrupt;
-	void attach(int aPintNumber, int bPinNumber, enum encType et);
+	void attach(int aPintNumber, int bPinNumber, encType et);
 	int64_t getCountRaw();
 	bool attached;
   bool direction;

@@ -1,8 +1,0 @@
-# pack-refs with: peeled fully-peeled sorted 
-a87bbfbcd047c6f2297e2ec20b84d7712d91346a refs/remotes/origin/faad2-aac-decoder
-3f640315d7640558bf365715403c3643c7679596 refs/remotes/origin/master
-46ca6dab60c3067448e4ec2529e64102b1f797d5 refs/tags/2.0.3
-f8e5e70617fa07ad20ae558247c73510c77c88b9 refs/tags/2.0.4
-63fd045c243df7e59ed84c2cadb69f06f305ae8a refs/tags/2.0.5
-ed150bdf6746fe16db67735420d6a3b582b3d448 refs/tags/2.0.6
-c395d0ff0c914af380c7f9213f263d1a0eaa995f refs/tags/3.0.0
