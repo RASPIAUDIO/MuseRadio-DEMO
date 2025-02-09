@@ -1,3 +1,5 @@
+V1.2 fix: AAC support, mp3 fix that was making slow pitch artifacts.
+
 # Muse Radio : Demo Internet Radio Project
 ====> Copy the libraries directory to your local librairies directory
 ====> ESP32 Arduino 2.0.13
@@ -11,7 +13,6 @@ esptool -p COM16 -b 1000000 write_flash 0 myfirmware.bin
 
 To recompile use following Arduino parameters:
 
+![image](https://github.com/user-attachments/assets/871232ee-431e-4a81-93a3-66468d48b6c2)
 
-
-![Arduino Compilation Parameters](Arduino%20compilation%20parameters.png)
 
