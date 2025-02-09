@@ -16,9 +16,9 @@
 #include <Arduino_ESP32_OTA.h>
 #include "root_ca.h"
 //#include "USB.h"
-#include <IRremoteESP8266.h>
+//#include <IRremoteESP8266.h>
 #include <IRrecv.h>
-#include <IRutils.h>
+//#include <IRutils.h>
 #include <FS.h>
 #include <SD_MMC.h>
 #include <driver/i2s.h>
@@ -32,7 +32,7 @@ PNG png;
 
 
 
-#define version "V1.0"
+#define version "V1.1"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
@@ -81,11 +81,7 @@ xTaskHandle radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiIn
 Arduino_ESP32_OTA ota;
 Arduino_ESP32_OTA::Error ota_err = Arduino_ESP32_OTA::Error::None;
 
-const char *mqtt_broker = "test.mosquitto.org";
-const char *topic = "raspiaudioRadioMaria";
-const char *mqtt_username = "";
-const char *mqtt_password = "";
-const int mqtt_port = 1883;
+
 
 
 WiFiClient espClient;
@@ -126,17 +122,6 @@ int displayT = TEMPO;
 IRrecv irrecv(IR);
 decode_results results;
 
-
-void mqttCB(char *topic, byte *payload, unsigned int length) {
-  Serial.print("Message arrived in topic: ");
-  Serial.println(topic);
-  Serial.print("Message:");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char) payload[i]);
-  }
-  Serial.println();
-  Serial.println("-----------------------");
-}
 
 void displayON(void)
 {
@@ -487,7 +472,7 @@ static void keyb(void* pdata)
 
   while (1)
   {
-   
+
     //   printf("CLICK1 = %d   CLICK2 = %d\n", gpio_get_level(CLICK1), gpio_get_level(CLICK2));
     if ((gpio_get_level(CLICK1) == 0) && (CLICK1B == false)) CLICK1E = true;
     if ((gpio_get_level(CLICK1) == 1) && (CLICK1E == true)) {
@@ -508,7 +493,7 @@ static void keyb(void* pdata)
     if (REMOTE_KEY == OK_rem) {
       CLICK2B = true;
       REMOTE_KEY = 0;
-    } 
+    }
     delay(100);
   }
 }
@@ -634,7 +619,7 @@ static void playRadio(void* data)
       toDisplay = 2;
     }
     audio.loop();
-    delay(1);
+    vTaskDelay(1);
   }
 }
 ///////////////////////////////////////////////////////////////////
@@ -1175,7 +1160,7 @@ void setup() {
   uint8_t res;
   USBSerial.begin(115200);
 
-    // Start the Improv Wi-Fi over Serial task immediately
+  // Start the Improv Wi-Fi over Serial task immediately
   xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
 
   // Small delay to ensure Improv Serial is ready
@@ -1188,7 +1173,7 @@ void setup() {
     Serial.println("LittleFS initialisation failed!");
     while (1) for (;;);
   }
- //    LittleFS.format();
+  //    LittleFS.format();
   File root = LittleFS.open("/", "r");
   File file = root.openNextFile();
   while (file) {
@@ -1241,11 +1226,11 @@ void setup() {
   delay(100);
   BOTA = false;
   if (gpio_get_level(CLICK1) == 0) BOTA = true;
-  
+
   ///////////////////////////////////////////////////////
   // to run the Factory Test
   //////////////////////////////////////////////////////
-  if(gpio_get_level(CLICK2) == 0) FactoryTest();
+  if (gpio_get_level(CLICK2) == 0) FactoryTest();
 
   ///////////////////////////////////////////////////////
   //enable remote
@@ -1436,7 +1421,7 @@ void setup() {
 
 void loop() {
 
-   
+
 
   //////////////////////////////////////////////////////////////////////
   // Volume via encoder
@@ -1808,16 +1793,16 @@ void QRcreate(void)
 }
 
 void audio_id3data(const char *info) { //id3 metadata
-  //Serial.print("id3data     ");Serial.println(info);
+  Serial.print("id3data     ");Serial.println(info);
 }
 void audio_eof_mp3(const char *info) { //end of file
-  //Serial.print("eof_mp3     ");Serial.println(info);
+  Serial.print("eof_mp3     ");Serial.println(info);
 }
 void audio_showstation(const char *info) {
-  //Serial.print("station     ");Serial.println(info);
+  Serial.print("station     ");Serial.println(info);
 }
 void audio_showstreaminfo(const char *info) {
-  //  Serial.print("streaminfo  ");Serial.println(info);
+  Serial.print("streaminfo  ");Serial.println(info);
 }
 void audio_showstreamtitle(const char *info) {
   Serial.print("streamtitle "); Serial.println(info);
@@ -1829,19 +1814,19 @@ void audio_showstreamtitle(const char *info) {
   else mes[0] = 0;
 }
 void audio_bitrate(const char *info) {
-  // Serial.print("bitrate     ");Serial.println(info);
+  Serial.print("bitrate     ");Serial.println(info);
 }
 void audio_commercial(const char *info) { //duration in sec
-  // Serial.print("commercial  ");Serial.println(info);
+   Serial.print("commercial  ");Serial.println(info);
 }
 void audio_icyurl(const char *info) { //homepage
   // Serial.print("icyurl      ");Serial.println(info);
 }
 void audio_lasthost(const char *info) { //stream URL played
-  //Serial.print("lasthost    ");Serial.println(info);
+  Serial.print("lasthost    ");Serial.println(info);
 }
 void audio_eof_speech(const char *info) {
-  //Serial.print("eof_speech  ");Serial.println(info);
+  Serial.print("eof_speech  ");Serial.println(info);
 }
 
 void fetchStationList() {
@@ -1945,11 +1930,11 @@ void fetchStationList() {
 }
 void FactoryTest() {
 
-int FILESIZE;
+  int FILESIZE;
 #define bytesToRead 128
-uint8_t b[bytesToRead];
-//bool started = false;
-// SD 1 wire
+  uint8_t b[bytesToRead];
+  //bool started = false;
+  // SD 1 wire
 #define clk         14
 #define cmd         15
 #define d0          2
@@ -1965,7 +1950,7 @@ uint8_t b[bytesToRead];
 #define I2SW (i2s_port_t)0
 #define I2SR (i2s_port_t)1
 
-// SD 1 wire
+  // SD 1 wire
 #define clk         14
 #define cmd         15
 #define d0          2
@@ -1974,49 +1959,42 @@ uint8_t b[bytesToRead];
 #define alertVal  350
 #define zeroVal   2000
 
-int adcValue;
-int res;
-int vol = 20;
+  int adcValue;
+  int res;
+  int vol = 20;
 #define maxVol 31
 
-IRrecv irrecv(IR);
-decode_results results;
-// MQTT Broker
-
-const char *mqtt_broker = "test.mosquitto.org";
-const char *topic = "raspiaudioRadioMaria";
-const char *mqtt_username = "";
-const char *mqtt_password = "";
-const int mqtt_port = 1883;
+  IRrecv irrecv(IR);
+  decode_results results;
 
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-bool testON;
-time_t now;
-struct tm timeinfo;
-char timeStr[60];
+  WiFiClient espClient;
+  PubSubClient client(espClient);
+  bool testON;
+  time_t now;
+  struct tm timeinfo;
+  char timeStr[60];
 
-uint8_t header[] = {
-  0x52, 0x49, 0x46, 0x46, //"RIFF"
-  0x24, 0x7D, 0x00, 0x00, //taille fichier - 8 (little endian)
-  0x57, 0x41, 0x56, 0x45, //"WAVE"
-  0x66, 0x6d, 0x74, 0x20, //"fmt "
-  0x10, 0x00, 0x00, 0x00, //nb d'octets du bloc
-  0x01, 0x00,             //format PCM
-  0x02, 0x00,             //nombre de canaux
-  0x40, 0x1F, 0x00, 0x00, //frequence d'echantillonnage 8000
-  0x00, 0x7D, 0x00, 0x00, //nombre d'octets a lire par seconde   32000
-  0x02, 0x00,             //nombre d'octets par bloc d'échantillonnage
-  0x10, 0x00,             //nb de bits par echantillon
-  0x64, 0x61, 0x74, 0x61, //"data"
-  0x00, 0x7D, 0x00, 0x00
-};   //nombre d'octets de donnees
+  uint8_t header[] = {
+    0x52, 0x49, 0x46, 0x46, //"RIFF"
+    0x24, 0x7D, 0x00, 0x00, //taille fichier - 8 (little endian)
+    0x57, 0x41, 0x56, 0x45, //"WAVE"
+    0x66, 0x6d, 0x74, 0x20, //"fmt "
+    0x10, 0x00, 0x00, 0x00, //nb d'octets du bloc
+    0x01, 0x00,             //format PCM
+    0x02, 0x00,             //nombre de canaux
+    0x40, 0x1F, 0x00, 0x00, //frequence d'echantillonnage 8000
+    0x00, 0x7D, 0x00, 0x00, //nombre d'octets a lire par seconde   32000
+    0x02, 0x00,             //nombre d'octets par bloc d'échantillonnage
+    0x10, 0x00,             //nb de bits par echantillon
+    0x64, 0x61, 0x74, 0x61, //"data"
+    0x00, 0x7D, 0x00, 0x00
+  };   //nombre d'octets de donnees
 
 #define BLOCK_SIZE 128
 
-// Configuration pour I2S0 (écriture)
-i2s_config_t i2s_config_write = {
+  // Configuration pour I2S0 (écriture)
+  i2s_config_t i2s_config_write = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = 8000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -2025,15 +2003,15 @@ i2s_config_t i2s_config_write = {
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
     .dma_buf_len = 128/*,
-    
+
     .use_apll = false,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
-    */
-};
+*/
+  };
 
-// Configuration pour I2S1 (lecture)
-i2s_config_t i2s_config_read = {
+  // Configuration pour I2S1 (lecture)
+  i2s_config_t i2s_config_read = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 8000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -2045,27 +2023,27 @@ i2s_config_t i2s_config_read = {
     .use_apll = false,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
-    */
-};
+*/
+  };
 
-// Configuration des broches pour I2S0 (écriture)
-i2s_pin_config_t pin_config_write = {
+  // Configuration des broches pour I2S0 (écriture)
+  i2s_pin_config_t pin_config_write = {
     .bck_io_num = I2S_BCLK,
     .ws_io_num = I2S_LRC,
     .data_out_num = I2S_DOUT,
     .data_in_num = I2S_PIN_NO_CHANGE
-};
+  };
 
-// Configuration des broches pour I2S1 (lecture)
-i2s_pin_config_t pin_config_read = {
+  // Configuration des broches pour I2S1 (lecture)
+  i2s_pin_config_t pin_config_read = {
     .bck_io_num = I2S_BCLK,
     .ws_io_num = I2S_LRC,
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_DIN
-};
+  };
 
 
-  
+
 #define RECB CLICK1B
 #define bytesToRead 128
   //  uint8_t b[bytesToRead];
@@ -2124,7 +2102,7 @@ i2s_pin_config_t pin_config_read = {
   ///////////////////////////////////////////////////////
   // test#1 buttons
   //////////////////////////////////////////////////////
- 
+
   RECB = false;
   delay(2000);
   headerL("test#1 : Buttons", "try each, from left to right bottom to top", TFT_NAVY);
@@ -2482,7 +2460,7 @@ i2s_pin_config_t pin_config_read = {
   tft.setTextDatum(TC_DATUM);
   i2s_driver_install(I2SR, &i2s_config_read, 0, NULL);
   i2s_set_pin(I2SR, &pin_config_read);
-  i2s_set_clk(I2SR, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);  
+  i2s_set_clk(I2SR, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);
   i2s_stop(I2SR);
   i2s_start(I2SR);
   i2s_zero_dma_buffer(I2SR);
@@ -2495,81 +2473,81 @@ i2s_pin_config_t pin_config_read = {
   // DAC power-up LOUT1/ROUT1 enabled
   ES8388_Write_Reg(4, 0x30);
 #define bytesToRead 128
- // uint8_t b[bytesToRead];
+  // uint8_t b[bytesToRead];
   printf("0\n");
   RECB = false;
-  while(RECB == false) delay(10);
-  
-    i2s_start(I2SR);
-    RECB = false;
-    testON = true;
-    printf("1\n");
-    f = SD_MMC.open("/record.wav", FILE_WRITE);
-    f.seek(44);
-//    int n;
-    int i;
- //   size_t t;
-    uint32_t s = 44;
-    headerL("test#11 : Microphones", "Click1 to stop recording", TFT_NAVY); 
-    while (RECB == false)
-    {
-      i = 0;
-      n = 0;
-      do
-      {
-        while (n == 0) i2s_read(I2SR, &b[i], BLOCK_SIZE, (size_t*)&n, portMAX_DELAY);
-        i = i + n;
-      } while ((i < bytesToRead) && (RECB == false));
+  while (RECB == false) delay(10);
 
-      f.write(b, i);
-      s += i;
-    }
-   
-    printf("writing header...\n");
-    f.seek(0);
-    header[40] = s & 0xFF;
-    header[41] = (s >> 8) & 0xFF;
-    header[42] = (s >> 16) & 0xFF;
-    header[43] = (s >> 24) & 0xFF;
-    header[4] = (s - 8) & 0xFF;
-    header[5] = ((s - 8) >> 8) & 0xFF;
-    header[6] = ((s - 8) >> 16) & 0xFF;
-    header[7] = ((s - 8) >> 24) & 0xFF;
-    f.write(header, 44);
-    printf("end\n");
-    f.seek(s);
-    f.close();
-    delay(100);
-    RECB = false;
- //   while (RECB == false) delay(10);   
-    headerL("test#11 : Microphones", "Playing...", TFT_NAVY);
-    i2s_stop(I2SR);
-    i2s_set_pin(I2SW, &pin_config_write);
-    i2s_set_clk(I2SW, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);
-    i2s_start(I2SW);
-    f = SD_MMC.open("/record.wav", FILE_READ);
-    f.seek(44);
+  i2s_start(I2SR);
+  RECB = false;
+  testON = true;
+  printf("1\n");
+  f = SD_MMC.open("/record.wav", FILE_WRITE);
+  f.seek(44);
+  //    int n;
+  int i;
+  //   size_t t;
+  uint32_t s = 44;
+  headerL("test#11 : Microphones", "Click1 to stop recording", TFT_NAVY);
+  while (RECB == false)
+  {
+    i = 0;
+    n = 0;
     do
     {
-      n = f.read(b, BLOCK_SIZE);
-      i2s_write(I2SW, b, n, &t, portMAX_DELAY);
-    } while (n > 0);
-    i2s_zero_dma_buffer(I2SW);
-    i2s_stop(I2SW);
-    f.close();
-    RECB = false;
-    testON = false;
+      while (n == 0) i2s_read(I2SR, &b[i], BLOCK_SIZE, (size_t*)&n, portMAX_DELAY);
+      i = i + n;
+    } while ((i < bytesToRead) && (RECB == false));
+
+    f.write(b, i);
+    s += i;
+  }
+
+  printf("writing header...\n");
+  f.seek(0);
+  header[40] = s & 0xFF;
+  header[41] = (s >> 8) & 0xFF;
+  header[42] = (s >> 16) & 0xFF;
+  header[43] = (s >> 24) & 0xFF;
+  header[4] = (s - 8) & 0xFF;
+  header[5] = ((s - 8) >> 8) & 0xFF;
+  header[6] = ((s - 8) >> 16) & 0xFF;
+  header[7] = ((s - 8) >> 24) & 0xFF;
+  f.write(header, 44);
+  printf("end\n");
+  f.seek(s);
+  f.close();
+  delay(100);
+  RECB = false;
+  //   while (RECB == false) delay(10);
+  headerL("test#11 : Microphones", "Playing...", TFT_NAVY);
+  i2s_stop(I2SR);
+  i2s_set_pin(I2SW, &pin_config_write);
+  i2s_set_clk(I2SW, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);
+  i2s_start(I2SW);
+  f = SD_MMC.open("/record.wav", FILE_READ);
+  f.seek(44);
+  do
+  {
+    n = f.read(b, BLOCK_SIZE);
+    i2s_write(I2SW, b, n, &t, portMAX_DELAY);
+  } while (n > 0);
+  i2s_zero_dma_buffer(I2SW);
+  i2s_stop(I2SW);
+  f.close();
+  RECB = false;
+  testON = false;
 
 
   delay(500);
   tft.setTextColor(TFT_WHITE, TFT_NAVY);
   tft.setTextDatum(TC_DATUM);
   tft.fillScreen(TFT_NAVY);
-  
+
   tft.fillRect(52, 102, 216, 36, TFT_NAVY);
   tft.drawString("  OK", 160, 110, 4);
   delay(1000);
-  
+
   //////////////////////////////////////////////////////////////////
   // initialisation temps NTP
   //
@@ -2594,63 +2572,39 @@ i2s_pin_config_t pin_config_read = {
   printf("==>> %s\n", timeStr);
 
 
-//////////////////////////////////////////////
-//connecting to a mqtt broker
-//////////////////////////////////////////////
-  client.setServer(mqtt_broker, mqtt_port);
-  client.setCallback(mqttCB);
-  while (!client.connected()) {
-    String client_id = "esp32-client-";
-    client_id += String(WiFi.macAddress());
-    printf("The client %s connects to the public MQTT broker\n", client_id.c_str());
 
-    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
-      printf("Public EMQX MQTT broker connected\n");
-    } else {
-      printf("failed with state %d\n", client.state());
-      delay(2000);
-    }
+  ////////////////////////////////////////////////////////////
+  // connecting to Google sheets
+  ////////////////////////////////////////////////////////////
+  delay(3000);
+  printf("Google sheets\n");
+  //    String uniqueID = String((uint32_t)(ESP.getEfuseMac() >> 32), HEX) + String((uint32_t)ESP.getEfuseMac(), HEX) ;
+  String uniqueID = String(timeStr);
+  String data = "id=" + uniqueID;
+  printf("1\n");
+  const char* googleScriptURL = "https://script.google.com/macros/s/AKfycbyNtmE7-G77xtEAAL8aoCWozyrNJcV2hoqTdlHBWbix1YImqDyb7lI8znLH3R11cq_s/exec";
+  printf("11\n");
+  HTTPClient http;
+  printf("12\n");
+  http.begin(googleScriptURL);
+  printf("13\n");
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  printf("14\n");
+  int httpResponseCode = http.POST(data);
+  printf("15\n");
+  delay(3000);
+  printf("2\n");
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    printf("3\n");
+    printf("%x\n", httpResponseCode);
+    Serial.println(response);
+  } else {
+    Serial.print("Error on sending POST: ");
+    Serial.println(httpResponseCode);
   }
-////////////////////////////////////////////////  
-// Publish and subscribe
-////////////////////////////////////////////////
-  client.publish(topic, timeStr, false);    // not retained
-  client.subscribe(topic);
 
-
-
-////////////////////////////////////////////////////////////
-// connecting to Google sheets
-////////////////////////////////////////////////////////////  
-    delay(3000);
-    printf("Google sheets\n");
-//    String uniqueID = String((uint32_t)(ESP.getEfuseMac() >> 32), HEX) + String((uint32_t)ESP.getEfuseMac(), HEX) ;
-    String uniqueID = String(timeStr);
-    String data = "id=" + uniqueID;
-    printf("1\n");
-    const char* googleScriptURL = "https://script.google.com/macros/s/AKfycbyNtmE7-G77xtEAAL8aoCWozyrNJcV2hoqTdlHBWbix1YImqDyb7lI8znLH3R11cq_s/exec";
-    printf("11\n");
-    HTTPClient http;
-    printf("12\n");
-    http.begin(googleScriptURL);
-    printf("13\n");
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    printf("14\n");
-    int httpResponseCode = http.POST(data);
-    printf("15\n");
-    delay(3000);
-    printf("2\n");
-     if(httpResponseCode > 0) {
-      String response = http.getString();
-      printf("3\n");
-      printf("%x\n",httpResponseCode);
-      Serial.println(response);
-    } else {
-      Serial.print("Error on sending POST: ");
-      Serial.println(httpResponseCode);
-    }
-
-    http.end();   
+  http.end();
 
   tft.fillRect(50, 100, 220, 40, TFT_WHITE);
   tft.fillRect(52, 102, 216, 36, TFT_NAVY);
