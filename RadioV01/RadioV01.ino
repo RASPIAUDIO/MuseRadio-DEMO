@@ -32,7 +32,7 @@ PNG png;
 
 
 
-#define version "V1.1"
+#define version "V1.1b"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
@@ -1963,6 +1963,9 @@ void FactoryTest() {
   int res;
   int vol = 20;
 #define maxVol 31
+
+
+  gpio_set_level(EN_4G, 1);
 
   IRrecv irrecv(IR);
   decode_results results;
