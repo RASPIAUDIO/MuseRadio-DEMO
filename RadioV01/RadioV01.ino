@@ -399,6 +399,36 @@ void headerL(const char *string1, const char *string2, uint16_t color)
   tft.drawString(string2, 160, 40, 2);
 }
 
+////////////////////////////////////////////////////////////////////////
+// Draw the WiFi password and wrap it on two lines if needed
+////////////////////////////////////////////////////////////////////////
+static void drawPassword(const char *password)
+{
+  constexpr int MAX_PER_LINE = 18;
+  int rectHeight = 30;
+  if (strlen(password) > MAX_PER_LINE) rectHeight = 50;
+
+  tft.fillRect(20, 120, 300, rectHeight, TFT_NAVY);
+  tft.setTextColor(TFT_YELLOW);
+  tft.setTextDatum(TL_DATUM);
+  tft.setFreeFont(FSB12);
+  tft.drawString("pwd:", 20, 120, GFXFF);
+
+  tft.setTextColor(TFT_GREEN);
+  if (strlen(password) <= MAX_PER_LINE)
+  {
+    tft.drawString(password, 80, 120, GFXFF);
+  }
+  else
+  {
+    char line1[MAX_PER_LINE + 1];
+    strncpy(line1, password, MAX_PER_LINE);
+    line1[MAX_PER_LINE] = '\0';
+    tft.drawString(line1, 80, 120, GFXFF);
+    tft.drawString(password + MAX_PER_LINE, 80, 140, GFXFF);
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // to change the volume
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -934,13 +964,9 @@ void settings(void)
       tft.setTextDatum(TL_DATUM);
       tft.setFreeFont(FSB12);
       tft.drawString("ssid:", 20, 80, GFXFF);
-      tft.setTextColor(TFT_GREEN);
-      tft.drawString((char*)ssid, 80, 80, GFXFF);
-      tft.setTextColor(TFT_YELLOW);
-      tft.fillRect(20, 120, 300, 30, TFT_NAVY);
-      tft.drawString("pwd:", 20, 120, GFXFF);
-      tft.setTextColor(TFT_GREEN);
-      tft.drawString((char*)pwd, 80, 120, GFXFF);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString((char*)ssid, 80, 80, GFXFF);
+        drawPassword((char*)pwd);
 
 
       tft.setTextColor(TFT_YELLOW);
@@ -965,14 +991,8 @@ void settings(void)
         {
           PPL = PL;
 
-          // Display current password
-          tft.fillRect(20, 120, 300, 30, TFT_NAVY);
-          tft.setTextColor(TFT_YELLOW);
-          tft.setTextDatum(TL_DATUM);
-          tft.setFreeFont(FSB12);
-          tft.drawString("pwd:", 20, 120, GFXFF);
-          tft.setTextColor(TFT_GREEN);
-          tft.drawString((char*)pwd, 80, 120, GFXFF);
+            // Display current password
+            drawPassword((char*)pwd);
 
           // Display carousel
           tft.fillRect(100, 170, 120, 40, TFT_NAVY);
