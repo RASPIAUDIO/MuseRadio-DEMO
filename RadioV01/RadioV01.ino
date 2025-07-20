@@ -404,7 +404,7 @@ void headerL(const char *string1, const char *string2, uint16_t color)
 ////////////////////////////////////////////////////////////////////////
 static void drawPassword(const char *password)
 {
-  constexpr int MAX_PER_LINE = 18;
+  constexpr int MAX_PER_LINE = 16;
   int rectHeight = 30;
   if (strlen(password) > MAX_PER_LINE) rectHeight = 50;
 
