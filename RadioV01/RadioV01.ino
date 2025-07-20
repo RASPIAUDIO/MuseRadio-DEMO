@@ -119,6 +119,83 @@ bool Bdonate = false;
 #define TEMPO 30000
 int displayT = TEMPO;
 
+//==============================================================
+// WiFi credentials management
+//==============================================================
+#define MAX_CREDENTIALS 5
+struct WifiCredential {
+  char ssid[80];
+  char pwd[80];
+};
+WifiCredential wifiCreds[MAX_CREDENTIALS];
+int wifiCredCount = 0;
+
+void saveWifiCreds()
+{
+  DynamicJsonDocument doc(512);
+  JsonArray arr = doc.createNestedArray("networks");
+  for (int i = 0; i < wifiCredCount; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["ssid"] = wifiCreds[i].ssid;
+    o["pwd"] = wifiCreds[i].pwd;
+  }
+  File f = LittleFS.open("/wifi_credentials.json", "w");
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+  }
+}
+
+void loadWifiCreds()
+{
+  wifiCredCount = 0;
+  File f = LittleFS.open("/wifi_credentials.json", "r");
+  if (!f) return;
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, f);
+  if (!err) {
+    JsonArray arr = doc["networks"].as<JsonArray>();
+    for (JsonVariant v : arr) {
+      if (wifiCredCount >= MAX_CREDENTIALS) break;
+      strlcpy(wifiCreds[wifiCredCount].ssid, v["ssid"] | "", sizeof(wifiCreds[0].ssid));
+      strlcpy(wifiCreds[wifiCredCount].pwd, v["pwd"] | "", sizeof(wifiCreds[0].pwd));
+      wifiCredCount++;
+    }
+  }
+  f.close();
+}
+
+int findWifiCred(const char* s)
+{
+  for (int i = 0; i < wifiCredCount; i++) {
+    if (strcmp(wifiCreds[i].ssid, s) == 0) return i;
+  }
+  return -1;
+}
+
+void addWifiCred(const char* s, const char* p)
+{
+  int idx = findWifiCred(s);
+  if (idx >= 0) {
+    strlcpy(wifiCreds[idx].pwd, p, sizeof(wifiCreds[idx].pwd));
+  } else if (wifiCredCount < MAX_CREDENTIALS) {
+    strlcpy(wifiCreds[wifiCredCount].ssid, s, sizeof(wifiCreds[0].ssid));
+    strlcpy(wifiCreds[wifiCredCount].pwd, p, sizeof(wifiCreds[0].pwd));
+    wifiCredCount++;
+  }
+  saveWifiCreds();
+}
+
+void removeWifiCred(int idx)
+{
+  if (idx < 0 || idx >= wifiCredCount) return;
+  for (int i = idx; i < wifiCredCount - 1; i++) {
+    wifiCreds[i] = wifiCreds[i + 1];
+  }
+  wifiCredCount--;
+  saveWifiCreds();
+}
+
 IRrecv irrecv(IR);
 decode_results results;
 
@@ -944,9 +1021,42 @@ void settings(void)
     }
     strcpy((char*)ssid, WiFi.SSID(j).c_str());
     printf("ssid = %s\n", ssid);
-    ln = LittleFS.open("/ssid", FILE_WRITE);
-    ln.write(ssid, strlen((char*)ssid) + 1);
-    ln.close();
+    int idxCred = findWifiCred((char*)ssid);
+    if (idxCred >= 0) {
+      strcpy((char*)pwd, wifiCreds[idxCred].pwd);
+      headerL("SETTINGS", "Stored network", TFT_NAVY);
+      tft.setTextColor(TFT_RED);
+      tft.setTextDatum(TC_DATUM);
+      tft.setFreeFont(FSB9);
+      tft.drawString("2 = forget   check = connect", 160, 60, GFXFF);
+      while ((button_get_level(sw1) == 1) && (button_get_level(sw3) == 1)) {
+        delay(100);
+      }
+      if (button_get_level(sw1) == 0) {
+        removeWifiCred(idxCred);
+        while (button_get_level(sw1) == 0) delay(10);
+        tft.fillScreen(TFT_NAVY);
+        tft.setTextDatum(TC_DATUM);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString("Restarting...", 150, 105, 4);
+        delay(1000);
+        esp_restart();
+      }
+      while (button_get_level(sw3) == 0) delay(10);
+      addWifiCred((char*)ssid, (char*)pwd);
+      ln = LittleFS.open("/ssid", FILE_WRITE);
+      ln.write(ssid, strlen((char*)ssid) + 1);
+      ln.close();
+      ln = LittleFS.open("/pwd", "w");
+      ln.write(pwd, strlen((char*)pwd) + 1);
+      ln.close();
+      tft.fillScreen(TFT_NAVY);
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString("Restarting...", 150, 105, 4);
+      delay(1000);
+      esp_restart();
+    }
 
     delay(1000);
     headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
@@ -1041,6 +1151,10 @@ void settings(void)
     }
     printf("ssid: %s   pwd: %s\n", ssid, pwd);
 
+    addWifiCred((char*)ssid, (char*)pwd);
+    ln = LittleFS.open("/ssid", FILE_WRITE);
+    ln.write(ssid, strlen((char*)ssid) + 1);
+    ln.close();
     ln = LittleFS.open("/pwd", "w");
     ln.write(pwd, strlen((char*)pwd) + 1);
     ln.close();
@@ -1085,6 +1199,7 @@ void WiFiConnected(const char *ssid, const char *password)
   ln = LittleFS.open("/ssid", FILE_WRITE);
   ln.write((uint8_t*)ssid, strlen(ssid) + 1);
   ln.close();
+  addWifiCred(ssid, password);
   vTaskDelete(radioH);
   vTaskDelete(keybH);
   vTaskDelete(batteryH);
@@ -1281,28 +1396,19 @@ void setup() {
   {
     printf("WiFi\n");
     gpio_set_level(EN_4G, 0);
-    ln = LittleFS.open("/ssid", FILE_READ);
-    if (!ln) settings();
-    ln.read(ssid, 80);
-    ssid[ln.size() - 1] = 0;
-    ln.close();
-    ln = LittleFS.open("/pwd", FILE_READ);
-    if (!ln) settings();
-    ln.read(pwd, 80);
-    pwd[ln.size() - 1] = 0;
-    ln.close();
+    loadWifiCreds();
+    if (wifiCredCount == 0) settings();
   }
   ////////////////////////////////////////////////
   // WiFi init
   ////////////////////////////////////////////////
   started = false;
-  printf("%s    %s\n", ssid, pwd);
-
   WiFi.useStaticBuffers(true);
   WiFi.mode(WIFI_STA);
-  //   WiFi.begin((char*)ssid, (char*)pwd);
-  wifiMulti.addAP((char*)ssid, (char*)pwd);    /////////////////////////////////////:
-  //   wifiMulti.run();
+  for (int i = 0; i < wifiCredCount; i++) {
+    wifiMulti.addAP(wifiCreds[i].ssid, wifiCreds[i].pwd);
+  }
+
   const uint32_t connectTimeoutMs = 20000;
   if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
     USBSerial.print("WiFi connected: ");
