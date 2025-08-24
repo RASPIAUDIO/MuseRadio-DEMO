@@ -26,6 +26,13 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
+// Provide a portable console alias: use USB CDC when available, else UART Serial
+// On ESP32-S2/S3 with "USB CDC On Boot" enabled, the core exposes `USBSerial`.
+// For other boards/configs, fall back to `Serial`.
+#if !defined(ARDUINO_USB_CDC_ON_BOOT)
+#define USBSerial Serial
+#endif
+
 PNG png;
 #define MAX_IMAGE_WDITH 320 // Adjust for your images
 
@@ -99,6 +106,109 @@ int Pvol;
 uint8_t mode;
 uint8_t ssid[80];
 uint8_t pwd[80];
+
+// ---- Multi WiFi credentials support ----
+#define WIFI_JSON_PATH "/wifi.json"
+#define WIFI_MAX_NETWORKS 10
+struct WifiCred { char ssid[33]; char pwd[65]; };
+
+// Load stored WiFi credentials from LittleFS JSON into an array.
+// Returns count loaded. Backward-compatible: if only /ssid and /pwd exist,
+// migrate them into JSON on first run.
+int loadWifiList(WifiCred list[], int maxItems)
+{
+  int count = 0;
+  File f = LittleFS.open(WIFI_JSON_PATH, FILE_READ);
+  if (f) {
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (!err && doc.containsKey("networks") && doc["networks"].is<JsonArray>()) {
+      for (JsonObject obj : doc["networks"].as<JsonArray>()) {
+        if (count >= maxItems) break;
+        const char* s = obj["ssid"] | "";
+        const char* p = obj["pwd"] | "";
+        strncpy(list[count].ssid, s, sizeof(list[count].ssid));
+        list[count].ssid[sizeof(list[count].ssid)-1] = 0;
+        strncpy(list[count].pwd, p, sizeof(list[count].pwd));
+        list[count].pwd[sizeof(list[count].pwd)-1] = 0;
+        count++;
+      }
+      return count;
+    }
+  }
+
+  // Backward-compat: migrate single /ssid + /pwd if present
+  File sFile = LittleFS.open("/ssid", FILE_READ);
+  File pFile = LittleFS.open("/pwd", FILE_READ);
+  if (sFile && pFile) {
+    size_t sn = sFile.readBytes((char*)ssid, sizeof(ssid)-1); ((char*)ssid)[sn] = 0;
+    size_t pn = pFile.readBytes((char*)pwd, sizeof(pwd)-1); ((char*)pwd)[pn] = 0;
+    sFile.close(); pFile.close();
+    if (sn > 0 && pn >= 0) {
+      strncpy(list[0].ssid, (char*)ssid, sizeof(list[0].ssid)); list[0].ssid[sizeof(list[0].ssid)-1]=0;
+      strncpy(list[0].pwd, (char*)pwd, sizeof(list[0].pwd)); list[0].pwd[sizeof(list[0].pwd)-1]=0;
+      count = 1;
+    }
+  }
+  return count;
+}
+
+void saveWifiList(const WifiCred list[], int count)
+{
+  DynamicJsonDocument doc(3072);
+  JsonArray arr = doc.createNestedArray("networks");
+  for (int i = 0; i < count; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["ssid"] = list[i].ssid;
+    o["pwd"]  = list[i].pwd;
+  }
+  File f = LittleFS.open(WIFI_JSON_PATH, FILE_WRITE);
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+  }
+}
+
+int indexOfSsid(const WifiCred list[], int count, const char* target)
+{
+  for (int i = 0; i < count; i++) if (strcmp(list[i].ssid, target) == 0) return i;
+  return -1;
+}
+
+// Adds new credential or updates password if SSID already exists.
+int addOrUpdateWifi(WifiCred list[], int count, const char* s, const char* p)
+{
+  int idx = indexOfSsid(list, count, s);
+  if (idx >= 0) {
+    strncpy(list[idx].pwd, p, sizeof(list[idx].pwd));
+    list[idx].pwd[sizeof(list[idx].pwd)-1] = 0;
+    return count;
+  }
+  if (count < WIFI_MAX_NETWORKS) {
+    strncpy(list[count].ssid, s, sizeof(list[count].ssid));
+    list[count].ssid[sizeof(list[count].ssid)-1] = 0;
+    strncpy(list[count].pwd, p, sizeof(list[count].pwd));
+    list[count].pwd[sizeof(list[count].pwd)-1] = 0;
+    return count + 1;
+  }
+  return count; // full, ignore
+}
+
+bool removeWifiByIndex(WifiCred list[], int &count, int idx)
+{
+  if (idx < 0 || idx >= count) return false;
+  for (int i = idx; i < count - 1; i++) list[i] = list[i+1];
+  count--;
+  return true;
+}
+
+void wifiMultiFromList(WiFiMulti &wm, const WifiCred list[], int count)
+{
+  for (int i = 0; i < count; i++) {
+    wm.addAP(list[i].ssid, list[i].pwd);
+  }
+}
 char qrData[120];
 char c[2];
 int PL;
@@ -944,6 +1054,7 @@ void settings(void)
     }
     strcpy((char*)ssid, WiFi.SSID(j).c_str());
     printf("ssid = %s\n", ssid);
+    // Keep legacy file for compatibility but main storage is wifi.json
     ln = LittleFS.open("/ssid", FILE_WRITE);
     ln.write(ssid, strlen((char*)ssid) + 1);
     ln.close();
@@ -1044,6 +1155,11 @@ void settings(void)
     ln = LittleFS.open("/pwd", "w");
     ln.write(pwd, strlen((char*)pwd) + 1);
     ln.close();
+    // Append or update in wifi.json
+    WifiCred list[WIFI_MAX_NETWORKS];
+    int count = loadWifiList(list, WIFI_MAX_NETWORKS);
+    count = addOrUpdateWifi(list, count, (char*)ssid, (char*)pwd);
+    saveWifiList(list, count);
   }
   //  }
   tft.fillScreen(TFT_NAVY);
@@ -1079,12 +1195,18 @@ void WiFiConnected(const char *ssid, const char *password)
   File ln = LittleFS.open("/mode", FILE_WRITE);
   ln.write(&bm, 1);
   ln.close();
+  // Keep legacy files updated for compatibility
   ln = LittleFS.open("/pwd", "w");
   ln.write((uint8_t*)password, strlen(password) + 1);
   ln.close();
   ln = LittleFS.open("/ssid", FILE_WRITE);
   ln.write((uint8_t*)ssid, strlen(ssid) + 1);
   ln.close();
+  // Add or update in multi-credential JSON
+  WifiCred list[WIFI_MAX_NETWORKS];
+  int count = loadWifiList(list, WIFI_MAX_NETWORKS);
+  count = addOrUpdateWifi(list, count, ssid, password);
+  saveWifiList(list, count);
   vTaskDelete(radioH);
   vTaskDelete(keybH);
   vTaskDelete(batteryH);
@@ -1281,27 +1403,21 @@ void setup() {
   {
     printf("WiFi\n");
     gpio_set_level(EN_4G, 0);
-    ln = LittleFS.open("/ssid", FILE_READ);
-    if (!ln) settings();
-    ln.read(ssid, 80);
-    ssid[ln.size() - 1] = 0;
-    ln.close();
-    ln = LittleFS.open("/pwd", FILE_READ);
-    if (!ln) settings();
-    ln.read(pwd, 80);
-    pwd[ln.size() - 1] = 0;
-    ln.close();
   }
   ////////////////////////////////////////////////
   // WiFi init
   ////////////////////////////////////////////////
   started = false;
-  printf("%s    %s\n", ssid, pwd);
+  WifiCred wifiList[WIFI_MAX_NETWORKS];
+  int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
+  if (wifiCount == 0) {
+    // No credentials yet, go to settings to add one
+    settings();
+  }
 
   WiFi.useStaticBuffers(true);
   WiFi.mode(WIFI_STA);
-  //   WiFi.begin((char*)ssid, (char*)pwd);
-  wifiMulti.addAP((char*)ssid, (char*)pwd);    /////////////////////////////////////:
+  wifiMultiFromList(wifiMulti, wifiList, wifiCount);
   //   wifiMulti.run();
   const uint32_t connectTimeoutMs = 20000;
   if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
@@ -1325,9 +1441,97 @@ void setup() {
     tft.fillRect(0, 0, 320, 240, TFT_BLACK);
     tft.setTextColor(TFT_RED);
     tft.setTextDatum(TC_DATUM);
-    tft.drawString("Connection failed...", 180, 105, 4);
-    settings();                                           //////////////////////////////
-    delay(2000);
+    tft.drawString("Connection failed...", 180, 60, 4);
+
+    // Simple menu: Retry / Forget / Add
+    int pos = 0; // 0=Retry,1=Forget,2=Add
+    staEncoder.setCount(0);
+    while (true) {
+      tft.setTextColor(pos==0?TFT_GREEN:TFT_WHITE);
+      tft.drawString("- Retry", 160, 100, 4);
+      tft.setTextColor(pos==1?TFT_GREEN:TFT_WHITE);
+      tft.drawString("- Forget network", 160, 140, 4);
+      tft.setTextColor(pos==2?TFT_GREEN:TFT_WHITE);
+      tft.drawString("- Add network", 160, 180, 4);
+
+      int V = staEncoder.getCount();
+      if (V > 0) { pos++; if (pos>2) pos=2; staEncoder.setCount(0); }
+      if (V < 0) { pos--; if (pos<0) pos=0; staEncoder.setCount(0); }
+      if (gpio_get_level(CLICK2) == 0) {
+        while (gpio_get_level(CLICK2)==0) delay(10);
+        if (pos == 0) {
+          // Retry all known networks
+          if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
+            USBSerial.print("WiFi connected: ");
+            USBSerial.println(WiFi.SSID());
+            started = true;
+            break;
+          }
+          tft.setTextColor(TFT_RED);
+          tft.drawString("Still failed.", 160, 60, 2);
+        } else if (pos == 1) {
+          // Choose network to forget
+          if (wifiCount == 0) {
+            tft.setTextColor(TFT_YELLOW);
+            tft.drawString("No saved networks.", 160, 60, 2);
+            continue;
+          }
+          int sel = 0; staEncoder.setCount(0);
+          while (gpio_get_level(CLICK2) == 1) {
+            for (int i=0;i<wifiCount && i<6;i++) {
+              tft.setTextColor(i==sel?TFT_GREEN:TFT_WHITE);
+              tft.drawString(wifiList[i].ssid, 160, 80 + i*20, 2);
+            }
+            int d = staEncoder.getCount();
+            if (d>0) { sel++; if (sel>wifiCount-1) sel=wifiCount-1; staEncoder.setCount(0);} 
+            if (d<0) { sel--; if (sel<0) sel=0; staEncoder.setCount(0);} 
+            delay(50);
+          }
+          while (gpio_get_level(CLICK2)==0) delay(10);
+          // Ask twice to confirm forgetting
+          tft.fillRect(0,0,320,240,TFT_BLACK);
+          tft.setTextColor(TFT_YELLOW);
+          tft.setTextDatum(TC_DATUM);
+          tft.drawString("Forget:", 160, 80, 2);
+          tft.setTextColor(TFT_RED);
+          tft.drawString(wifiList[sel].ssid, 160, 110, 2);
+          tft.setTextColor(TFT_WHITE);
+          tft.drawString("Press again to confirm", 160, 150, 2);
+          // wait for confirm
+          unsigned long t0 = millis(); bool confirmed=false;
+          while (millis()-t0 < 5000) {
+            if (gpio_get_level(CLICK2)==0) { confirmed=true; while (gpio_get_level(CLICK2)==0) delay(10); break; }
+            delay(10);
+          }
+          if (confirmed) {
+            if (removeWifiByIndex(wifiList, wifiCount, sel)) {
+              saveWifiList(wifiList, wifiCount);
+              tft.setTextColor(TFT_GREEN);
+              tft.drawString("Forgotten.", 160, 180, 2);
+              delay(800);
+            }
+            // Rebuild WiFiMulti after removal
+            WiFi.disconnect(true);
+            wifiMulti = WiFiMulti();
+            wifiMultiFromList(wifiMulti, wifiList, wifiCount);
+          } else {
+            tft.setTextColor(TFT_YELLOW);
+            tft.drawString("Cancelled.", 160, 180, 2);
+            delay(800);
+          }
+          tft.fillRect(0,0,320,240,TFT_BLACK);
+          tft.setTextColor(TFT_RED);
+          tft.setTextDatum(TC_DATUM);
+          tft.drawString("Connection failed...", 180, 60, 4);
+        } else if (pos == 2) {
+          settings();
+          delay(500);
+          // After settings(), the device restarts.
+        }
+      }
+      delay(50);
+    }
+    // success path continues below
   }
 
 

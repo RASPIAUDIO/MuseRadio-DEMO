@@ -40,6 +40,15 @@ Welcome to the Muse Radio demo project, an internet radio designed for the [Muse
 ### Version 1.2:
 - Fixed AAC support and corrected slow pitch artifacts in MP3 playback.
 
+### Recent Changes
+- Multiple Wi‑Fi credentials: Credentials are now stored in LittleFS at `/wifi.json` and loaded into `WiFiMulti` on boot. You can add multiple networks (via Settings or Improv), and the device will try them in order. Legacy `/ssid` and `/pwd` are still updated for compatibility.
+- Retry/Forget/Add flow on failure: If Wi‑Fi cannot connect, a small on‑device menu lets you Retry, Forget a saved network (with double confirmation to avoid mistakes), or Add a new network.
+- Long password display: The password entry screen wraps long Wi‑Fi passwords onto two lines for readability.
+- USBSerial compatibility: Added a small alias so sketches build on boards without native USB CDC. When `ARDUINO_USB_CDC_ON_BOOT` is not defined, `USBSerial` maps to `Serial`.
+
+## Future Features
+- Wi‑Fi WPS support
+
 ## Development Setup
 
 #### Libraries & Tools Required
