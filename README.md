@@ -67,5 +67,6 @@ Welcome to the Muse Radio demo project, an internet radio designed for the [Muse
 
 #### Recompilation Parameters
 - Use specified Arduino parameters as shown in your IDE settings.
+<img width="423" height="444" alt="image" src="https://github.com/user-attachments/assets/143c5175-d75c-483c-af66-9cd7ddead77f" />
+<img width="423" height="444" alt="image" src="https://github.com/user-attachments/assets/143c5175-d75c-483c-af66-9cd7ddead77f" />
 
-![Arduino Setup](https://github.com/user-attachments/assets/871232ee-431e-4a81-93a3-66468d48b6c2)
