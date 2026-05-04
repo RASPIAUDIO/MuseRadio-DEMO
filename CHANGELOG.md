@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3 - 2026-05-04
+
+- Added a fallback captive Wi-Fi setup portal at `http://192.168.4.1` when no saved network connects.
+- Display a real Wi-Fi QR code for the fallback `MuseRadio-XXXX` access point on the TFT.
+- Added an OK/encoder button shortcut from the captive portal screen to manual credential entry.
+- Documented `firmware.with-data.bin`, a single flash image that includes the LittleFS data partition at `0x310000`.
+- Defaulted fresh installs without `/mode` to Wi-Fi mode so the captive portal starts on first boot.
+- Bumped the displayed firmware version and Improv device version to 1.3.
+
 ## 1.2 - 2026-05-04
 
 - Added PlatformIO support for the Muse Radio ESP32-S3 build.

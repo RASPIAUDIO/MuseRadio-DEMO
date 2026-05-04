@@ -13,6 +13,7 @@ The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons,
 - ES8388 codec output with speaker and headphone routing.
 - Battery level display.
 - Multiple saved Wi-Fi credentials through LittleFS `/wifi.json`.
+- Captive Wi-Fi setup portal when no saved network connects.
 
 ## Source Code and Discussion
 
@@ -25,25 +26,31 @@ The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons,
 2. Power on the Muse Radio and connect it over USB.
 3. Select "Muse Radio - Radio".
 4. Click "Connect" and choose the serial port.
-5. Configure Wi-Fi credentials in the browser or through the on-screen menu.
+5. Configure Wi-Fi credentials in the browser, through the on-screen menu, or through the fallback captive portal.
+
+If no saved Wi-Fi network connects, the radio starts an access point named `MuseRadio-XXXX` with password `museradio`, shows a Wi-Fi QR code for that access point, and serves a local setup page at `http://192.168.4.1`. Scan the QR code to connect a phone to the radio, open `http://192.168.4.1`, choose a network, enter the password, and the radio saves it in `/wifi.json` before restarting. Press the OK/encoder button on the radio to skip the portal and use the manual on-screen credential entry.
 
 For installation or usage issues, open an issue on [GitHub](https://github.com/RASPIAUDIO/MuseRadio-DEMO/issues).
 
-## Release 1.2
+## Release 1.3
 
-- Added PlatformIO support for ESP32-S3 Muse Radio builds.
-- Updated the build to pioarduino / Arduino ESP32 core 3.3.8.
-- Updated `ESP32-audioI2S` to 3.4.5.
-- Enabled the ESP32-S3 N8R8 profile for 8 MB flash and 8 MB PSRAM.
-- Fixed TFT startup on ESP32-S3 by selecting the HSPI port and restoring the display backlight.
-- Fixed ES8388 audio output with the new audio library by explicitly routing MCLK on GPIO0.
-- Adapted bundled compatibility libraries for Arduino ESP32 3.x.
-- Disabled legacy factory I2S audio tests by default because the old I2S driver conflicts with the ESP-IDF 5 I2S driver used by `ESP32-audioI2S`.
+Version 1.3 is the current ESP32-S3 N8R8 release for Muse Radio. It keeps the Arduino ESP32 3.3.8 / `ESP32-audioI2S` 3.4.5 base from 1.2 and focuses on making Wi-Fi setup easier for end users.
+
+- Captive Wi-Fi setup portal when no saved network connects.
+- Real Wi-Fi QR code for the fallback `MuseRadio-XXXX` access point.
+- Fallback access point password: `museradio`.
+- Local setup page at `http://192.168.4.1` for choosing the target network and saving credentials.
+- OK/encoder button shortcut from the captive portal screen to the manual on-screen Wi-Fi entry.
+- First-boot default to Wi-Fi mode so a fresh LittleFS image reaches the captive portal without requiring manual setup first.
+- Single full-flash binary workflow with `firmware.with-data.bin`, including the LittleFS data partition at `0x310000`.
+- Retained PSRAM-enabled ESP32-S3 N8R8 build, TFT startup fix, ES8388 MCLK routing, audio metadata callback migration, and Arduino ESP32 3.x compatibility fixes from 1.2.
 
 ## Recent Changes
 
 - Multiple Wi-Fi credentials are stored in LittleFS at `/wifi.json` and loaded into `WiFiMulti` on boot.
-- The Wi-Fi failure menu can retry, forget a saved network, or add a new network.
+- When no saved Wi-Fi network connects, the radio starts a captive setup portal at `http://192.168.4.1` and displays a Wi-Fi QR code on the TFT.
+- The captive portal screen also offers the OK/encoder button as a shortcut to manual credential entry.
+- The displayed firmware version is now `V1.3`.
 - Long Wi-Fi passwords wrap onto two lines for readability.
 - `USBSerial` falls back to `Serial` when native USB CDC is not enabled.
 
@@ -70,6 +77,15 @@ PlatformIO also generates a combined binary at `.pio/build/muse_radio/firmware.f
 
 ```bash
 python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x0 .pio/build/muse_radio/firmware.factory.bin
+```
+
+To include the LittleFS data partition from `RadioV01/data` in the same binary, build the filesystem image and merge it at the `huge_app.csv` data offset `0x310000`:
+
+```powershell
+python -m platformio run -e muse_radio -t buildfs
+$bootApp0 = "$env:USERPROFILE\.platformio\packages\framework-arduinoespressif32\tools\partitions\boot_app0.bin"
+python -m esptool --chip esp32s3 merge_bin --output .pio/build/muse_radio/firmware.with-data.bin --flash_mode keep --flash_freq 80m --flash_size 8MB 0x0 .pio/build/muse_radio/bootloader.bin 0x8000 .pio/build/muse_radio/partitions.bin 0xe000 $bootApp0 0x10000 .pio/build/muse_radio/firmware.bin 0x310000 .pio/build/muse_radio/littlefs.bin
+python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x0 .pio/build/muse_radio/firmware.with-data.bin
 ```
 
 The LittleFS data directory is `RadioV01/data`. If upload does not start automatically, press the hidden IO0 button with a paperclip inserted in the headphone jack.

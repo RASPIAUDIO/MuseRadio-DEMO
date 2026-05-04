@@ -4,6 +4,8 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <DNSServer.h>
+#include <WebServer.h>
 #include <Wire.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
@@ -42,7 +44,7 @@ PNG png;
 
 
 
-#define version "V1.2"
+#define version "V1.3"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
@@ -102,6 +104,7 @@ struct tm timeinfo;
 char timeStr[60];
 Audio audio;
 static void audioEvent(Audio::msg_t msg);
+void settings(void);
 WiFiMulti wifiMulti;              //////////////////////////////////////
 #define maxVol 31
 #define pos360 31
@@ -425,6 +428,9 @@ bool jaugeB = false;
 
 TFT_eSPI tft = TFT_eSPI();
 
+DNSServer captiveDns;
+WebServer captiveServer(80);
+
 ESP32Encoder volEncoder;
 ESP32Encoder staEncoder;
 
@@ -533,6 +539,271 @@ static void drawPassword(const char *password)
     line1[MAX_PER_LINE] = '\0';
     tft.drawString(line1, 80, 120, GFXFF);
     tft.drawString(password + MAX_PER_LINE, 80, 140, GFXFF);
+  }
+}
+
+static const byte CAPTIVE_DNS_PORT = 53;
+static const char *CAPTIVE_PORTAL_URL = "http://192.168.4.1";
+static const char *CAPTIVE_AP_PASSWORD = "museradio";
+static IPAddress captivePortalIP(192, 168, 4, 1);
+static String captiveApName;
+static int captiveScanCount = 0;
+static bool captiveRestartPending = false;
+
+static String htmlEscape(const String &value)
+{
+  String escaped;
+  escaped.reserve(value.length());
+  for (size_t i = 0; i < value.length(); i++) {
+    char ch = value[i];
+    switch (ch) {
+      case '&': escaped += F("&amp;"); break;
+      case '<': escaped += F("&lt;"); break;
+      case '>': escaped += F("&gt;"); break;
+      case '"': escaped += F("&quot;"); break;
+      case '\'': escaped += F("&#39;"); break;
+      default: escaped += ch; break;
+    }
+  }
+  return escaped;
+}
+
+static String wifiQrEscape(const String &value)
+{
+  String escaped;
+  escaped.reserve(value.length());
+  for (size_t i = 0; i < value.length(); i++) {
+    char ch = value[i];
+    if (ch == '\\' || ch == ';' || ch == ',' || ch == ':' || ch == '"') escaped += '\\';
+    escaped += ch;
+  }
+  return escaped;
+}
+
+static String captiveWifiQrPayload()
+{
+  String payload = F("WIFI:T:WPA;S:");
+  payload += wifiQrEscape(captiveApName);
+  payload += F(";P:");
+  payload += wifiQrEscape(CAPTIVE_AP_PASSWORD);
+  payload += F(";;");
+  return payload;
+}
+
+static void saveWifiCredential(const char *newSsid, const char *newPassword)
+{
+  if (newSsid == nullptr || newSsid[0] == 0) return;
+  if (newPassword == nullptr) newPassword = "";
+
+  uint8_t bm = '1';
+  File f = LittleFS.open("/mode", FILE_WRITE);
+  if (f) {
+    f.write(&bm, 1);
+    f.close();
+  }
+
+  f = LittleFS.open("/pwd", "w");
+  if (f) {
+    f.write((const uint8_t*)newPassword, strlen(newPassword) + 1);
+    f.close();
+  }
+
+  f = LittleFS.open("/ssid", FILE_WRITE);
+  if (f) {
+    f.write((const uint8_t*)newSsid, strlen(newSsid) + 1);
+    f.close();
+  }
+
+  WifiCred list[WIFI_MAX_NETWORKS];
+  int count = loadWifiList(list, WIFI_MAX_NETWORKS);
+  count = addOrUpdateWifi(list, count, newSsid, newPassword);
+  saveWifiList(list, count);
+}
+
+static String captivePortalPage()
+{
+  String html;
+  html.reserve(5200);
+  html += F("<!doctype html><html><head><meta charset='utf-8'>");
+  html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  html += F("<title>Muse Radio WiFi</title>");
+  html += F("<style>");
+  html += F("body{margin:0;font-family:Arial,sans-serif;background:#111827;color:#f9fafb;}");
+  html += F("main{max-width:460px;margin:0 auto;padding:28px 18px;}");
+  html += F("h1{font-size:28px;margin:0 0 8px;}p{color:#cbd5e1;line-height:1.35;}");
+  html += F("label{display:block;margin:18px 0 6px;font-weight:700;}");
+  html += F("select,input,button{width:100%;box-sizing:border-box;font-size:17px;border-radius:8px;border:0;padding:12px;}");
+  html += F("select,input{background:#f8fafc;color:#0f172a;}button{margin-top:20px;background:#22c55e;color:#052e16;font-weight:700;}");
+  html += F("a{display:block;color:#93c5fd;margin-top:18px;text-align:center;}small{color:#94a3b8;display:block;margin-top:8px;}");
+  html += F("</style></head><body><main>");
+  html += F("<h1>Muse Radio WiFi</h1>");
+  html += F("<p>Choose a network, enter its password, then the radio will save it and restart.</p>");
+  html += F("<form method='POST' action='/save'>");
+  html += F("<label for='ssid'>Network</label><select id='ssid' name='ssid'>");
+
+  if (captiveScanCount <= 0) {
+    html += F("<option value=''>No network found</option>");
+  } else {
+    for (int i = 0; i < captiveScanCount; i++) {
+      String ssidName = WiFi.SSID(i);
+      if (!ssidName.length()) continue;
+      String escaped = htmlEscape(ssidName);
+      html += F("<option value='");
+      html += escaped;
+      html += F("'>");
+      html += escaped;
+      html += F(" (");
+      html += String(WiFi.RSSI(i));
+      html += F(" dBm");
+      if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) html += F(", open");
+      html += F(")</option>");
+    }
+  }
+
+  html += F("</select>");
+  html += F("<label for='ssid_manual'>Hidden network</label>");
+  html += F("<input id='ssid_manual' name='ssid_manual' maxlength='32' placeholder='Optional manual SSID'>");
+  html += F("<small>Leave this empty unless the network is hidden.</small>");
+  html += F("<label for='pwd'>Password</label>");
+  html += F("<input id='pwd' name='pwd' maxlength='64' type='password' autocomplete='current-password'>");
+  html += F("<button type='submit'>Save and restart</button>");
+  html += F("</form><a href='/rescan'>Scan again</a>");
+  html += F("</main></body></html>");
+  return html;
+}
+
+static void captiveHandleRoot()
+{
+  captiveServer.sendHeader("Cache-Control", "no-store");
+  captiveServer.send(200, "text/html", captivePortalPage());
+}
+
+static void captiveHandleRescan()
+{
+  WiFi.scanDelete();
+  captiveScanCount = WiFi.scanNetworks(false, true);
+  captiveServer.sendHeader("Location", "/", true);
+  captiveServer.send(302, "text/plain", "");
+}
+
+static void captiveHandleSave()
+{
+  String selectedSsid = captiveServer.arg("ssid");
+  String manualSsid = captiveServer.arg("ssid_manual");
+  String password = captiveServer.arg("pwd");
+  selectedSsid.trim();
+  manualSsid.trim();
+
+  String finalSsid = manualSsid.length() ? manualSsid : selectedSsid;
+  if (!finalSsid.length() || finalSsid.length() > 32 || password.length() > 64) {
+    captiveServer.send(400, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Invalid WiFi data</h1><p>SSID must be 1-32 chars and password 0-64 chars.</p><a href='/'>Back</a></body>"));
+    return;
+  }
+
+  saveWifiCredential(finalSsid.c_str(), password.c_str());
+  captiveRestartPending = true;
+  captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Saved</h1><p>The radio is restarting.</p></body>"));
+}
+
+static void captiveHandleNotFound()
+{
+  captiveServer.sendHeader("Location", CAPTIVE_PORTAL_URL, true);
+  captiveServer.send(302, "text/plain", "");
+}
+
+static void drawCaptivePortalScreen()
+{
+  tft.setRotation(1);
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextSize(1);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.drawString("Scan WiFi QR", 160, 6, 4);
+  tft.drawString(captiveApName.c_str(), 160, 34, 2);
+  tft.drawString("PWD: museradio", 160, 52, 2);
+  tft.drawString("Open: 192.168.4.1", 160, 70, 2);
+
+  QRCode qrcode;
+  String wifiQr = captiveWifiQrPayload();
+  uint8_t qrcodeData[qrcode_getBufferSize(4)];
+  qrcode_initText(&qrcode, qrcodeData, 4, 0, wifiQr.c_str());
+
+  uint16_t scale = 3;
+  uint16_t offsetX = (tft.width() - qrcode.size * scale) / 2;
+  uint16_t offsetY = 104;
+
+  for (uint8_t y = 0; y < qrcode.size; y++) {
+    for (uint8_t x = 0; x < qrcode.size; x++) {
+      uint16_t color = qrcode_getModule(&qrcode, x, y) ? TFT_BLACK : TFT_WHITE;
+      tft.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, color);
+    }
+  }
+
+  tft.setTextColor(TFT_GREY, TFT_WHITE);
+  tft.drawString("OK button: manual setup", 160, 222, 2);
+}
+
+static void startWifiCaptivePortal()
+{
+  gpio_set_level(backLight, 1);
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_AP_STA);
+  delay(200);
+
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  if (mac.length() < 4) mac = "0000";
+  captiveApName = "MuseRadio-" + mac.substring(mac.length() - 4);
+  captiveRestartPending = false;
+
+  WiFi.softAPConfig(captivePortalIP, captivePortalIP, IPAddress(255, 255, 255, 0));
+  bool apStarted = WiFi.softAP(captiveApName.c_str(), CAPTIVE_AP_PASSWORD);
+  if (!apStarted) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("WiFi setup AP failed", 160, 105, 4);
+    delay(2000);
+    settings();
+    return;
+  }
+
+  drawCaptivePortalScreen();
+  captiveScanCount = WiFi.scanNetworks(false, true);
+
+  captiveDns.start(CAPTIVE_DNS_PORT, "*", captivePortalIP);
+  captiveServer.on("/", HTTP_GET, captiveHandleRoot);
+  captiveServer.on("/rescan", HTTP_GET, captiveHandleRescan);
+  captiveServer.on("/save", HTTP_POST, captiveHandleSave);
+  captiveServer.on("/generate_204", HTTP_GET, captiveHandleRoot);
+  captiveServer.on("/hotspot-detect.html", HTTP_GET, captiveHandleRoot);
+  captiveServer.on("/connecttest.txt", HTTP_GET, captiveHandleRoot);
+  captiveServer.on("/ncsi.txt", HTTP_GET, captiveHandleRoot);
+  captiveServer.on("/fwlink", HTTP_GET, captiveHandleRoot);
+  captiveServer.onNotFound(captiveHandleNotFound);
+  captiveServer.begin();
+
+  printf("Captive portal started: SSID=%s PWD=%s URL=%s\n", captiveApName.c_str(), CAPTIVE_AP_PASSWORD, CAPTIVE_PORTAL_URL);
+
+  while (true) {
+    captiveDns.processNextRequest();
+    captiveServer.handleClient();
+    if (gpio_get_level(CLICK2) == 0) {
+      while (gpio_get_level(CLICK2) == 0) delay(10);
+      captiveServer.stop();
+      captiveDns.stop();
+      WiFi.softAPdisconnect(true);
+      settings();
+    }
+    if (captiveRestartPending) {
+      tft.fillScreen(TFT_NAVY);
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString("Restarting...", 160, 105, 4);
+      delay(1000);
+      esp_restart();
+    }
+    delay(10);
   }
 }
 
@@ -1146,14 +1417,7 @@ void settings(void)
     }
     printf("ssid: %s   pwd: %s\n", ssid, pwd);
 
-    ln = LittleFS.open("/pwd", "w");
-    ln.write(pwd, strlen((char*)pwd) + 1);
-    ln.close();
-    // Append or update in wifi.json
-    WifiCred list[WIFI_MAX_NETWORKS];
-    int count = loadWifiList(list, WIFI_MAX_NETWORKS);
-    count = addOrUpdateWifi(list, count, (char*)ssid, (char*)pwd);
-    saveWifiList(list, count);
+    saveWifiCredential((char*)ssid, (char*)pwd);
   }
   //  }
   tft.fillScreen(TFT_NAVY);
@@ -1185,28 +1449,13 @@ ImprovWiFi improvSerial(&USBSerial);
 void WiFiConnected(const char *ssid, const char *password)
 {
   //  printf("%s   %s\n", ssid, password);
-  uint8_t bm = '1';
-  File ln = LittleFS.open("/mode", FILE_WRITE);
-  ln.write(&bm, 1);
-  ln.close();
-  // Keep legacy files updated for compatibility
-  ln = LittleFS.open("/pwd", "w");
-  ln.write((uint8_t*)password, strlen(password) + 1);
-  ln.close();
-  ln = LittleFS.open("/ssid", FILE_WRITE);
-  ln.write((uint8_t*)ssid, strlen(ssid) + 1);
-  ln.close();
-  // Add or update in multi-credential JSON
-  WifiCred list[WIFI_MAX_NETWORKS];
-  int count = loadWifiList(list, WIFI_MAX_NETWORKS);
-  count = addOrUpdateWifi(list, count, ssid, password);
-  saveWifiList(list, count);
-  vTaskDelete(radioH);
-  vTaskDelete(keybH);
-  vTaskDelete(batteryH);
-  vTaskDelete(jackH);
-  vTaskDelete(remoteH);
-  vTaskDelete(displayONOFFH);
+  saveWifiCredential(ssid, password);
+  if (radioH) vTaskDelete(radioH);
+  if (keybH) vTaskDelete(keybH);
+  if (batteryH) vTaskDelete(batteryH);
+  if (jackH) vTaskDelete(jackH);
+  if (remoteH) vTaskDelete(remoteH);
+  if (displayONOFFH) vTaskDelete(displayONOFFH);
 
 
   tft.fillScreen(TFT_NAVY);
@@ -1231,7 +1480,7 @@ void WiFiConnected(const char *ssid, const char *password)
 }
 static void improvWiFiInit(void* data)
 {
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.0", "Raspiaudio Radio");
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.3", "Raspiaudio Radio");
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
   while (true)
@@ -1382,10 +1631,18 @@ void setup() {
 
 
   File ln = LittleFS.open("/mode", FILE_READ);
-  // if mode not defined ==> settings
-  if (!ln) settings();
-  ln.read(&mode, 1);
-  ln.close();
+  // If mode is not defined, default to WiFi and let the captive portal handle credentials.
+  if (!ln) {
+    mode = '1';
+    File modeFile = LittleFS.open("/mode", FILE_WRITE);
+    if (modeFile) {
+      modeFile.write(&mode, 1);
+      modeFile.close();
+    }
+  } else {
+    ln.read(&mode, 1);
+    ln.close();
+  }
   printf("mode = %c\n", mode);
   //////////////////////////////////////////////////////
   //Screen init
@@ -1410,8 +1667,8 @@ void setup() {
   WifiCred wifiList[WIFI_MAX_NETWORKS];
   int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
   if (wifiCount == 0) {
-    // No credentials yet, go to settings to add one
-    settings();
+    // No credentials yet, start the phone-friendly captive portal.
+    startWifiCaptivePortal();
   }
 
   WiFi.useStaticBuffers(true);
@@ -1440,97 +1697,11 @@ void setup() {
     tft.fillRect(0, 0, 320, 240, TFT_BLACK);
     tft.setTextColor(TFT_RED);
     tft.setTextDatum(TC_DATUM);
-    tft.drawString("Connection failed...", 180, 60, 4);
-
-    // Simple menu: Retry / Forget / Add
-    int pos = 0; // 0=Retry,1=Forget,2=Add
-    staEncoder.setCount(0);
-    while (true) {
-      tft.setTextColor(pos==0?TFT_GREEN:TFT_WHITE);
-      tft.drawString("- Retry", 160, 100, 4);
-      tft.setTextColor(pos==1?TFT_GREEN:TFT_WHITE);
-      tft.drawString("- Forget network", 160, 140, 4);
-      tft.setTextColor(pos==2?TFT_GREEN:TFT_WHITE);
-      tft.drawString("- Add network", 160, 180, 4);
-
-      int V = staEncoder.getCount();
-      if (V > 0) { pos++; if (pos>2) pos=2; staEncoder.setCount(0); }
-      if (V < 0) { pos--; if (pos<0) pos=0; staEncoder.setCount(0); }
-      if (gpio_get_level(CLICK2) == 0) {
-        while (gpio_get_level(CLICK2)==0) delay(10);
-        if (pos == 0) {
-          // Retry all known networks
-          if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
-            USBSerial.print("WiFi connected: ");
-            USBSerial.println(WiFi.SSID());
-            started = true;
-            break;
-          }
-          tft.setTextColor(TFT_RED);
-          tft.drawString("Still failed.", 160, 60, 2);
-        } else if (pos == 1) {
-          // Choose network to forget
-          if (wifiCount == 0) {
-            tft.setTextColor(TFT_YELLOW);
-            tft.drawString("No saved networks.", 160, 60, 2);
-            continue;
-          }
-          int sel = 0; staEncoder.setCount(0);
-          while (gpio_get_level(CLICK2) == 1) {
-            for (int i=0;i<wifiCount && i<6;i++) {
-              tft.setTextColor(i==sel?TFT_GREEN:TFT_WHITE);
-              tft.drawString(wifiList[i].ssid, 160, 80 + i*20, 2);
-            }
-            int d = staEncoder.getCount();
-            if (d>0) { sel++; if (sel>wifiCount-1) sel=wifiCount-1; staEncoder.setCount(0);} 
-            if (d<0) { sel--; if (sel<0) sel=0; staEncoder.setCount(0);} 
-            delay(50);
-          }
-          while (gpio_get_level(CLICK2)==0) delay(10);
-          // Ask twice to confirm forgetting
-          tft.fillRect(0,0,320,240,TFT_BLACK);
-          tft.setTextColor(TFT_YELLOW);
-          tft.setTextDatum(TC_DATUM);
-          tft.drawString("Forget:", 160, 80, 2);
-          tft.setTextColor(TFT_RED);
-          tft.drawString(wifiList[sel].ssid, 160, 110, 2);
-          tft.setTextColor(TFT_WHITE);
-          tft.drawString("Press again to confirm", 160, 150, 2);
-          // wait for confirm
-          unsigned long t0 = millis(); bool confirmed=false;
-          while (millis()-t0 < 5000) {
-            if (gpio_get_level(CLICK2)==0) { confirmed=true; while (gpio_get_level(CLICK2)==0) delay(10); break; }
-            delay(10);
-          }
-          if (confirmed) {
-            if (removeWifiByIndex(wifiList, wifiCount, sel)) {
-              saveWifiList(wifiList, wifiCount);
-              tft.setTextColor(TFT_GREEN);
-              tft.drawString("Forgotten.", 160, 180, 2);
-              delay(800);
-            }
-            // Rebuild WiFiMulti after removal
-            WiFi.disconnect(true);
-            wifiMulti = WiFiMulti();
-            wifiMultiFromList(wifiMulti, wifiList, wifiCount);
-          } else {
-            tft.setTextColor(TFT_YELLOW);
-            tft.drawString("Cancelled.", 160, 180, 2);
-            delay(800);
-          }
-          tft.fillRect(0,0,320,240,TFT_BLACK);
-          tft.setTextColor(TFT_RED);
-          tft.setTextDatum(TC_DATUM);
-          tft.drawString("Connection failed...", 180, 60, 4);
-        } else if (pos == 2) {
-          settings();
-          delay(500);
-          // After settings(), the device restarts.
-        }
-      }
-      delay(50);
-    }
-    // success path continues below
+    tft.drawString("Connection failed...", 160, 75, 4);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("Starting WiFi setup...", 160, 125, 2);
+    delay(1000);
+    startWifiCaptivePortal();
   }
 
 
