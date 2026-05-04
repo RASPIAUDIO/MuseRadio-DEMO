@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include <Arduino_DebugUtils.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include "decompress/utility.h"
 

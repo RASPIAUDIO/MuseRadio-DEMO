@@ -243,7 +243,12 @@ static void USE_IRAM_ATTR gpio_intr() {
   timer->dev->config.alarm_en = 1;
 #else  // _ESP32_IRRECV_TIMER_HACK
   timerWrite(timer, 0);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  timerAlarm(timer, MS_TO_USEC(params.timeout), ONCE, 0);
+  timerStart(timer);
+#else
   timerAlarmEnable(timer);
+#endif
 #endif  // _ESP32_IRRECV_TIMER_HACK
 #endif  // ESP32
 }
@@ -359,7 +364,11 @@ void IRrecv::enableIRIn(const bool pullup) {
 #if defined(ESP32)
   // Initialise the ESP32 timer.
   // 80MHz / 80 = 1 uSec granularity.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  timer = timerBegin(1000000);
+#else
   timer = timerBegin(_timer_num, 80, true);
+#endif
 #ifdef DEBUG
   if (timer == NULL) {
     DPRINT("FATAL: Unable enable system timer: ");
@@ -368,11 +377,19 @@ void IRrecv::enableIRIn(const bool pullup) {
 #endif  // DEBUG
   assert(timer != NULL);  // Check we actually got the timer.
   // Set the timer so it only fires once, and set it's trigger in uSeconds.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  timerAlarm(timer, MS_TO_USEC(params.timeout), ONCE, 0);
+#else
   timerAlarmWrite(timer, MS_TO_USEC(params.timeout), ONCE);
+#endif
   // Note: Interrupt needs to be attached before it can be enabled or disabled.
   // Note: EDGE (true) is not supported, use LEVEL (false). Ref: #1713
   // See: https://github.com/espressif/arduino-esp32/blob/caef4006af491130136b219c1205bdcf8f08bf2b/cores/esp32/esp32-hal-timer.c#L224-L227
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  timerAttachInterrupt(timer, &read_timeout);
+#else
   timerAttachInterrupt(timer, &read_timeout, false);
+#endif
 #endif  // ESP32
 
   // Initialise state machine variables
@@ -398,7 +415,11 @@ void IRrecv::disableIRIn(void) {
   os_timer_disarm(&timer);
 #endif  // ESP8266
 #if defined(ESP32)
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  timerStop(timer);
+#else
   timerAlarmDisable(timer);
+#endif
   timerDetachInterrupt(timer);
   timerEnd(timer);
 #endif  // ESP32
@@ -426,7 +447,11 @@ void IRrecv::resume(void) {
   params.rawlen = 0;
   params.overflow = false;
 #if defined(ESP32)
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  timerStop(timer);
+#else
   timerAlarmDisable(timer);
+#endif
   gpio_intr_enable((gpio_num_t)params.recvpin);
 #endif  // ESP32
 }

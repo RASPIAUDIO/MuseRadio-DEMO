@@ -21,15 +21,18 @@
 //#include <IRutils.h>
 #include <FS.h>
 #include <SD_MMC.h>
-#include <driver/i2s.h>
 #include "lwip/apps/sntp.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
+#ifndef ENABLE_LEGACY_FACTORY_I2S
+#define ENABLE_LEGACY_FACTORY_I2S 0
+#endif
+
 // Provide a portable console alias: use USB CDC when available, else UART Serial
 // On ESP32-S2/S3 with "USB CDC On Boot" enabled, the core exposes `USBSerial`.
 // For other boards/configs, fall back to `Serial`.
-#if !defined(ARDUINO_USB_CDC_ON_BOOT)
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
 #define USBSerial Serial
 #endif
 
@@ -39,13 +42,13 @@ PNG png;
 
 
 
-#define version "V1.1b"
+#define version "V1.2"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
 #define I2S_LRC         16
 #define I2S_DIN         4
-#define I2SN (i2s_port_t)0
+#define I2S_MCLK        0
 #define I2CN (i2c_port_t)0
 #define SDA 18
 #define SCL 11
@@ -98,6 +101,7 @@ time_t now;
 struct tm timeinfo;
 char timeStr[60];
 Audio audio;
+static void audioEvent(Audio::msg_t msg);
 WiFiMulti wifiMulti;              //////////////////////////////////////
 #define maxVol 31
 #define pos360 31
@@ -370,13 +374,6 @@ int ES8388_Init(void)
 
 int delay1 = 10;
 int delay2 = 500;
-i2s_pin_config_t pin_configR =
-{
-  .bck_io_num   =   I2S_BCLK,
-  .ws_io_num    =   I2S_LRC ,
-  .data_out_num =   I2S_DOUT,
-  .data_in_num  =   I2S_DIN
-};
 
 int station = 0;
 int previousStation;
@@ -736,10 +733,7 @@ static void playRadio(void* data)
     if ((station != previousStation) || (connected == false))
     {
       printf("station no %d %s\n", station, Rname(station));
-      i2s_stop(I2SN);
-      i2s_zero_dma_buffer(I2SN);
       delay(500);
-      i2s_start(I2SN);
       audio.stopSong();
       connected = false;
       //delay(100);
@@ -1301,6 +1295,10 @@ void setup() {
 
   uint8_t res;
   USBSerial.begin(115200);
+  printf("PSRAM: %s, size=%u, free=%u\n",
+         psramFound() ? "yes" : "no",
+         (unsigned)ESP.getPsramSize(),
+         (unsigned)ESP.getFreePsram());
 
   // Start the Improv Wi-Fi over Serial task immediately
   xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
@@ -1354,6 +1352,7 @@ void setup() {
   gpio_set_direction(EN_4G, GPIO_MODE_OUTPUT);
   gpio_set_direction(PA, GPIO_MODE_OUTPUT);
   gpio_set_direction(backLight, GPIO_MODE_OUTPUT);
+  gpio_set_level(backLight, 1);
 
   //gpio_set_pull_mode
   gpio_set_pull_mode(CLICK1, GPIO_PULLUP_ONLY);
@@ -1546,8 +1545,8 @@ void setup() {
   if (res == 0)printf("Codec init OK\n"); else printf("Codec init failed\n");
 
   // audio lib init
-  i2s_set_pin((i2s_port_t)0, &pin_configR);
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  Audio::audio_info_callback = audioEvent;
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
   audio.setVolumeSteps(maxVol + 1);
   audio.setVolume(maxVol);
 
@@ -1926,13 +1925,13 @@ void loop() {
 void audio_info(const char *info) {
 #define maxRetries 4
   // Serial.print("info        "); Serial.println(info);
-  if (strstr(info, "SampleRate=") > 0)
+  if (strstr(info, "SampleRate=") != nullptr)
   {
     sscanf(info, "SampleRate=%d", &sampleRate);
     printf("==================>>>>>>>>>>%d\n", sampleRate);
   }
   connected = true;
-  if (strstr(info, "failed") > 0) {
+  if (strstr(info, "failed") != nullptr) {
     connected = false;
     printf("failed\n");
 
@@ -2053,6 +2052,42 @@ void audio_eof_speech(const char *info) {
   Serial.print("eof_speech  "); Serial.println(info);
 }
 
+static void audioEvent(Audio::msg_t msg) {
+  const char* info = msg.msg ? msg.msg : "";
+  switch (msg.e) {
+    case Audio::evt_info:
+    case Audio::evt_log:
+      audio_info(info);
+      break;
+    case Audio::evt_id3data:
+      audio_id3data(info);
+      break;
+    case Audio::evt_eof:
+      audio_eof_mp3(info);
+      break;
+    case Audio::evt_name:
+      audio_showstation(info);
+      break;
+    case Audio::evt_icydescription:
+      audio_showstreaminfo(info);
+      break;
+    case Audio::evt_streamtitle:
+      audio_showstreamtitle(info);
+      break;
+    case Audio::evt_bitrate:
+      audio_bitrate(info);
+      break;
+    case Audio::evt_icyurl:
+      audio_icyurl(info);
+      break;
+    case Audio::evt_lasthost:
+      audio_lasthost(info);
+      break;
+    default:
+      break;
+  }
+}
+
 void fetchStationList() {
   // Lire l'URL de base à partir du fichier /QR
   File ln = LittleFS.open("/QR", FILE_READ);
@@ -2171,8 +2206,10 @@ void FactoryTest() {
 #define I2S_BCLK      5
 #define I2S_LRC       16
 #define I2S_DIN       4
+#if ENABLE_LEGACY_FACTORY_I2S
 #define I2SW (i2s_port_t)0
 #define I2SR (i2s_port_t)1
+#endif
 
   // SD 1 wire
 #define clk         14
@@ -2221,6 +2258,7 @@ void FactoryTest() {
 #define BLOCK_SIZE 128
 
   // Configuration pour I2S0 (écriture)
+#if ENABLE_LEGACY_FACTORY_I2S
   i2s_config_t i2s_config_write = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = 8000,
@@ -2268,6 +2306,7 @@ void FactoryTest() {
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_DIN
   };
+#endif
 
 
 
@@ -2595,6 +2634,7 @@ void FactoryTest() {
   ///////////////////////////////////////////////////////
   // test#9 Audio => speaker
   ///////////////////////////////////////////////////////
+#if ENABLE_LEGACY_FACTORY_I2S
   headerL("test#9 Audio => Speaker", "nothing to do...", TFT_NAVY);
   tft.fillRect(50, 100, 220, 40, TFT_WHITE);
   tft.fillRect(52, 102, 216, 36, TFT_NAVY);
@@ -2764,6 +2804,10 @@ void FactoryTest() {
   f.close();
   RECB = false;
   testON = false;
+#else
+  headerL("test#9-11 Audio I2S", "disabled on Arduino 3", TFT_NAVY);
+  delay(1000);
+#endif
 
 
   delay(500);

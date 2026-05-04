@@ -1,71 +1,81 @@
+# Muse Radio Demo
 
-# Muse Radio: Demo Internet Radio Project
+Internet radio demo project for the [Muse Radio](https://raspiaudio.com/product/muse-radio/) by RASPIAUDIO.
 
-Welcome to the Muse Radio demo project, an internet radio designed for the [Muse Radio](https://raspiaudio.com/product/muse-radio/) product by RASPIAUDIO. This demonstration showcases various features including WiFi streaming, integrated screen and button controls, and more.
+The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons, IR remote control, OTA support, ES8388 codec output, headphone/speaker switching, and battery monitoring.
 
 ## Features
 
-- **WiFi Streaming**: Supports multiple stream formats such as MP3, AAC, and more.
-- **User Interface**: Seamlessly integrates a display screen and six-button control.
-- **Remote Control**: Operate using an IR remote.
-- **OTA Updates**: Over-the-air demo support.
-- **Audio Codec**: Utilizes the ES8388 codec, with support for both headphone jack and speaker, including codec volume control.
-- **Battery Monitoring**: Displays battery level status.
+- Wi-Fi streaming with MP3, AAC, and common internet radio formats.
+- TFT display UI with encoder and button controls.
+- IR remote support.
+- OTA update support.
+- ES8388 codec output with speaker and headphone routing.
+- Battery level display.
+- Multiple saved Wi-Fi credentials through LittleFS `/wifi.json`.
 
 ## Source Code and Discussion
 
-- **Source Code**: Available on [GitHub](https://github.com/RASPIAUDIO/MuseRadio-DEMO).
-- **Discussion Forum**: Join the conversation on our [forum](https://forum.raspiaudio.com/t/muse-radio-demo-app-fo-internet-radio-update/1214).
+- Source code: [github.com/RASPIAUDIO/MuseRadio-DEMO](https://github.com/RASPIAUDIO/MuseRadio-DEMO)
+- Discussion forum: [Muse Radio demo app for internet radio update](https://forum.raspiaudio.com/t/muse-radio-demo-app-fo-internet-radio-update/1214)
 
-## Installation Instructions
+## Installation
 
-1. **Access the Application**:
-   - Visit [apps.raspiaudio.com](https://apps.raspiaudio.com) using Chrome.
+1. Visit [apps.raspiaudio.com](https://apps.raspiaudio.com) with Chrome.
+2. Power on the Muse Radio and connect it over USB.
+3. Select "Muse Radio - Radio".
+4. Click "Connect" and choose the serial port.
+5. Configure Wi-Fi credentials in the browser or through the on-screen menu.
 
-2. **Connect the Device**:
-   - Power on the Muse Radio and connect it to your computer via a USB data cable.
+For installation or usage issues, open an issue on [GitHub](https://github.com/RASPIAUDIO/MuseRadio-DEMO/issues).
 
-3. **Setup Muse Radio**:
-   - Select "Muse Radio - Radio" on the website.
-   - Click "Connect" and choose the appropriate COM port.
+## Release 1.2
 
-4. **Set Up WiFi**:
-   - After the 2-minute download, configure your WiFi credentials directly in the browser (an offline option) or through the on-screen menu.
+- Added PlatformIO support for ESP32-S3 Muse Radio builds.
+- Updated the build to pioarduino / Arduino ESP32 core 3.3.8.
+- Updated `ESP32-audioI2S` to 3.4.5.
+- Enabled the ESP32-S3 N8R8 profile for 8 MB flash and 8 MB PSRAM.
+- Fixed TFT startup on ESP32-S3 by selecting the HSPI port and restoring the display backlight.
+- Fixed ES8388 audio output with the new audio library by explicitly routing MCLK on GPIO0.
+- Adapted bundled compatibility libraries for Arduino ESP32 3.x.
+- Disabled legacy factory I2S audio tests by default because the old I2S driver conflicts with the ESP-IDF 5 I2S driver used by `ESP32-audioI2S`.
 
-5. **Troubleshooting**:
-   - For any issues during installation or usage, please open an issue on [GitHub](https://github.com/RASPIAUDIO/MuseRadio-DEMO/issues).
+## Recent Changes
 
-## Updates
-
-### Version 1.2:
-- Fixed AAC support and corrected slow pitch artifacts in MP3 playback.
-
-### Recent Changes
-- Multiple Wi‑Fi credentials: Credentials are now stored in LittleFS at `/wifi.json` and loaded into `WiFiMulti` on boot. You can add multiple networks (via Settings or Improv), and the device will try them in order. Legacy `/ssid` and `/pwd` are still updated for compatibility.
-- Retry/Forget/Add flow on failure: If Wi‑Fi cannot connect, a small on‑device menu lets you Retry, Forget a saved network (with double confirmation to avoid mistakes), or Add a new network.
-- Long password display: The password entry screen wraps long Wi‑Fi passwords onto two lines for readability.
-- USBSerial compatibility: Added a small alias so sketches build on boards without native USB CDC. When `ARDUINO_USB_CDC_ON_BOOT` is not defined, `USBSerial` maps to `Serial`.
-
-## Future Features
-- Wi‑Fi WPS support
+- Multiple Wi-Fi credentials are stored in LittleFS at `/wifi.json` and loaded into `WiFiMulti` on boot.
+- The Wi-Fi failure menu can retry, forget a saved network, or add a new network.
+- Long Wi-Fi passwords wrap onto two lines for readability.
+- `USBSerial` falls back to `Serial` when native USB CDC is not enabled.
 
 ## Development Setup
 
-#### Libraries & Tools Required
-- Copy the `libraries` directory to your local libraries folder.
-- ESP32 Arduino 2.0.13.
-- Install the LittleFS plugin in Arduino IDE.
+Required tools and target:
 
-#### Flashing and Uploading Data
-- Upload your data directory using LittleFS. If upload doesn’t start automatically, you may need to:
-  - Press the hidden IO0 button with a paperclip inserted in the headphone jack.
-- To flash precompiled firmware, use the following command (adjust with your serial COM port and file name):
+- PlatformIO Core 6.1.19 or newer.
+- pioarduino stable `platform-espressif32`.
+- Arduino ESP32 core 3.3.8.
+- ESP32-audioI2S 3.4.5.
+- ESP32-S3 with 8 MB flash and 8 MB PSRAM.
+- PlatformIO board profile: `esp32-s3-devkitc1-n8r8`.
 
-  ```bash
-  esptool -p COM16 -b 1000000 write_flash 0 myfirmware.bin
-  ```
+The repository includes a `platformio.ini` configured for the Muse Radio ESP32-S3 build. On Windows, use `python -m platformio` if another older `platformio.exe` is first in `PATH`.
 
-#### Recompilation Parameters
-- Use specified Arduino parameters as shown in your IDE settings.
-<img width="420" height="458" alt="image" src="https://github.com/user-attachments/assets/a65fd9cc-7095-4753-a1b7-7152aec121b8" />
+```bash
+python -m platformio run -e muse_radio
+python -m platformio run -e muse_radio -t upload --upload-port COM5
+python -m platformio run -e muse_radio -t uploadfs --upload-port COM5
+```
 
+PlatformIO also generates a combined binary at `.pio/build/muse_radio/firmware.factory.bin`. This "total" binary contains the bootloader, partition table, OTA boot app, and firmware image, and must be flashed at address `0x0`.
+
+```bash
+python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x0 .pio/build/muse_radio/firmware.factory.bin
+```
+
+The LittleFS data directory is `RadioV01/data`. If upload does not start automatically, press the hidden IO0 button with a paperclip inserted in the headphone jack.
+
+## Notes
+
+- PSRAM is required by `ESP32-audioI2S` 3.4.5.
+- The ES8388 codec needs MCLK on GPIO0 with the current audio library.
+- Legacy factory I2S tests can be re-enabled with `ENABLE_LEGACY_FACTORY_I2S=1`, but they are incompatible with the new audio driver path and are disabled by default.
