@@ -30,10 +30,12 @@
 // Fix IDF problems with ESP32S3
 // Note illogical enumerations: FSPI_HOST=SPI2_HOST=1   HSPI_HOST=SPI3_HOST=2
 #if CONFIG_IDF_TARGET_ESP32S3
-  // Fix ESP32C3 IDF bug for missing definition (FSPI only tested at the moment)
-  #ifndef REG_SPI_BASE //                      HSPI                 FSPI/VSPI
-    #define REG_SPI_BASE(i) (((i)>1) ? (DR_REG_SPI3_BASE) : (DR_REG_SPI2_BASE))
+  // Arduino's S3 SPI bus ids used by this file do not match IDF 5's REG_SPI_BASE
+  // helper for GPSPI3, so keep TFT_eSPI direct writes on the selected display bus.
+  #ifdef REG_SPI_BASE
+    #undef REG_SPI_BASE
   #endif
+  #define REG_SPI_BASE(i) (((i)>1) ? (DR_REG_SPI3_BASE) : (DR_REG_SPI2_BASE))
 
   // Fix ESP32S3 IDF bug for name change
   #ifndef SPI_MOSI_DLEN_REG

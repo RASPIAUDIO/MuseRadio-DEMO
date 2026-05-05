@@ -123,6 +123,7 @@ class Audio {
     bool             isRunning() { return m_f_running; }
     void             loop();
     uint32_t         stopSong();
+    size_t           writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate = 44100, uint8_t channels = 2);
     void             forceMono(bool m);
     void             setOutput48KHz(bool f48);
     void             setBalance(float balance = 0.0f);

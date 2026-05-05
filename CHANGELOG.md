@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5 - 2026-05-05
+
+- Stabilized Spotify Connect playback after the initial 1.4 POC.
+- Fixed Spotify audio fetching through the Spotify `spclient` storage-resolve endpoint with protobuf CDN URL parsing.
+- Added Spotify pause/resume handling in the local `cspot` track player.
+- Changed Spotify volume handling to drive the ES8388 codec output directly, avoiding software attenuation of PCM samples.
+- Added a short guard before radio resume after Spotify disconnects to reduce I2S/network task races.
+- Bumped the displayed firmware version and Improv device version to 1.5.
+
+## 1.4 - 2026-05-05
+
+- Added an isolated `muse_radio_spotify_poc` PlatformIO environment with `ENABLE_SPOTIFY_CONNECT=1`.
+- Added a native Spotify Connect POC using vendored `cspot` from `1b07a9c00ba6d5e878e5b33dcbf89bff493cde26`, with nested `bell` vendored from `e83737367a08b5a5a1f652a7ecb97a0d926929dd`.
+- Added `SpotifyConnectService` wiring for ZeroConf setup, LittleFS auth cache at `/spotify_auth.json`, Spotify active/inactive events, and radio resume after Spotify disconnects.
+- Added a minimal TFT `Spotify Connect` status screen; LVGL remains out of scope for this version.
+- Added raw 44.1 kHz / 16-bit stereo PCM output to the local `ESP32-audioI2S` copy so Spotify PCM can reuse the Muse ES8388 I2S path.
+- Added reproducible nanopb/protobuf generated files for the `cspot` build and PlatformIO/ESP-IDF compatibility shims.
+- Bumped the displayed firmware version and Improv device version to 1.4.
+- Documented the GPLv3/source-public direction, Spotify Premium requirement, and unofficial `cspot` risk.
+
 ## 1.3 - 2026-05-04
 
 - Added a fallback captive Wi-Fi setup portal at `http://192.168.4.1` when no saved network connects.

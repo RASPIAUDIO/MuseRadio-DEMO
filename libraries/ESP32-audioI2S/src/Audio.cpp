@@ -3275,6 +3275,54 @@ uint32_t Audio::stopSong() {
     return currTime;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+size_t Audio::writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate, uint8_t channels) {
+    if (!data || len < 4 || channels != 2 || !m_f_I2S_init) return 0;
+
+    if (m_i2s_items.sampleRate != sampleRate) {
+        setSampleRate(sampleRate);
+    }
+
+    if (!m_f_i2s_channel_enabled) {
+        I2Sstart();
+    }
+
+    constexpr size_t SRC_FRAME_BYTES = 4; // 16-bit stereo PCM
+    constexpr size_t OUT_SAMPLES = 512;   // 256 stereo frames
+    constexpr size_t OUT_FRAME_BYTES = 2 * sizeof(int32_t);
+    int32_t out[OUT_SAMPLES];
+
+    size_t consumed = 0;
+    size_t frames = len / SRC_FRAME_BYTES;
+
+    while (frames > 0) {
+        const size_t framesThisPass = frames < (OUT_SAMPLES / 2) ? frames : (OUT_SAMPLES / 2);
+        for (size_t frame = 0; frame < framesThisPass; frame++) {
+            const size_t src = consumed + frame * SRC_FRAME_BYTES;
+            const int16_t left = (int16_t)((uint16_t)data[src] | ((uint16_t)data[src + 1] << 8));
+            const int16_t right = (int16_t)((uint16_t)data[src + 2] | ((uint16_t)data[src + 3] << 8));
+            out[frame * 2] = ((int32_t)left) << 16;
+            out[frame * 2 + 1] = ((int32_t)right) << 16;
+        }
+
+        size_t bytesWritten = 0;
+        const size_t bytesToWrite = framesThisPass * OUT_FRAME_BYTES;
+        esp_err_t err = i2s_channel_write(m_i2s_tx_handle, out, bytesToWrite, &bytesWritten, 50);
+        if (!(err == ESP_OK || err == ESP_ERR_TIMEOUT) || bytesWritten == 0) {
+            break;
+        }
+
+        const size_t framesWritten = bytesWritten / OUT_FRAME_BYTES;
+        consumed += framesWritten * SRC_FRAME_BYTES;
+        frames -= framesWritten;
+
+        if (framesWritten < framesThisPass) {
+            break;
+        }
+    }
+
+    return consumed;
+}
+
 bool Audio::pauseResume() {
     xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
     bool retVal = false;

@@ -24,8 +24,13 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include "lwip/apps/sntp.h"
+#if ENABLE_SPOTIFY_CONNECT
+#include "MuseHTTPClient.h"
+#else
 #include <HTTPClient.h>
+#endif
 #include <ArduinoJson.h>
+#include "SpotifyConnect.h"
 
 #ifndef ENABLE_LEGACY_FACTORY_I2S
 #define ENABLE_LEGACY_FACTORY_I2S 0
@@ -44,7 +49,7 @@ PNG png;
 
 
 
-#define version "V1.3"
+#define version "V1.5"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
@@ -87,7 +92,7 @@ PNG png;
 
 static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPIAUDIO/ota/main/RadioLast.ota";
 
-xTaskHandle radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiInitH;
+TaskHandle_t radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiInitH;
 
 
 Arduino_ESP32_OTA ota;
@@ -382,6 +387,8 @@ int station = 0;
 int previousStation;
 int MS;
 bool connected = true;
+static volatile bool spotifyPlaybackActive = false;
+static volatile uint32_t spotifyRadioResumeAtMs = 0;
 char* linkS;
 char mes[200];
 uint32_t sampleRate;
@@ -435,6 +442,24 @@ ESP32Encoder volEncoder;
 ESP32Encoder staEncoder;
 
 
+static void forceTftPowerOn()
+{
+#ifdef TFT_BL
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+#endif
+#if defined(TFT_RST) && (TFT_RST >= 0)
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, HIGH);
+  delay(5);
+  digitalWrite(TFT_RST, LOW);
+  delay(20);
+  digitalWrite(TFT_RST, HIGH);
+  delay(150);
+#endif
+}
+
+
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -451,6 +476,7 @@ void ES8388vol_Set(uint8_t volx)
 #define lowVol   16
   if (volx > maxVol) volx = maxVol;
   if (volx == 0)ES8388_Write_Reg(25, 0x04); else ES8388_Write_Reg(25, 0x00);
+  bool spotifyCodecVolume = spotifyPlaybackActive || spotifyConnectActive();
 
   //    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);
   //    printf("VOLX = %d  %d\n",volx, jackON);
@@ -468,7 +494,13 @@ void ES8388vol_Set(uint8_t volx)
     // ROUT1/LOUT1
     ES8388_Write_Reg(48, 0);
     ES8388_Write_Reg(49, 0);
-    if (volx > lowVol)
+    if (spotifyCodecVolume)
+    {
+      audio.setVolume(maxVol);
+      ES8388_Write_Reg(46, volx + 2);
+      ES8388_Write_Reg(47, volx + 2);
+    }
+    else if (volx > lowVol)
     {
       audio.setVolume(maxVol);
       ES8388_Write_Reg(46, volx + 2);
@@ -746,6 +778,8 @@ static void drawCaptivePortalScreen()
 static void startWifiCaptivePortal()
 {
   gpio_set_level(backLight, 1);
+  forceTftPowerOn();
+  tft.init();
   WiFi.disconnect(false);
   WiFi.mode(WIFI_AP_STA);
   delay(200);
@@ -820,6 +854,76 @@ void refreshVolume(void)
   }
   audio.setVolume(maxVol / 2, 0);
   ES8388vol_Set(vol);
+  if (spotifyPlaybackActive || spotifyConnectActive())
+  {
+    spotifyConnectSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
+  }
+}
+
+static void drawSpotifyStatus(const char* line)
+{
+  tft.setRotation(1);
+  tft.fillRect(80, 90, 240, 80, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("Spotify Connect", 200, 100, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (line && line[0])
+  {
+    tft.drawString(line, 200, 135, 2);
+  }
+  else
+  {
+    tft.drawString(spotifyConnectDeviceName(), 200, 135, 2);
+  }
+}
+
+static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value, const char* text)
+{
+  switch (event)
+  {
+    case SpotifyConnectEvent::Ready:
+      printf("[spotify] ready: %s\n", text ? text : spotifyConnectDeviceName());
+      break;
+    case SpotifyConnectEvent::Active:
+      spotifyPlaybackActive = true;
+      spotifyRadioResumeAtMs = 0;
+      audio.stopSong();
+      connected = false;
+      refreshVolume();
+      drawSpotifyStatus(text ? text : spotifyConnectDeviceName());
+      break;
+    case SpotifyConnectEvent::Paused:
+      spotifyPlaybackActive = true;
+      refreshVolume();
+      drawSpotifyStatus(text ? text : "Spotify paused");
+      break;
+    case SpotifyConnectEvent::Inactive:
+      spotifyRadioResumeAtMs = millis() + 1500;
+      spotifyPlaybackActive = false;
+      connected = false;
+      refreshVolume();
+      drawSpotifyStatus(text ? text : "Radio resumes...");
+      break;
+    case SpotifyConnectEvent::Volume:
+    {
+      int newVol = (int)((value * maxVol + 32767UL) / 65535UL);
+      if (newVol < 0) newVol = 0;
+      if (newVol > maxVol) newVol = maxVol;
+      if (newVol != vol)
+      {
+        vol = newVol;
+        V = vol * pos360 / maxVol;
+        PV = V;
+        volEncoder.setCount(V);
+        refreshVolume();
+        toDisplay = 3;
+      }
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 int16_t xpos = 0;
@@ -1000,6 +1104,12 @@ static void playRadio(void* data)
   while (started == false) delay(100);
   while (1)
   {
+    if (spotifyPlaybackActive || spotifyConnectActive() ||
+        (spotifyRadioResumeAtMs != 0 && (int32_t)(millis() - spotifyRadioResumeAtMs) < 0))
+    {
+      vTaskDelay(20 / portTICK_PERIOD_MS);
+      continue;
+    }
     // printf("st %d prev %d\n",station,previousStation);
     if ((station != previousStation) || (connected == false))
     {
@@ -1480,7 +1590,7 @@ void WiFiConnected(const char *ssid, const char *password)
 }
 static void improvWiFiInit(void* data)
 {
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.3", "Raspiaudio Radio");
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.5", "Raspiaudio Radio");
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
   while (true)
@@ -1626,6 +1736,7 @@ void setup() {
   //enable remote
   ///////////////////////////////////////////////////////
   irrecv.enableIRIn();
+  forceTftPowerOn();
   tft.init();
 
 
@@ -1768,6 +1879,7 @@ void setup() {
   volEncoder.setCount(V);
   PV = V;
   refreshVolume();
+  spotifyConnectBegin(audio, handleSpotifyConnectEvent);
   // station encoder init
   staEncoder.setCount(station * 2);
   S = VS = 0;
