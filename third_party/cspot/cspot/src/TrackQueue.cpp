@@ -120,6 +120,38 @@ std::string bytesPreview(const std::vector<uint8_t>& data) {
   }
   return out;
 }
+
+std::vector<uint8_t> selectCoverImage(Image* images, pb_size_t imageCount) {
+  std::vector<uint8_t> fallback;
+  std::vector<uint8_t> smallFallback;
+
+  for (pb_size_t i = 0; i < imageCount; i++) {
+    if (images[i].file_id == nullptr) {
+      continue;
+    }
+
+    auto imageId = pbArrayToVector(images[i].file_id);
+    const std::string imageHex = bytesToHexString(imageId);
+    if (fallback.empty()) {
+      fallback = imageId;
+    }
+
+    // Spotify image IDs commonly encode size markers: 1e02 is ~300px,
+    // 4851 is ~64px, b273 is ~640px. Prefer medium for the TFT cover.
+    if (imageHex.find("00001e02") != std::string::npos) {
+      return imageId;
+    }
+    if (smallFallback.empty() &&
+        imageHex.find("00004851") != std::string::npos) {
+      smallFallback = imageId;
+    }
+  }
+
+  if (!smallFallback.empty()) {
+    return smallFallback;
+  }
+  return fallback;
+}
 }  // namespace
 
 namespace TrackDataUtils {
@@ -190,9 +222,11 @@ void TrackInfo::loadPbTrack(Track* pbTrack, const std::vector<uint8_t>& gid) {
 
     if (pbTrack->album.has_cover_group &&
         pbTrack->album.cover_group.image_count > 0) {
-      auto imageId =
-          pbArrayToVector(pbTrack->album.cover_group.image[0].file_id);
-      imageUrl = "https://i.scdn.co/image/" + bytesToHexString(imageId);
+      auto imageId = selectCoverImage(pbTrack->album.cover_group.image,
+                                      pbTrack->album.cover_group.image_count);
+      if (!imageId.empty()) {
+        imageUrl = "https://i.scdn.co/image/" + bytesToHexString(imageId);
+      }
     }
   }
 
@@ -210,8 +244,11 @@ void TrackInfo::loadPbEpisode(Episode* pbEpisode,
 
   if (pbEpisode->covers->image_count > 0) {
     // Handle episode info
-    auto imageId = pbArrayToVector(pbEpisode->covers->image[0].file_id);
-    imageUrl = "https://i.scdn.co/image/" + bytesToHexString(imageId);
+    auto imageId =
+        selectCoverImage(pbEpisode->covers->image, pbEpisode->covers->image_count);
+    if (!imageId.empty()) {
+      imageUrl = "https://i.scdn.co/image/" + bytesToHexString(imageId);
+    }
   }
 
   number = pbEpisode->has_number ? pbEpisode->number : 0;
@@ -288,6 +325,8 @@ void QueuedTrack::stepParseMetadata(Track* pbTrack, Episode* pbEpisode) {
     if (trackId.size() > 0) {
       // Load track information
       trackInfo.loadPbTrack(pbTrack, trackId);
+      CSPOT_LOG(info, "Track cover URL: %s",
+                trackInfo.imageUrl.empty() ? "(none)" : trackInfo.imageUrl.c_str());
     }
   } else {
     // Handle episodes
@@ -307,6 +346,8 @@ void QueuedTrack::stepParseMetadata(Track* pbTrack, Episode* pbEpisode) {
 
       // Load track information
       trackInfo.loadPbEpisode(pbEpisode, trackId);
+      CSPOT_LOG(info, "Episode cover URL: %s",
+                trackInfo.imageUrl.empty() ? "(none)" : trackInfo.imageUrl.c_str());
     }
   }
 
@@ -504,9 +545,18 @@ TrackQueue::~TrackQueue() {
 }
 
 TrackInfo TrackQueue::getTrackInfo(std::string_view identifier) {
+  std::scoped_lock lock(tracksMutex);
   for (auto& track : preloadedTracks) {
     if (track->identifier == identifier)
       return track->trackInfo;
+  }
+  return TrackInfo{};
+}
+
+TrackInfo TrackQueue::getCurrentTrackInfo() {
+  std::scoped_lock lock(tracksMutex);
+  if (!preloadedTracks.empty() && preloadedTracks[0]) {
+    return preloadedTracks[0]->trackInfo;
   }
   return TrackInfo{};
 }

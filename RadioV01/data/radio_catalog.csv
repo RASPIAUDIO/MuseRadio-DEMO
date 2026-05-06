@@ -1,0 +1,52 @@
+France Inter|General|FR|http://direct.franceinter.fr/live/franceinter-hifi.aac
+France Info|News|FR|http://direct.franceinfo.fr/live/franceinfo-hifi.aac
+France Culture|Culture|FR|http://direct.franceculture.fr/live/franceculture-hifi.aac
+France Musique|Classical|FR|http://direct.franceinter.fr/live/francemusique-hifi.aac
+FIP|Music|FR|http://direct.fipradio.fr/live/fip-hifi.aac
+FIP Jazz|Jazz|FR|http://direct.fipradio.fr/live/fip-webradio2.mp3
+FIP Groove|Funk|FR|http://direct.fipradio.fr/live/fip-webradio3.mp3
+FIP Rock|Rock|FR|http://direct.fipradio.fr/live/fip-webradio1.mp3
+Mouv|Hip-hop|FR|http://direct.mouv.fr/live/mouv-midfi.mp3
+RFI Monde|News|FR|http://live02.rfi.fr/rfimonde-96k.mp3
+RTL|Talk|FR|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg
+Europe 1|Talk|FR|http://ais-live.cloud-services.paris:8000/europe1.mp3
+RMC|Talk|FR|https://audio.bfmtv.com/rmcradio_128.mp3
+Sud Radio|Talk|FR|http://start-sud.ice.infomaniak.ch/start-sud-high.mp3
+BFM Business|News|FR|https://audio.bfmtv.com/bfmbusiness_128.mp3
+Radio Classique|Classical|FR|http://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3
+Frequence Jazz|Jazz|FR|http://broadcast.infomaniak.ch/frequencejazz-high.mp3
+TSF Jazz|Jazz|FR|http://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3
+Radio Nova|Eclectic|FR|http://novazz.ice.infomaniak.ch/novazz-128.mp3
+Radio Meuh|Eclectic|FR|http://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3
+Radio Crooner|Jazz|FR|http://croonerradio.ice.infomaniak.ch/croonerradio-hifi.mp3
+Rires et Chansons|Comedy|FR|http://cdn.nrjaudio.fm/audio1/fr/30401/aac_64.mp3?origine=fluxradios
+Nostalgie|Oldies|FR|http://cdn.nrjaudio.fm/audio1/fr/30601/aac_64.mp3?origine=fluxradios
+Cherie FM|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30201/aac_64.mp3?origine=fluxradios
+NRJ|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30001/aac_64.mp3?origine=fluxradios
+RTL2|Rock|FR|http://streaming.radio.rtl2.fr/rtl2-1-44-128
+Fun Radio|Dance|FR|http://streaming.radio.funradio.fr/fun-1-44-128
+Oui FM|Rock|FR|http://ouifm.ice.infomaniak.ch/ouifm-high.mp3
+Skyrock|Hip-hop|FR|http://icecast.skyrock.net/s/natio_mp3_128k
+Latina|Latin|FR|http://start-latina.ice.infomaniak.ch/start-latina-high.mp3
+FG Radio|Electro|FR|http://radiofg.impek.com/fg
+Jazz Radio|Jazz|FR|http://jazzradio.ice.infomaniak.ch/jazzradio-high.mp3
+Classic and Jazz|Classical|FR|http://jazz-wr01.ice.infomaniak.ch/jazz-wr01-128.mp3
+Suisse La Premiere|General|CH|http://stream.srg-ssr.ch/m/la-1ere/mp3_128
+RTS Espace 2|Classical|CH|http://stream.srg-ssr.ch/m/espace-2/mp3_128
+Couleur 3|Rock|CH|http://stream.srg-ssr.ch/m/couleur3/mp3_128
+RTBF La Premiere|General|BE|http://radios.rtbf.be/laprem1ere-128.mp3
+RTBF Classic 21|Rock|BE|http://radios.rtbf.be/classic21-128.mp3
+RTBF Musiq3|Classical|BE|http://radios.rtbf.be/musiq3-128.mp3
+BBC World Service|News|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_world_service
+BBC Radio 4|Talk|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm
+BBC Radio 6 Music|Alternative|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_6music
+NPR News|News|US|https://npr-ice.streamguys1.com/live.mp3
+KEXP|Alternative|US|https://kexp-mp3-128.streamguys1.com/kexp128.mp3
+KCRW|Eclectic|US|https://kcrw.streamguys1.com/kcrw_192k_mp3_on_air
+WNYC FM|Talk|US|https://fm939.wnyc.org/wnycfm
+SomaFM Groove Salad|Ambient|US|https://ice2.somafm.com/groovesalad-128-mp3
+SomaFM Drone Zone|Ambient|US|https://ice2.somafm.com/dronezone-128-mp3
+SomaFM Secret Agent|Lounge|US|https://ice2.somafm.com/secretagent-128-mp3
+Radio Paradise Main|Eclectic|US|https://stream.radioparadise.com/mp3-128
+Radio Paradise Mellow|Eclectic|US|https://stream.radioparadise.com/mellow-128
+Radio Paradise Rock|Rock|US|https://stream.radioparadise.com/rock-128

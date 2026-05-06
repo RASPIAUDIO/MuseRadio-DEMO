@@ -46,6 +46,8 @@ std::atomic<uint32_t> s_pcmPendingSinceMs(0);
 std::shared_ptr<cspot::SpircHandler> s_spirc;
 std::unique_ptr<bell::MDNSService> s_mdnsService;
 String s_deviceName;
+std::string s_trackEventText;
+std::string s_trackEventId;
 
 void unregisterSpotifyMDNS() {
   if (!s_mdnsService) {
@@ -77,7 +79,56 @@ void markPlaybackRequested() {
 void markInactive(const char* text = "Radio resumes") {
   s_pcmPending = false;
   s_active = false;
+  s_trackEventId.clear();
   emit(SpotifyConnectEvent::Inactive, 0, text);
+}
+
+std::string trackInfoEventId(const cspot::TrackInfo& info) {
+  if (!info.trackId.empty()) {
+    return info.trackId;
+  }
+  return info.name + "\n" + info.artist + "\n" + info.imageUrl;
+}
+
+std::string formatTrackEventText(const cspot::TrackInfo& info) {
+  std::string title = info.name;
+  std::string artist = info.artist;
+
+  if (title.empty()) {
+    title = "Spotify";
+  }
+  if (artist.empty()) {
+    artist = info.album;
+  }
+  if (artist.empty()) {
+    artist = "Unknown artist";
+  }
+
+  std::string text = title + "\n" + artist;
+  if (!info.imageUrl.empty()) {
+    text += "\n";
+    text += info.imageUrl;
+  }
+  return text;
+}
+
+void emitTrackInfo(const cspot::TrackInfo& info) {
+  if (info.name.empty() && info.artist.empty() && info.imageUrl.empty()) {
+    return;
+  }
+
+  const auto eventId = trackInfoEventId(info);
+  if (!eventId.empty() && eventId == s_trackEventId) {
+    return;
+  }
+  s_trackEventId = eventId;
+
+  s_trackEventText = formatTrackEventText(info);
+  Serial.printf("[spotify] track: %s - %s cover=%s\n",
+                info.artist.empty() ? "Unknown artist" : info.artist.c_str(),
+                info.name.empty() ? "Spotify" : info.name.c_str(),
+                info.imageUrl.empty() ? "(none)" : info.imageUrl.c_str());
+  emit(SpotifyConnectEvent::Track, 0, s_trackEventText.c_str());
 }
 
 void checkPcmStartTimeout() {
@@ -94,6 +145,15 @@ void checkPcmStartTimeout() {
   if (s_active.exchange(false)) {
     emit(SpotifyConnectEvent::Inactive, 0, "Spotify stream unavailable");
   }
+}
+
+void pollCurrentTrackInfo() {
+  auto handler = s_spirc;
+  if (!handler || !handler->getTrackQueue()) {
+    return;
+  }
+
+  emitTrackInfo(handler->getTrackQueue()->getCurrentTrackInfo());
 }
 
 std::string deviceName() {
@@ -176,6 +236,12 @@ void handleCSpotEvent(std::unique_ptr<cspot::SpircHandler::Event> event) {
         emit(SpotifyConnectEvent::Volume, (uint32_t)std::get<int>(event->data), nullptr);
       }
       break;
+    case EventType::TRACK_INFO:
+      if (std::holds_alternative<cspot::TrackInfo>(event->data)) {
+        const auto& info = std::get<cspot::TrackInfo>(event->data);
+        emitTrackInfo(info);
+      }
+      break;
     case EventType::DISC:
     case EventType::DEPLETED:
       markInactive();
@@ -212,8 +278,14 @@ bool runSession(std::shared_ptr<cspot::LoginBlob> blob, bool persistAuth) {
     s_spirc->getTrackPlayer()->setDataCallback(writePCM);
     emit(SpotifyConnectEvent::Ready, 0, deviceName().c_str());
 
+    uint32_t lastTrackPollMs = 0;
     while (true) {
       ctx->session->handlePacket();
+      const uint32_t nowMs = millis();
+      if ((int32_t)(nowMs - lastTrackPollMs) >= 250) {
+        lastTrackPollMs = nowMs;
+        pollCurrentTrackInfo();
+      }
       checkPcmStartTimeout();
       vTaskDelay(1);
     }

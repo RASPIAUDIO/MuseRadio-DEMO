@@ -31,6 +31,11 @@
 #endif
 #include <ArduinoJson.h>
 #include "SpotifyConnect.h"
+#if ENABLE_SPOTIFY_CONNECT
+#include "esp_heap_caps.h"
+#include "esp32s3/rom/tjpgd.h"
+#include "freertos/queue.h"
+#endif
 
 #ifndef ENABLE_LEGACY_FACTORY_I2S
 #define ENABLE_LEGACY_FACTORY_I2S 0
@@ -89,6 +94,10 @@ PNG png;
 #define sw1             1
 #define sw2             2
 #define sw3             3
+#define ADC_BUTTON_DEBUG 0
+#define ADC_BUTTON_THRESHOLD 250
+static const int ADC_BUTTON_REFERENCE[] = {1863, 2355, 486, 930};
+static const int ADC_BUTTON_COUNT = sizeof(ADC_BUTTON_REFERENCE) / sizeof(ADC_BUTTON_REFERENCE[0]);
 
 static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPIAUDIO/ota/main/RadioLast.ota";
 
@@ -110,6 +119,8 @@ char timeStr[60];
 Audio audio;
 static void audioEvent(Audio::msg_t msg);
 void settings(void);
+int button_get_level(int nb);
+static void debugAdcButtonsTick();
 WiFiMulti wifiMulti;              //////////////////////////////////////
 #define maxVol 31
 #define pos360 31
@@ -122,6 +133,12 @@ uint8_t pwd[80];
 // ---- Multi WiFi credentials support ----
 #define WIFI_JSON_PATH "/wifi.json"
 #define WIFI_MAX_NETWORKS 10
+#define RADIO_PRESET_MAX 99
+#define RADIO_NAME_MAX 48
+#define RADIO_URL_MAX 192
+#define RADIO_CATALOG_PATH "/radio_catalog.csv"
+#define RADIO_NAME_PATH "/nameS"
+#define RADIO_LINK_PATH "/linkS"
 struct WifiCred { char ssid[33]; char pwd[65]; };
 
 // Load stored WiFi credentials from LittleFS JSON into an array.
@@ -389,6 +406,28 @@ int MS;
 bool connected = true;
 static volatile bool spotifyPlaybackActive = false;
 static volatile uint32_t spotifyRadioResumeAtMs = 0;
+static String spotifyTrackTitle;
+static String spotifyTrackArtist;
+static String spotifyTrackCoverUrl;
+#if ENABLE_SPOTIFY_CONNECT
+static const int SPOTIFY_COVER_X = 12;
+static const int SPOTIFY_COVER_Y = 92;
+static const int SPOTIFY_COVER_SIZE = 88;
+static const size_t SPOTIFY_COVER_JPEG_MAX = 64 * 1024;
+static const uint32_t SPOTIFY_COVER_DELAY_MS = 8000;
+struct SpotifyCoverRequest {
+  char url[128];
+  uint32_t generation;
+};
+static String spotifyCoverPendingUrl;
+static volatile uint32_t spotifyCoverRequestDueMs = 0;
+static QueueHandle_t spotifyCoverQueue = nullptr;
+static TaskHandle_t spotifyCoverTaskH = nullptr;
+static uint16_t* spotifyCoverPixels = nullptr;
+static volatile uint32_t spotifyCoverGeneration = 0;
+static volatile bool spotifyCoverPixelsReady = false;
+static volatile bool spotifyCoverNeedsDraw = false;
+#endif
 char* linkS;
 char mes[200];
 uint32_t sampleRate;
@@ -413,6 +452,7 @@ bool VALB = false;
 #define CLICK2B VALB
 #define OK_keyB VALB
 bool jaugeB = false;
+static volatile uint32_t adcButtonEvents = 0;
 
 // remote keys
 #define RET_rem       0x906F
@@ -456,6 +496,16 @@ static void forceTftPowerOn()
   delay(20);
   digitalWrite(TFT_RST, HIGH);
   delay(150);
+#endif
+}
+
+static void wakeTftBacklight()
+{
+  displayON();
+  gpio_set_level(backLight, 1);
+#ifdef TFT_BL
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
 #endif
 }
 
@@ -581,6 +631,7 @@ static IPAddress captivePortalIP(192, 168, 4, 1);
 static String captiveApName;
 static int captiveScanCount = 0;
 static bool captiveRestartPending = false;
+static bool captiveManualFallbackRequested = false;
 
 static String htmlEscape(const String &value)
 {
@@ -618,8 +669,306 @@ static String captiveWifiQrPayload()
   payload += wifiQrEscape(captiveApName);
   payload += F(";P:");
   payload += wifiQrEscape(CAPTIVE_AP_PASSWORD);
-  payload += F(";;");
+  payload += F(";H:false;;");
   return payload;
+}
+
+static const char DEFAULT_RADIO_PRESETS[] =
+  "RFI|http://live02.rfi.fr/rfimonde-96k.mp3\n"
+  "France Culture|http://direct.franceculture.fr/live/franceculture-hifi.aac\n"
+  "FIP|http://direct.fipradio.fr/live/fip-hifi.aac\n"
+  "RTL|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg\n"
+  "RMC|https://audio.bfmtv.com/rmcradio_128.mp3\n"
+  "France Info|http://direct.franceinfo.fr/live/franceinfo-hifi.aac\n"
+  "Radio Classique|http://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3\n"
+  "France Musique|http://direct.franceinter.fr/live/francemusique-hifi.aac\n"
+  "Radio Crooner|http://croonerradio.ice.infomaniak.ch/croonerradio-hifi.mp3\n"
+  "Europe 1|http://ais-live.cloud-services.paris:8000/europe1.mp3\n"
+  "Sud Radio|http://start-sud.ice.infomaniak.ch/start-sud-high.mp3\n"
+  "France Inter|http://direct.franceinter.fr/live/franceinter-hifi.aac\n"
+  "Frequence Jazz|http://broadcast.infomaniak.ch/frequencejazz-high.mp3\n"
+  "Le Mouv|http://direct.mouv.fr/live/mouv-midfi.mp3\n"
+  "Suisse Premiere|http://stream.srg-ssr.ch/m/la-1ere/mp3_128\n"
+  "RTBF|http://broadcast.infomaniak.ch/belrtl-mp3-128.mp3\n"
+  "BFM Business|https://audio.bfmtv.com/bfmbusiness_128.mp3\n"
+  "Rires et Chansons|http://cdn.nrjaudio.fm/audio1/fr/30401/aac_64.mp3?origine=fluxradios\n";
+
+static const char DEFAULT_RADIO_CATALOG[] =
+  "France Inter|General|FR|http://direct.franceinter.fr/live/franceinter-hifi.aac\n"
+  "France Info|News|FR|http://direct.franceinfo.fr/live/franceinfo-hifi.aac\n"
+  "France Culture|Culture|FR|http://direct.franceculture.fr/live/franceculture-hifi.aac\n"
+  "France Musique|Classical|FR|http://direct.franceinter.fr/live/francemusique-hifi.aac\n"
+  "FIP|Music|FR|http://direct.fipradio.fr/live/fip-hifi.aac\n"
+  "FIP Jazz|Jazz|FR|http://direct.fipradio.fr/live/fip-webradio2.mp3\n"
+  "FIP Groove|Funk|FR|http://direct.fipradio.fr/live/fip-webradio3.mp3\n"
+  "FIP Rock|Rock|FR|http://direct.fipradio.fr/live/fip-webradio1.mp3\n"
+  "Mouv|Hip-hop|FR|http://direct.mouv.fr/live/mouv-midfi.mp3\n"
+  "RFI Monde|News|FR|http://live02.rfi.fr/rfimonde-96k.mp3\n"
+  "RTL|Talk|FR|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg\n"
+  "Europe 1|Talk|FR|http://ais-live.cloud-services.paris:8000/europe1.mp3\n"
+  "RMC|Talk|FR|https://audio.bfmtv.com/rmcradio_128.mp3\n"
+  "Sud Radio|Talk|FR|http://start-sud.ice.infomaniak.ch/start-sud-high.mp3\n"
+  "BFM Business|News|FR|https://audio.bfmtv.com/bfmbusiness_128.mp3\n"
+  "Radio Classique|Classical|FR|http://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3\n"
+  "Frequence Jazz|Jazz|FR|http://broadcast.infomaniak.ch/frequencejazz-high.mp3\n"
+  "TSF Jazz|Jazz|FR|http://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3\n"
+  "Radio Nova|Eclectic|FR|http://novazz.ice.infomaniak.ch/novazz-128.mp3\n"
+  "Radio Meuh|Eclectic|FR|http://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3\n"
+  "Radio Crooner|Jazz|FR|http://croonerradio.ice.infomaniak.ch/croonerradio-hifi.mp3\n"
+  "Rires et Chansons|Comedy|FR|http://cdn.nrjaudio.fm/audio1/fr/30401/aac_64.mp3?origine=fluxradios\n"
+  "Nostalgie|Oldies|FR|http://cdn.nrjaudio.fm/audio1/fr/30601/aac_64.mp3?origine=fluxradios\n"
+  "Cherie FM|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30201/aac_64.mp3?origine=fluxradios\n"
+  "NRJ|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30001/aac_64.mp3?origine=fluxradios\n"
+  "RTL2|Rock|FR|http://streaming.radio.rtl2.fr/rtl2-1-44-128\n"
+  "Fun Radio|Dance|FR|http://streaming.radio.funradio.fr/fun-1-44-128\n"
+  "Oui FM|Rock|FR|http://ouifm.ice.infomaniak.ch/ouifm-high.mp3\n"
+  "Skyrock|Hip-hop|FR|http://icecast.skyrock.net/s/natio_mp3_128k\n"
+  "Latina|Latin|FR|http://start-latina.ice.infomaniak.ch/start-latina-high.mp3\n"
+  "FG Radio|Electro|FR|http://radiofg.impek.com/fg\n"
+  "Jazz Radio|Jazz|FR|http://jazzradio.ice.infomaniak.ch/jazzradio-high.mp3\n"
+  "Classic and Jazz|Classical|FR|http://jazz-wr01.ice.infomaniak.ch/jazz-wr01-128.mp3\n"
+  "Suisse La Premiere|General|CH|http://stream.srg-ssr.ch/m/la-1ere/mp3_128\n"
+  "RTS Espace 2|Classical|CH|http://stream.srg-ssr.ch/m/espace-2/mp3_128\n"
+  "Couleur 3|Rock|CH|http://stream.srg-ssr.ch/m/couleur3/mp3_128\n"
+  "RTBF La Premiere|General|BE|http://radios.rtbf.be/laprem1ere-128.mp3\n"
+  "RTBF Classic 21|Rock|BE|http://radios.rtbf.be/classic21-128.mp3\n"
+  "RTBF Musiq3|Classical|BE|http://radios.rtbf.be/musiq3-128.mp3\n"
+  "BBC World Service|News|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_world_service\n"
+  "BBC Radio 4|Talk|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm\n"
+  "BBC Radio 6 Music|Alternative|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_6music\n"
+  "NPR News|News|US|https://npr-ice.streamguys1.com/live.mp3\n"
+  "KEXP|Alternative|US|https://kexp-mp3-128.streamguys1.com/kexp128.mp3\n"
+  "KCRW|Eclectic|US|https://kcrw.streamguys1.com/kcrw_192k_mp3_on_air\n"
+  "WNYC FM|Talk|US|https://fm939.wnyc.org/wnycfm\n"
+  "SomaFM Groove Salad|Ambient|US|https://ice2.somafm.com/groovesalad-128-mp3\n"
+  "SomaFM Drone Zone|Ambient|US|https://ice2.somafm.com/dronezone-128-mp3\n"
+  "SomaFM Secret Agent|Lounge|US|https://ice2.somafm.com/secretagent-128-mp3\n"
+  "Radio Paradise Main|Eclectic|US|https://stream.radioparadise.com/mp3-128\n"
+  "Radio Paradise Mellow|Eclectic|US|https://stream.radioparadise.com/mellow-128\n"
+  "Radio Paradise Rock|Rock|US|https://stream.radioparadise.com/rock-128\n";
+
+static bool fileMissingOrEmpty(const char *path)
+{
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) return true;
+  bool empty = (f.size() == 0);
+  f.close();
+  return empty;
+}
+
+static bool writeDefaultPresets()
+{
+  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_WRITE);
+  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
+  if (!nameFile || !linkFile) {
+    if (nameFile) nameFile.close();
+    if (linkFile) linkFile.close();
+    return false;
+  }
+
+  String data = DEFAULT_RADIO_PRESETS;
+  int start = 0;
+  int written = 0;
+  while (start < (int)data.length() && written < RADIO_PRESET_MAX) {
+    int end = data.indexOf('\n', start);
+    if (end < 0) end = data.length();
+    String line = data.substring(start, end);
+    line.trim();
+    int sep = line.indexOf('|');
+    if (sep > 0) {
+      String name = line.substring(0, sep);
+      String url = line.substring(sep + 1);
+      name.trim();
+      url.trim();
+      if (url.length()) {
+        nameFile.println(name);
+        linkFile.println(url);
+        written++;
+      }
+    }
+    start = end + 1;
+  }
+
+  nameFile.close();
+  linkFile.close();
+  return written > 0;
+}
+
+static bool writeDefaultCatalog()
+{
+  File f = LittleFS.open(RADIO_CATALOG_PATH, FILE_WRITE);
+  if (!f) return false;
+  f.write((const uint8_t*)DEFAULT_RADIO_CATALOG, sizeof(DEFAULT_RADIO_CATALOG) - 1);
+  f.close();
+  return true;
+}
+
+static void repairStationUrlPrefixes()
+{
+  File in = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
+  if (!in) return;
+
+  String content;
+  content.reserve(in.size() + 8);
+  bool changed = false;
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("ttp://")) {
+      line = "h" + line;
+      changed = true;
+    }
+    content += line;
+    content += '\n';
+  }
+  in.close();
+
+  if (changed) {
+    File out = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
+    if (out) {
+      out.print(content);
+      out.close();
+    }
+  }
+}
+
+static void ensureLocalRadioData()
+{
+  if (fileMissingOrEmpty(RADIO_NAME_PATH) || fileMissingOrEmpty(RADIO_LINK_PATH)) {
+    writeDefaultPresets();
+  }
+  repairStationUrlPrefixes();
+  if (fileMissingOrEmpty(RADIO_CATALOG_PATH)) {
+    writeDefaultCatalog();
+  }
+}
+
+static bool isValidRadioUrl(const String &url)
+{
+  return url.startsWith("http://") || url.startsWith("https://");
+}
+
+static int loadStationPresets(String names[], String urls[], int maxItems)
+{
+  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
+  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
+  if (!nameFile || !linkFile) {
+    if (nameFile) nameFile.close();
+    if (linkFile) linkFile.close();
+    return 0;
+  }
+
+  int slot = 0;
+  int highestUsedSlot = 0;
+  while (slot < maxItems && (nameFile.available() || linkFile.available())) {
+    names[slot] = nameFile.available() ? nameFile.readStringUntil('\n') : "";
+    urls[slot] = linkFile.available() ? linkFile.readStringUntil('\n') : "";
+    names[slot].trim();
+    urls[slot].trim();
+    if (urls[slot].length() > 0) {
+      if (names[slot].length() == 0) names[slot] = "Preset " + String(slot + 1);
+      highestUsedSlot = slot + 1;
+    }
+    slot++;
+  }
+
+  nameFile.close();
+  linkFile.close();
+  return highestUsedSlot;
+}
+
+static bool saveStationPresets(String names[], String urls[], int count)
+{
+  if (count < 0) count = 0;
+  if (count > RADIO_PRESET_MAX) count = RADIO_PRESET_MAX;
+  while (count > 0) {
+    urls[count - 1].trim();
+    if (urls[count - 1].length() > 0) break;
+    count--;
+  }
+  if (count <= 0) return false;
+
+  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_WRITE);
+  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
+  if (!nameFile || !linkFile) {
+    if (nameFile) nameFile.close();
+    if (linkFile) linkFile.close();
+    return false;
+  }
+
+  for (int i = 0; i < count; i++) {
+    names[i].trim();
+    urls[i].trim();
+    if (!urls[i].length()) {
+      nameFile.println();
+      linkFile.println();
+    } else {
+      if (names[i].length() == 0) names[i] = "Preset " + String(i + 1);
+      if (names[i].length() >= RADIO_NAME_MAX) names[i] = names[i].substring(0, RADIO_NAME_MAX - 1);
+      if (urls[i].length() >= RADIO_URL_MAX) urls[i] = urls[i].substring(0, RADIO_URL_MAX - 1);
+      nameFile.println(names[i]);
+      linkFile.println(urls[i]);
+    }
+  }
+
+  nameFile.close();
+  linkFile.close();
+  return true;
+}
+
+static bool setStationPreset(int slotIndex, String name, String url)
+{
+  name.trim();
+  url.trim();
+  if (slotIndex < 0) slotIndex = 0;
+  if (slotIndex >= RADIO_PRESET_MAX) slotIndex = RADIO_PRESET_MAX - 1;
+  if (!name.length() || !isValidRadioUrl(url)) return false;
+  if (name.length() >= RADIO_NAME_MAX) name = name.substring(0, RADIO_NAME_MAX - 1);
+  if (url.length() >= RADIO_URL_MAX) return false;
+
+  String names[RADIO_PRESET_MAX];
+  String urls[RADIO_PRESET_MAX];
+  int count = loadStationPresets(names, urls, RADIO_PRESET_MAX);
+  if (slotIndex >= count) count = slotIndex + 1;
+  names[slotIndex] = name;
+  urls[slotIndex] = url;
+  bool saved = saveStationPresets(names, urls, count);
+  printf("Radio preset save slot=%d count=%d ok=%d name=%s url=%s\n",
+         slotIndex + 1, count, saved ? 1 : 0, name.c_str(), url.c_str());
+  return saved;
+}
+
+static bool clearStationPreset(int slotIndex)
+{
+  String names[RADIO_PRESET_MAX];
+  String urls[RADIO_PRESET_MAX];
+  int count = loadStationPresets(names, urls, RADIO_PRESET_MAX);
+  if (slotIndex < 0 || slotIndex >= RADIO_PRESET_MAX) return false;
+  if (slotIndex >= count) return false;
+  names[slotIndex] = "";
+  urls[slotIndex] = "";
+  if (count <= 0) return writeDefaultPresets();
+  bool saved = saveStationPresets(names, urls, count);
+  if (!saved) return writeDefaultPresets();
+  printf("Radio preset clear slot=%d count=%d ok=%d\n", slotIndex + 1, count, saved ? 1 : 0);
+  return saved;
+}
+
+static bool splitCatalogLine(const String &line, String &name, String &category, String &country, String &url)
+{
+  int p1 = line.indexOf('|');
+  int p2 = (p1 >= 0) ? line.indexOf('|', p1 + 1) : -1;
+  int p3 = (p2 >= 0) ? line.indexOf('|', p2 + 1) : -1;
+  if (p1 <= 0 || p2 <= p1 || p3 <= p2) return false;
+  name = line.substring(0, p1);
+  category = line.substring(p1 + 1, p2);
+  country = line.substring(p2 + 1, p3);
+  url = line.substring(p3 + 1);
+  name.trim();
+  category.trim();
+  country.trim();
+  url.trim();
+  return name.length() && url.length();
 }
 
 static void saveWifiCredential(const char *newSsid, const char *newPassword)
@@ -652,27 +1001,67 @@ static void saveWifiCredential(const char *newSsid, const char *newPassword)
   saveWifiList(list, count);
 }
 
+static void appendPortalMessage(String &html)
+{
+  String saved = captiveServer.arg("saved");
+  if (!saved.length()) return;
+  html += F("<div class='notice'>");
+  if (saved == "wifi") html += F("Wi-Fi saved. Restart the radio when you are done.");
+  else if (saved == "forget") html += F("Network forgotten. Restart the radio when you are done.");
+  else if (saved == "radio") html += F("Radio preset saved locally.");
+  else if (saved == "clear") html += F("Radio preset removed.");
+  else if (saved == "defaults") html += F("Default local presets restored.");
+  else html += F("Saved.");
+  html += F("</div>");
+}
+
+static void appendCatalogOptions(String &html)
+{
+  File catalog = LittleFS.open(RADIO_CATALOG_PATH, FILE_READ);
+  if (!catalog) return;
+
+  int count = 0;
+  while (catalog.available() && count < 120) {
+    String line = catalog.readStringUntil('\n');
+    line.trim();
+    String name, category, country, url;
+    if (splitCatalogLine(line, name, category, country, url)) {
+      String value = name + "|" + url;
+      html += F("<option data-cat='");
+      html += htmlEscape(category);
+      html += F("' value='");
+      html += htmlEscape(value);
+      html += F("'>");
+      html += htmlEscape(name);
+      html += F(" - ");
+      html += htmlEscape(category);
+      html += F(" (");
+      html += htmlEscape(country);
+      html += F(")</option>");
+      count++;
+    }
+  }
+  catalog.close();
+}
+
 static String captivePortalPage()
 {
+  ensureLocalRadioData();
   String html;
-  html.reserve(5200);
+  html.reserve(42000);
   html += F("<!doctype html><html><head><meta charset='utf-8'>");
   html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<title>Muse Radio WiFi</title>");
+  html += F("<title>Muse Radio Settings</title>");
   html += F("<style>");
-  html += F("body{margin:0;font-family:Arial,sans-serif;background:#111827;color:#f9fafb;}");
-  html += F("main{max-width:460px;margin:0 auto;padding:28px 18px;}");
-  html += F("h1{font-size:28px;margin:0 0 8px;}p{color:#cbd5e1;line-height:1.35;}");
-  html += F("label{display:block;margin:18px 0 6px;font-weight:700;}");
-  html += F("select,input,button{width:100%;box-sizing:border-box;font-size:17px;border-radius:8px;border:0;padding:12px;}");
-  html += F("select,input{background:#f8fafc;color:#0f172a;}button{margin-top:20px;background:#22c55e;color:#052e16;font-weight:700;}");
-  html += F("a{display:block;color:#93c5fd;margin-top:18px;text-align:center;}small{color:#94a3b8;display:block;margin-top:8px;}");
+  html += F(":root{color-scheme:light;}body{margin:0;font-family:Arial,sans-serif;background:#eef2f7;color:#172033;}main{max-width:980px;margin:0 auto;padding:22px 14px 40px;}h1{font-size:30px;margin:0 0 4px;}h2{font-size:20px;margin:0 0 14px}.lead{margin:0 0 18px;color:#475569}.grid{display:grid;grid-template-columns:1fr;gap:14px}.panel{background:#fff;border:1px solid #d8dee8;border-radius:8px;padding:16px;box-shadow:0 1px 2px #0001}label{display:block;margin:12px 0 5px;font-weight:700;color:#263244}select,input,button{box-sizing:border-box;font-size:16px;border-radius:7px;padding:10px}select,input{width:100%;border:1px solid #aeb8c6;background:#fff;color:#111827}button{border:0;background:#166534;color:white;font-weight:700;cursor:pointer}.ghost{background:#e2e8f0;color:#172033}.danger{background:#b42318}.small{font-size:13px;padding:7px 9px;margin:0}.row{display:flex;gap:8px;align-items:end}.row>*{flex:1}.muted{color:#64748b;font-size:13px}.notice{background:#d1fae5;color:#064e3b;border:1px solid #86efac;border-radius:8px;padding:10px;margin:12px 0}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid #e2e8f0;padding:8px;text-align:left;vertical-align:top}.slot{width:42px;color:#475569}.url{color:#64748b;font-size:12px;word-break:break-all}.actions{width:84px}.restart{margin-top:14px;width:100%;background:#0f172a}.tabs{display:flex;gap:8px;margin:16px 0}.tabs a{flex:1;text-align:center;text-decoration:none;background:#dbeafe;color:#1e3a8a;border-radius:8px;padding:10px;font-weight:700}@media(min-width:760px){.grid{grid-template-columns:1fr 1fr}.wide{grid-column:1/-1}}");
   html += F("</style></head><body><main>");
-  html += F("<h1>Muse Radio WiFi</h1>");
-  html += F("<p>Choose a network, enter its password, then the radio will save it and restart.</p>");
-  html += F("<form method='POST' action='/save'>");
-  html += F("<label for='ssid'>Network</label><select id='ssid' name='ssid'>");
+  html += F("<h1>Muse Radio Settings</h1><p class='lead'>Manage Wi-Fi networks and the local radio presets stored on the Muse.</p>");
+  appendPortalMessage(html);
+  html += F("<div class='tabs'><a href='#wifi'>Wi-Fi</a><a href='#radio'>Radio presets</a></div>");
+  html += F("<div class='grid'>");
 
+  html += F("<section id='wifi' class='panel'><h2>Wi-Fi networks</h2>");
+  html += F("<form method='POST' action='/wifi/save'><label for='ssid'>Scanned network</label><select id='ssid' name='ssid'>");
   if (captiveScanCount <= 0) {
     html += F("<option value=''>No network found</option>");
   } else {
@@ -691,15 +1080,77 @@ static String captivePortalPage()
       html += F(")</option>");
     }
   }
+  html += F("</select><label for='ssid_manual'>SSID manual optionnel</label><input id='ssid_manual' name='ssid_manual' maxlength='32' placeholder='Use this if the network is not listed'>");
+  html += F("<label for='pwd'>Password</label><input id='pwd' name='pwd' maxlength='64' type='password' autocomplete='current-password'>");
+  html += F("<div class='row'><button type='submit'>Save network</button><a href='/rescan'><button class='ghost' type='button'>Scan again</button></a></div></form>");
 
-  html += F("</select>");
-  html += F("<label for='ssid_manual'>Hidden network</label>");
-  html += F("<input id='ssid_manual' name='ssid_manual' maxlength='32' placeholder='Optional manual SSID'>");
-  html += F("<small>Leave this empty unless the network is hidden.</small>");
-  html += F("<label for='pwd'>Password</label>");
-  html += F("<input id='pwd' name='pwd' maxlength='64' type='password' autocomplete='current-password'>");
-  html += F("<button type='submit'>Save and restart</button>");
-  html += F("</form><a href='/rescan'>Scan again</a>");
+  WifiCred wifiList[WIFI_MAX_NETWORKS];
+  int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
+  html += F("<h2 style='margin-top:18px'>Saved networks</h2>");
+  if (wifiCount == 0) {
+    html += F("<p class='muted'>No saved network yet.</p>");
+  } else {
+    html += F("<table><tbody>");
+    for (int i = 0; i < wifiCount; i++) {
+      html += F("<tr><td>");
+      html += htmlEscape(String(wifiList[i].ssid));
+      html += F("</td><td class='actions'><form method='POST' action='/wifi/forget'><input type='hidden' name='idx' value='");
+      html += String(i);
+      html += F("'><button class='small danger' type='submit'>Forget</button></form></td></tr>");
+    }
+    html += F("</tbody></table>");
+  }
+  html += F("</section>");
+
+  String presetNames[RADIO_PRESET_MAX];
+  String presetUrls[RADIO_PRESET_MAX];
+  int presetCount = loadStationPresets(presetNames, presetUrls, RADIO_PRESET_MAX);
+  int nextSlot = 1;
+  while (nextSlot <= RADIO_PRESET_MAX && presetUrls[nextSlot - 1].length() > 0) nextSlot++;
+  if (nextSlot > RADIO_PRESET_MAX) nextSlot = RADIO_PRESET_MAX;
+
+  html += F("<section id='radio' class='panel'><h2>Add radio</h2>");
+  html += F("<form method='POST' action='/radio/pick'><div class='row'><div><label for='slot_pick'>Preset</label><input id='slot_pick' name='slot' type='number' min='1' max='99' value='");
+  html += String(nextSlot);
+  html += F("'></div><div><label for='cat'>Theme</label><select id='cat'><option value=''>All</option><option>News</option><option>Talk</option><option>General</option><option>Culture</option><option>Music</option><option>Pop</option><option>Rock</option><option>Jazz</option><option>Classical</option><option>Electro</option><option>Ambient</option><option>Eclectic</option></select></div></div>");
+  html += F("<label for='search'>Search</label><input id='search' placeholder='Name, theme, country'><label for='catalog'>Local catalog</label><select id='catalog' name='catalog' size='9'>");
+  appendCatalogOptions(html);
+  html += F("</select><button type='submit'>Put selected radio in preset</button></form>");
+  html += F("<form method='POST' action='/radio/save'><h2 style='margin-top:18px'>Manual radio</h2><div class='row'><div><label for='slot_manual'>Preset</label><input id='slot_manual' name='slot' type='number' min='1' max='99' value='");
+  html += String(nextSlot);
+  html += F("'></div><div><label for='radio_name'>Name</label><input id='radio_name' name='name' maxlength='47'></div></div><label for='radio_url'>Stream URL</label><input id='radio_url' name='url' maxlength='191' placeholder='https://...'><button type='submit'>Save manual radio</button></form>");
+  html += F("</section>");
+
+  html += F("<section class='panel wide'><h2>Current presets</h2>");
+  bool hasPreset = false;
+  for (int i = 0; i < presetCount; i++) {
+    if (presetUrls[i].length() > 0) {
+      hasPreset = true;
+      break;
+    }
+  }
+  if (!hasPreset) {
+    html += F("<p class='muted'>No preset yet.</p>");
+  } else {
+    html += F("<table><thead><tr><th class='slot'>#</th><th>Radio</th><th class='actions'></th></tr></thead><tbody>");
+    for (int i = 0; i < presetCount; i++) {
+      if (presetUrls[i].length() == 0) continue;
+      html += F("<tr><td class='slot'>");
+      html += String(i + 1);
+      html += F("</td><td><strong>");
+      html += htmlEscape(presetNames[i]);
+      html += F("</strong><div class='url'>");
+      html += htmlEscape(presetUrls[i]);
+      html += F("</div></td><td class='actions'><form method='POST' action='/radio/clear'><input type='hidden' name='slot' value='");
+      html += String(i + 1);
+      html += F("'><button class='small danger' type='submit'>Clear</button></form></td></tr>");
+    }
+    html += F("</tbody></table>");
+  }
+  html += F("<form method='POST' action='/radio/defaults'><button class='ghost' type='submit'>Restore default presets</button></form>");
+  html += F("</section></div>");
+  html += F("<form method='POST' action='/restart'><button class='restart' type='submit'>Restart radio</button></form>");
+  html += F("<script>function f(){const q=document.getElementById('search').value.toLowerCase(),c=document.getElementById('cat').value;for(const o of document.getElementById('catalog').options){const t=o.text.toLowerCase();o.hidden=(c&&o.dataset.cat!==c)||(q&&!t.includes(q));}}document.getElementById('search').oninput=f;document.getElementById('cat').onchange=f;</script>");
   html += F("</main></body></html>");
   return html;
 }
@@ -718,6 +1169,17 @@ static void captiveHandleRescan()
   captiveServer.send(302, "text/plain", "");
 }
 
+static void portalRedirect(const char *tag)
+{
+  String location = "/";
+  if (tag && tag[0]) {
+    location += "?saved=";
+    location += tag;
+  }
+  captiveServer.sendHeader("Location", location, true);
+  captiveServer.send(303, "text/plain", "");
+}
+
 static void captiveHandleSave()
 {
   String selectedSsid = captiveServer.arg("ssid");
@@ -733,8 +1195,67 @@ static void captiveHandleSave()
   }
 
   saveWifiCredential(finalSsid.c_str(), password.c_str());
+  portalRedirect("wifi");
+}
+
+static void captiveHandleWifiForget()
+{
+  int idx = captiveServer.arg("idx").toInt();
+  WifiCred list[WIFI_MAX_NETWORKS];
+  int count = loadWifiList(list, WIFI_MAX_NETWORKS);
+  if (removeWifiByIndex(list, count, idx)) saveWifiList(list, count);
+  portalRedirect("forget");
+}
+
+static void captiveHandleRadioManual()
+{
+  int slot = captiveServer.arg("slot").toInt() - 1;
+  String name = captiveServer.arg("name");
+  String url = captiveServer.arg("url");
+  printf("Portal radio manual slot=%d name=%s url=%s\n", slot + 1, name.c_str(), url.c_str());
+  if (!setStationPreset(slot, name, url)) {
+    captiveServer.send(400, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Invalid radio</h1><p>Use a name and an http/https stream URL shorter than 191 chars.</p><a href='/'>Back</a></body>"));
+    return;
+  }
+  portalRedirect("radio");
+}
+
+static void captiveHandleRadioPick()
+{
+  int slot = captiveServer.arg("slot").toInt() - 1;
+  String selected = captiveServer.arg("catalog");
+  int sep = selected.indexOf('|');
+  if (sep <= 0) {
+    captiveServer.send(400, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>No radio selected</h1><a href='/'>Back</a></body>"));
+    return;
+  }
+  String name = selected.substring(0, sep);
+  String url = selected.substring(sep + 1);
+  printf("Portal radio pick slot=%d name=%s url=%s\n", slot + 1, name.c_str(), url.c_str());
+  if (!setStationPreset(slot, name, url)) {
+    captiveServer.send(400, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Cannot save radio</h1><a href='/'>Back</a></body>"));
+    return;
+  }
+  portalRedirect("radio");
+}
+
+static void captiveHandleRadioClear()
+{
+  int slot = captiveServer.arg("slot").toInt() - 1;
+  clearStationPreset(slot);
+  portalRedirect("clear");
+}
+
+static void captiveHandleRadioDefaults()
+{
+  writeDefaultPresets();
+  portalRedirect("defaults");
+}
+
+static void captiveHandleRestart()
+{
   captiveRestartPending = true;
-  captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Saved</h1><p>The radio is restarting.</p></body>"));
+  captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Restarting</h1><p>The radio will reboot now.</p></body>"));
 }
 
 static void captiveHandleNotFound()
@@ -750,15 +1271,17 @@ static void drawCaptivePortalScreen()
   tft.setTextSize(1);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
-  tft.drawString("Scan WiFi QR", 160, 6, 4);
-  tft.drawString(captiveApName.c_str(), 160, 34, 2);
+  tft.drawString("Settings portal", 160, 6, 4);
+  tft.drawString(("AP: " + captiveApName).c_str(), 160, 34, 2);
   tft.drawString("PWD: museradio", 160, 52, 2);
-  tft.drawString("Open: 192.168.4.1", 160, 70, 2);
+  tft.drawString("Scan QR: connect WiFi", 160, 70, 2);
+  tft.drawString("Portal: 192.168.4.1", 160, 86, 2);
 
   QRCode qrcode;
-  String wifiQr = captiveWifiQrPayload();
+  String portalQr = captiveWifiQrPayload();
+  printf("Captive WiFi QR payload: %s URL=%s\n", portalQr.c_str(), CAPTIVE_PORTAL_URL);
   uint8_t qrcodeData[qrcode_getBufferSize(4)];
-  qrcode_initText(&qrcode, qrcodeData, 4, 0, wifiQr.c_str());
+  qrcode_initText(&qrcode, qrcodeData, 4, 0, portalQr.c_str());
 
   uint16_t scale = 3;
   uint16_t offsetX = (tft.width() - qrcode.size * scale) / 2;
@@ -772,7 +1295,17 @@ static void drawCaptivePortalScreen()
   }
 
   tft.setTextColor(TFT_GREY, TFT_WHITE);
-  tft.drawString("OK button: manual setup", 160, 222, 2);
+  tft.drawString("Press knob: manual setup", 160, 222, 2);
+}
+
+static bool captiveManualButtonPressed()
+{
+  return gpio_get_level(CLICK2) == 0;
+}
+
+static void waitCaptiveManualButtonReleased()
+{
+  while (gpio_get_level(CLICK2) == 0) delay(10);
 }
 
 static void startWifiCaptivePortal()
@@ -780,6 +1313,7 @@ static void startWifiCaptivePortal()
   gpio_set_level(backLight, 1);
   forceTftPowerOn();
   tft.init();
+  ensureLocalRadioData();
   WiFi.disconnect(false);
   WiFi.mode(WIFI_AP_STA);
   delay(200);
@@ -789,6 +1323,7 @@ static void startWifiCaptivePortal()
   if (mac.length() < 4) mac = "0000";
   captiveApName = "MuseRadio-" + mac.substring(mac.length() - 4);
   captiveRestartPending = false;
+  captiveManualFallbackRequested = false;
 
   WiFi.softAPConfig(captivePortalIP, captivePortalIP, IPAddress(255, 255, 255, 0));
   bool apStarted = WiFi.softAP(captiveApName.c_str(), CAPTIVE_AP_PASSWORD);
@@ -798,7 +1333,7 @@ static void startWifiCaptivePortal()
     tft.setTextColor(TFT_RED);
     tft.drawString("WiFi setup AP failed", 160, 105, 4);
     delay(2000);
-    settings();
+    captiveManualFallbackRequested = true;
     return;
   }
 
@@ -808,7 +1343,14 @@ static void startWifiCaptivePortal()
   captiveDns.start(CAPTIVE_DNS_PORT, "*", captivePortalIP);
   captiveServer.on("/", HTTP_GET, captiveHandleRoot);
   captiveServer.on("/rescan", HTTP_GET, captiveHandleRescan);
+  captiveServer.on("/wifi/save", HTTP_POST, captiveHandleSave);
+  captiveServer.on("/wifi/forget", HTTP_POST, captiveHandleWifiForget);
   captiveServer.on("/save", HTTP_POST, captiveHandleSave);
+  captiveServer.on("/radio/save", HTTP_POST, captiveHandleRadioManual);
+  captiveServer.on("/radio/pick", HTTP_POST, captiveHandleRadioPick);
+  captiveServer.on("/radio/clear", HTTP_POST, captiveHandleRadioClear);
+  captiveServer.on("/radio/defaults", HTTP_POST, captiveHandleRadioDefaults);
+  captiveServer.on("/restart", HTTP_POST, captiveHandleRestart);
   captiveServer.on("/generate_204", HTTP_GET, captiveHandleRoot);
   captiveServer.on("/hotspot-detect.html", HTTP_GET, captiveHandleRoot);
   captiveServer.on("/connecttest.txt", HTTP_GET, captiveHandleRoot);
@@ -822,12 +1364,14 @@ static void startWifiCaptivePortal()
   while (true) {
     captiveDns.processNextRequest();
     captiveServer.handleClient();
-    if (gpio_get_level(CLICK2) == 0) {
-      while (gpio_get_level(CLICK2) == 0) delay(10);
+    debugAdcButtonsTick();
+    if (captiveManualButtonPressed()) {
+      waitCaptiveManualButtonReleased();
       captiveServer.stop();
       captiveDns.stop();
       WiFi.softAPdisconnect(true);
-      settings();
+      captiveManualFallbackRequested = true;
+      return;
     }
     if (captiveRestartPending) {
       tft.fillScreen(TFT_NAVY);
@@ -860,21 +1404,570 @@ void refreshVolume(void)
   }
 }
 
-static void drawSpotifyStatus(const char* line)
+static String spotifyMetadataLine(const char* text, uint8_t wantedLine)
 {
-  tft.setRotation(1);
-  tft.fillRect(80, 90, 240, 80, TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("Spotify Connect", 200, 100, 4);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  if (line && line[0])
+  if (!text) return "";
+
+  const char* lineStart = text;
+  uint8_t currentLine = 0;
+  for (const char* p = text; ; ++p)
   {
-    tft.drawString(line, 200, 135, 2);
+    if (*p == '\n' || *p == '\0')
+    {
+      if (currentLine == wantedLine)
+      {
+        String out;
+        out.reserve((uint16_t)(p - lineStart + 1));
+        for (const char* q = lineStart; q < p; ++q)
+        {
+          out += *q;
+        }
+        out.trim();
+        return out;
+      }
+
+      if (*p == '\0') break;
+      currentLine++;
+      lineStart = p + 1;
+    }
+  }
+
+  return "";
+}
+
+static void requestSpotifyCover(const String& url);
+static void scheduleSpotifyCover(const String& url);
+
+static void updateSpotifyTrackMetadata(const char* text)
+{
+  String previousCoverUrl = spotifyTrackCoverUrl;
+  spotifyTrackTitle = spotifyMetadataLine(text, 0);
+  spotifyTrackArtist = spotifyMetadataLine(text, 1);
+  spotifyTrackCoverUrl = spotifyMetadataLine(text, 2);
+  Serial.printf("[spotify] cover metadata: %s\n",
+                spotifyTrackCoverUrl.length() > 0 ? spotifyTrackCoverUrl.c_str() : "(none)");
+  if (spotifyTrackCoverUrl != previousCoverUrl)
+  {
+    scheduleSpotifyCover(spotifyTrackCoverUrl);
+  }
+}
+
+static void clearSpotifyTrackMetadata()
+{
+  spotifyTrackTitle = "";
+  spotifyTrackArtist = "";
+  spotifyTrackCoverUrl = "";
+  spotifyCoverPendingUrl = "";
+  spotifyCoverRequestDueMs = 0;
+  requestSpotifyCover("");
+}
+
+#if ENABLE_SPOTIFY_CONNECT
+static bool downloadSpotifyCoverJpeg(const char* url, uint8_t** outData, size_t* outLen)
+{
+  *outData = nullptr;
+  *outLen = 0;
+
+  if (!url || !url[0] || WiFi.status() != WL_CONNECTED) return false;
+
+  String requestUrl(url);
+  if (requestUrl.startsWith("https://i.scdn.co/"))
+  {
+    requestUrl.replace("https://", "http://");
+  }
+  requestUrl.replace("00001e02", "00004851");
+  requestUrl.replace("0000b273", "00004851");
+  requestUrl.replace("000082c1", "00004851");
+  Serial.printf("[spotify] cover request: %s\n", requestUrl.c_str());
+
+  WiFiClient client;
+
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, requestUrl))
+  {
+    Serial.println("[spotify] cover http begin failed");
+    return false;
+  }
+
+  const int httpCode = http.GET();
+  Serial.printf("[spotify] cover http code=%d len=%d\n", httpCode, http.getSize());
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.printf("[spotify] cover http code=%d\n", httpCode);
+    http.end();
+    return false;
+  }
+
+  const int contentLength = http.getSize();
+  if (contentLength <= 0 || (size_t)contentLength > SPOTIFY_COVER_JPEG_MAX)
+  {
+    Serial.printf("[spotify] cover invalid size=%d\n", contentLength);
+    http.end();
+    return false;
+  }
+
+  uint8_t* data = (uint8_t*)heap_caps_malloc((size_t)contentLength, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!data)
+  {
+    data = (uint8_t*)malloc((size_t)contentLength);
+  }
+  if (!data)
+  {
+    Serial.println("[spotify] cover jpeg alloc failed");
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  int totalRead = 0;
+  uint32_t lastProgressMs = millis();
+
+  while (totalRead < contentLength)
+  {
+    if ((int32_t)(millis() - lastProgressMs) > 10000)
+    {
+      Serial.println("[spotify] cover download timeout");
+      free(data);
+      http.end();
+      return false;
+    }
+
+    int available = stream->available();
+    if (available <= 0)
+    {
+      delay(5);
+      continue;
+    }
+
+    int chunk = contentLength - totalRead;
+    if (chunk > available) chunk = available;
+    if (chunk > 1024) chunk = 1024;
+
+    const int readNow = stream->readBytes(data + totalRead, chunk);
+    if (readNow > 0)
+    {
+      totalRead += readNow;
+      lastProgressMs = millis();
+    }
+    else
+    {
+      delay(5);
+    }
+  }
+
+  http.end();
+  *outData = data;
+  *outLen = (size_t)totalRead;
+  Serial.printf("[spotify] cover downloaded %u bytes\n", (unsigned)*outLen);
+  return true;
+}
+
+struct SpotifyJpegDecodeContext
+{
+  const uint8_t* data;
+  size_t len;
+  size_t pos;
+  uint16_t* tempPixels;
+  uint16_t tempWidth;
+  uint16_t tempHeight;
+};
+
+static UINT spotifyJpegInput(JDEC* decoder, BYTE* buffer, UINT byteCount)
+{
+  SpotifyJpegDecodeContext* ctx = (SpotifyJpegDecodeContext*)decoder->device;
+  if (!ctx) return 0;
+
+  const size_t remaining = ctx->len - ctx->pos;
+  UINT toRead = byteCount;
+  if (toRead > remaining) toRead = (UINT)remaining;
+
+  if (buffer && toRead > 0)
+  {
+    memcpy(buffer, ctx->data + ctx->pos, toRead);
+  }
+  ctx->pos += toRead;
+  return toRead;
+}
+
+static UINT spotifyJpegOutput(JDEC* decoder, void* bitmap, JRECT* rect)
+{
+  SpotifyJpegDecodeContext* ctx = (SpotifyJpegDecodeContext*)decoder->device;
+  if (!ctx || !bitmap || !rect) return 0;
+
+  const uint16_t blockWidth = rect->right - rect->left + 1;
+  const uint16_t blockHeight = rect->bottom - rect->top + 1;
+  const uint8_t* src = (const uint8_t*)bitmap;
+
+  for (uint16_t y = 0; y < blockHeight; y++)
+  {
+    const uint16_t dstY = rect->top + y;
+    if (dstY >= ctx->tempHeight) continue;
+
+    for (uint16_t x = 0; x < blockWidth; x++)
+    {
+      const uint16_t dstX = rect->left + x;
+      if (dstX >= ctx->tempWidth) continue;
+
+      const size_t srcIndex = ((size_t)y * blockWidth + x) * 3;
+      const uint8_t r = src[srcIndex + 0];
+      const uint8_t g = src[srcIndex + 1];
+      const uint8_t b = src[srcIndex + 2];
+      uint16_t color = ((uint16_t)(r & 0xF8) << 8) |
+                       ((uint16_t)(g & 0xFC) << 3) |
+                       (uint16_t)(b >> 3);
+      color = (uint16_t)((color << 8) | (color >> 8));
+      ctx->tempPixels[(size_t)dstY * ctx->tempWidth + dstX] = color;
+    }
+  }
+
+  return 1;
+}
+
+static uint8_t spotifyJpegScaleFor(uint16_t width, uint16_t height)
+{
+  uint16_t maxDim = width > height ? width : height;
+  uint8_t scale = 0;
+  while (scale < 3 && (maxDim >> scale) > (SPOTIFY_COVER_SIZE * 2))
+  {
+    scale++;
+  }
+  return scale;
+}
+
+static bool decodeSpotifyCoverJpeg(const uint8_t* jpegData, size_t jpegLen, uint16_t* scaledPixels)
+{
+  constexpr size_t WORK_POOL_SIZE = 8192;
+  void* workPool = heap_caps_malloc(WORK_POOL_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!workPool)
+  {
+    workPool = malloc(WORK_POOL_SIZE);
+  }
+  if (!workPool)
+  {
+    Serial.println("[spotify] cover work pool alloc failed");
+    return false;
+  }
+
+  SpotifyJpegDecodeContext ctx = {};
+  ctx.data = jpegData;
+  ctx.len = jpegLen;
+
+  JDEC decoder = {};
+  JRESULT result = jd_prepare(&decoder, spotifyJpegInput, workPool, WORK_POOL_SIZE, &ctx);
+  if (result != JDR_OK)
+  {
+    Serial.printf("[spotify] cover jpeg prepare failed=%d\n", (int)result);
+    free(workPool);
+    return false;
+  }
+
+  const uint8_t scale = spotifyJpegScaleFor(decoder.width, decoder.height);
+  ctx.tempWidth = (decoder.width + (1U << scale) - 1U) >> scale;
+  ctx.tempHeight = (decoder.height + (1U << scale) - 1U) >> scale;
+
+  const size_t tempPixelsCount = (size_t)ctx.tempWidth * ctx.tempHeight;
+  if (tempPixelsCount == 0 || tempPixelsCount > (220U * 220U))
+  {
+    Serial.printf("[spotify] cover temp size rejected %ux%u\n", ctx.tempWidth, ctx.tempHeight);
+    free(workPool);
+    return false;
+  }
+
+  ctx.tempPixels = (uint16_t*)heap_caps_malloc(tempPixelsCount * sizeof(uint16_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!ctx.tempPixels)
+  {
+    ctx.tempPixels = (uint16_t*)malloc(tempPixelsCount * sizeof(uint16_t));
+  }
+  if (!ctx.tempPixels)
+  {
+    Serial.println("[spotify] cover temp pixels alloc failed");
+    free(workPool);
+    return false;
+  }
+  memset(ctx.tempPixels, 0, tempPixelsCount * sizeof(uint16_t));
+
+  result = jd_decomp(&decoder, spotifyJpegOutput, scale);
+  free(workPool);
+
+  if (result != JDR_OK)
+  {
+    Serial.printf("[spotify] cover jpeg decode failed=%d\n", (int)result);
+    free(ctx.tempPixels);
+    return false;
+  }
+
+  for (int y = 0; y < SPOTIFY_COVER_SIZE; y++)
+  {
+    const uint32_t srcY = ((uint32_t)y * ctx.tempHeight) / SPOTIFY_COVER_SIZE;
+    for (int x = 0; x < SPOTIFY_COVER_SIZE; x++)
+    {
+      const uint32_t srcX = ((uint32_t)x * ctx.tempWidth) / SPOTIFY_COVER_SIZE;
+      scaledPixels[y * SPOTIFY_COVER_SIZE + x] =
+        ctx.tempPixels[srcY * ctx.tempWidth + srcX];
+    }
+  }
+
+  Serial.printf("[spotify] cover decoded %ux%u scale=%u -> %dx%d\n",
+                decoder.width, decoder.height, scale, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE);
+  free(ctx.tempPixels);
+  return true;
+}
+
+static void spotifyCoverTask(void*)
+{
+  SpotifyCoverRequest req = {};
+  while (true)
+  {
+    if (xQueueReceive(spotifyCoverQueue, &req, portMAX_DELAY) != pdTRUE) continue;
+
+    SpotifyCoverRequest latest = {};
+    while (xQueueReceive(spotifyCoverQueue, &latest, 0) == pdTRUE)
+    {
+      req = latest;
+    }
+
+    uint16_t* scaledPixels = (uint16_t*)heap_caps_malloc(
+      SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scaledPixels)
+    {
+      scaledPixels = (uint16_t*)malloc(SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t));
+    }
+
+    uint8_t* jpegData = nullptr;
+    size_t jpegLen = 0;
+    bool ok = scaledPixels &&
+              downloadSpotifyCoverJpeg(req.url, &jpegData, &jpegLen) &&
+              decodeSpotifyCoverJpeg(jpegData, jpegLen, scaledPixels);
+
+    if (jpegData) free(jpegData);
+
+    if (ok && req.generation == spotifyCoverGeneration)
+    {
+      if (!spotifyCoverPixels)
+      {
+        spotifyCoverPixels = (uint16_t*)heap_caps_malloc(
+          SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t),
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!spotifyCoverPixels)
+        {
+          spotifyCoverPixels = (uint16_t*)malloc(SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t));
+        }
+      }
+
+      if (spotifyCoverPixels)
+      {
+        memcpy(spotifyCoverPixels, scaledPixels, SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t));
+        spotifyCoverPixelsReady = true;
+        spotifyCoverNeedsDraw = true;
+      }
+      else
+      {
+        ok = false;
+      }
+    }
+
+    if (!ok && req.generation == spotifyCoverGeneration)
+    {
+      spotifyCoverPixelsReady = false;
+      spotifyCoverNeedsDraw = true;
+      Serial.println("[spotify] cover unavailable");
+    }
+
+    if (scaledPixels) free(scaledPixels);
+  }
+}
+
+static void requestSpotifyCover(const String& url)
+{
+  spotifyCoverGeneration++;
+  spotifyCoverPixelsReady = false;
+  spotifyCoverNeedsDraw = true;
+
+  if (url.length() == 0)
+  {
+    Serial.println("[spotify] cover request cleared");
+    return;
+  }
+
+  if (!spotifyCoverQueue)
+  {
+    spotifyCoverQueue = xQueueCreate(1, sizeof(SpotifyCoverRequest));
+  }
+  if (!spotifyCoverQueue)
+  {
+    Serial.println("[spotify] cover queue create failed");
+    return;
+  }
+
+  if (!spotifyCoverTaskH)
+  {
+    const BaseType_t rc = xTaskCreatePinnedToCore(
+      spotifyCoverTask, "spotifyCover", 12288, nullptr, 1, &spotifyCoverTaskH, 0);
+    if (rc != pdPASS)
+    {
+      Serial.printf("[spotify] cover task create failed rc=%ld\n", (long)rc);
+      spotifyCoverTaskH = nullptr;
+      return;
+    }
+  }
+
+  SpotifyCoverRequest req = {};
+  url.toCharArray(req.url, sizeof(req.url));
+  req.generation = spotifyCoverGeneration;
+  Serial.printf("[spotify] cover queued gen=%lu url=%s\n",
+                (unsigned long)req.generation, req.url);
+  xQueueOverwrite(spotifyCoverQueue, &req);
+}
+
+static void scheduleSpotifyCover(const String& url)
+{
+  spotifyCoverPendingUrl = "";
+  spotifyCoverRequestDueMs = 0;
+
+  if (url.length() == 0)
+  {
+    requestSpotifyCover("");
+    return;
+  }
+
+  spotifyCoverPixelsReady = false;
+  spotifyCoverNeedsDraw = true;
+  spotifyCoverPendingUrl = url;
+  spotifyCoverRequestDueMs = millis() + SPOTIFY_COVER_DELAY_MS;
+  Serial.printf("[spotify] cover scheduled in %lu ms\n",
+                (unsigned long)SPOTIFY_COVER_DELAY_MS);
+}
+
+static void drawSpotifyCoverPlaceholder()
+{
+  tft.fillRect(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, TFT_BLACK);
+  tft.drawRect(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, TFT_GREY);
+}
+
+static void drawSpotifyCover()
+{
+  if (spotifyCoverPixelsReady && spotifyCoverPixels)
+  {
+    const bool oldSwap = tft.getSwapBytes();
+    tft.setSwapBytes(false);
+    tft.pushImage(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, spotifyCoverPixels);
+    tft.setSwapBytes(oldSwap);
+    tft.drawRect(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, TFT_GREY);
   }
   else
   {
-    tft.drawString(spotifyConnectDeviceName(), 200, 135, 2);
+    drawSpotifyCoverPlaceholder();
+  }
+  spotifyCoverNeedsDraw = false;
+}
+
+static void serviceSpotifyCoverDisplay()
+{
+  if (spotifyCoverPendingUrl.length() > 0 &&
+      spotifyPlaybackActive &&
+      spotifyCoverRequestDueMs != 0 &&
+      (int32_t)(millis() - spotifyCoverRequestDueMs) >= 0)
+  {
+    String url = spotifyCoverPendingUrl;
+    spotifyCoverPendingUrl = "";
+    spotifyCoverRequestDueMs = 0;
+    requestSpotifyCover(url);
+  }
+
+  if (!spotifyCoverNeedsDraw || Bdonate) return;
+  if (!spotifyPlaybackActive && !spotifyConnectActive())
+  {
+    spotifyCoverNeedsDraw = false;
+    return;
+  }
+
+  tft.setRotation(1);
+  drawSpotifyCover();
+}
+#else
+static void requestSpotifyCover(const String&) {}
+static void scheduleSpotifyCover(const String&) {}
+static void drawSpotifyCoverPlaceholder() {}
+static void serviceSpotifyCoverDisplay() {}
+#endif
+
+static String fitSpotifyText(String text, uint8_t font, int maxWidth)
+{
+  text.trim();
+  if (text.length() == 0) return "";
+  if (tft.textWidth(text, font) <= maxWidth) return text;
+
+  while (text.length() > 0)
+  {
+    text.remove(text.length() - 1);
+    text.trim();
+
+    String candidate = text;
+    candidate += "...";
+    if (tft.textWidth(candidate, font) <= maxWidth)
+    {
+      return candidate;
+    }
+  }
+
+  return "...";
+}
+
+static void drawSpotifyTextLine(const String& text, int y, uint8_t font, uint16_t color)
+{
+  const bool hasCover = spotifyTrackCoverUrl.length() > 0;
+  const int centerX = hasCover ? 212 : 200;
+  const int maxWidth = hasCover ? 202 : 232;
+  String fitted = fitSpotifyText(text, font, maxWidth);
+  if (fitted.length() == 0) return;
+
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(fitted, centerX, y, font);
+}
+
+static void drawSpotifyStatus(const char* line)
+{
+  tft.setRotation(1);
+  tft.fillRect(8, 78, 312, 112, TFT_BLACK);
+#if ENABLE_SPOTIFY_CONNECT
+  if (spotifyTrackCoverUrl.length() > 0)
+  {
+    drawSpotifyCoverPlaceholder();
+    if (spotifyCoverPixelsReady) spotifyCoverNeedsDraw = true;
+  }
+#endif
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("Spotify Connect", spotifyTrackCoverUrl.length() > 0 ? 212 : 200, 86, 4);
+
+  const bool hasTrack = spotifyTrackTitle.length() > 0 || spotifyTrackArtist.length() > 0;
+  if (hasTrack)
+  {
+    drawSpotifyTextLine(spotifyTrackTitle.length() > 0 ? spotifyTrackTitle : "Unknown title", 122, 4, TFT_WHITE);
+    drawSpotifyTextLine(spotifyTrackArtist.length() > 0 ? spotifyTrackArtist : "Unknown artist", 151, 2, TFT_GREY);
+
+    if (line && strcmp(line, "Spotify paused") == 0)
+    {
+      drawSpotifyTextLine("Paused", 172, 2, TFT_YELLOW);
+    }
+  }
+  else
+  {
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    if (line && line[0])
+    {
+      drawSpotifyTextLine(line, 135, 2, TFT_WHITE);
+    }
+    else
+    {
+      drawSpotifyTextLine(spotifyConnectDeviceName(), 135, 2, TFT_WHITE);
+    }
   }
 }
 
@@ -902,8 +1995,13 @@ static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value,
       spotifyRadioResumeAtMs = millis() + 1500;
       spotifyPlaybackActive = false;
       connected = false;
+      clearSpotifyTrackMetadata();
       refreshVolume();
       drawSpotifyStatus(text ? text : "Radio resumes...");
+      break;
+    case SpotifyConnectEvent::Track:
+      updateSpotifyTrackMetadata(text);
+      drawSpotifyStatus(nullptr);
       break;
     case SpotifyConnectEvent::Volume:
     {
@@ -965,14 +2063,110 @@ void drawImage(char* f, int x, int y)
 
 int button_get_level(int nb)
 {
-#define THRESHOLD 200
 #define maxB 3
-  static int adcB[] = {1850, 2350, 450, 930};
-  int adcValue, V;
+  static uint32_t lastAdcDebugMs = 0;
   if ((nb > maxB) || (nb < 0))return -1;
-  adcValue = analogRead(KEYs_ADC);
-  V = adcB[nb];
-  if (abs(V - adcValue) < THRESHOLD ) return 0; else return 1;
+  int adcValue = 0;
+  for (int i = 0; i < 4; i++) {
+    adcValue += analogRead(KEYs_ADC);
+    delayMicroseconds(60);
+  }
+  adcValue /= 4;
+
+  int nearest = -1;
+  int bestDiff = 4096;
+  for (int i = 0; i < ADC_BUTTON_COUNT; i++) {
+    int diff = abs(ADC_BUTTON_REFERENCE[i] - adcValue);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      nearest = i;
+    }
+  }
+
+  if (adcValue < 3300 && (millis() - lastAdcDebugMs) > 250) {
+    lastAdcDebugMs = millis();
+    printf("ADC keys raw=%d nearest=sw%d diff=%d\n", adcValue, nearest, bestDiff);
+  }
+
+  return (nearest == nb && bestDiff < ADC_BUTTON_THRESHOLD) ? 0 : 1;
+}
+
+static void initAdcButtons()
+{
+  pinMode(KEYs_ADC, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(KEYs_ADC, ADC_11db);
+  analogRead(KEYs_ADC);
+}
+
+static int readAdcButtonsRaw()
+{
+  int adcValue = 0;
+  for (int i = 0; i < 8; i++) {
+    adcValue += analogRead(KEYs_ADC);
+    delayMicroseconds(60);
+  }
+  return adcValue / 8;
+}
+
+static int nearestAdcButton(int adcValue, int *bestDiff)
+{
+  int nearest = -1;
+  int diffBest = 4096;
+  for (int i = 0; i < ADC_BUTTON_COUNT; i++) {
+    int diff = abs(ADC_BUTTON_REFERENCE[i] - adcValue);
+    if (diff < diffBest) {
+      diffBest = diff;
+      nearest = i;
+    }
+  }
+  if (bestDiff) *bestDiff = diffBest;
+  return nearest;
+}
+
+static void debugAdcButtonsTick()
+{
+#if ADC_BUTTON_DEBUG
+  static uint32_t lastAdcDebugMs = 0;
+  if ((millis() - lastAdcDebugMs) < 250) return;
+  lastAdcDebugMs = millis();
+  int adcValue = readAdcButtonsRaw();
+  int bestDiff = 0;
+  int nearest = nearestAdcButton(adcValue, &bestDiff);
+  printf("ADCDBG raw=%d nearest_button=%d diff=%d refs=%d,%d,%d,%d\n",
+         adcValue,
+         nearest + 1,
+         bestDiff,
+         ADC_BUTTON_REFERENCE[0],
+         ADC_BUTTON_REFERENCE[1],
+         ADC_BUTTON_REFERENCE[2],
+         ADC_BUTTON_REFERENCE[3]);
+#endif
+}
+
+static int readAdcButtonIndex(int *rawOut = nullptr, int *diffOut = nullptr)
+{
+  int adcValue = readAdcButtonsRaw();
+  int bestDiff = 0;
+  int nearest = nearestAdcButton(adcValue, &bestDiff);
+  if (rawOut) *rawOut = adcValue;
+  if (diffOut) *diffOut = bestDiff;
+  return (nearest >= 0 && bestDiff < ADC_BUTTON_THRESHOLD) ? nearest : -1;
+}
+
+static void pushAdcButtonEvent(int index)
+{
+  if (index < 0 || index >= ADC_BUTTON_COUNT) return;
+  adcButtonEvents |= (1UL << index);
+}
+
+static bool consumeAdcButtonEvent(int index)
+{
+  if (index < 0 || index >= ADC_BUTTON_COUNT) return false;
+  uint32_t mask = (1UL << index);
+  if ((adcButtonEvents & mask) == 0) return false;
+  adcButtonEvents &= ~mask;
+  return true;
 }
 
 ///////////////////////////////////////////////////////////////////////
@@ -981,9 +2175,18 @@ int button_get_level(int nb)
 /////////://///////////////////////////////////////////////////////////
 static void keyb(void* pdata)
 {
+  int adcHeldButton = -1;
 
   while (1)
   {
+    int adcRaw = 0;
+    int adcDiff = 0;
+    int adcButton = readAdcButtonIndex(&adcRaw, &adcDiff);
+    if (adcButton >= 0 && adcHeldButton < 0) {
+      pushAdcButtonEvent(adcButton);
+      printf("ADC event button=%d raw=%d diff=%d\n", adcButton + 1, adcRaw, adcDiff);
+    }
+    adcHeldButton = adcButton;
 
     //   printf("CLICK1 = %d   CLICK2 = %d\n", gpio_get_level(CLICK1), gpio_get_level(CLICK2));
     if ((gpio_get_level(CLICK1) == 0) && (CLICK1B == false)) CLICK1E = true;
@@ -1006,7 +2209,7 @@ static void keyb(void* pdata)
       CLICK2B = true;
       REMOTE_KEY = 0;
     }
-    delay(100);
+    delay(30);
   }
 }
 
@@ -1017,28 +2220,24 @@ static void keyb(void* pdata)
 /////////////////////////////////////////////////////////////////////////////
 char* Rlink(int st)
 {
-  int i;
-  static char b[80];
-  File ln = LittleFS.open("/linkS", FILE_READ);
-  i = 0;
-  uint8_t c;
-  while (i != st)
-  {
-    while (c != 0x0a)ln.read(&c, 1);
-    c = 0;
-    i++;
+  static char out[RADIO_URL_MAX];
+  out[0] = 0;
+  if (st < 0 || st >= RADIO_PRESET_MAX) return out;
+  File ln = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
+  if (!ln) return out;
+
+  int slot = 0;
+  while (ln.available() && slot <= st) {
+    String line = ln.readStringUntil('\n');
+    line.trim();
+    if (slot == st && line.length() > 0) {
+      line.toCharArray(out, sizeof(out));
+      break;
+    }
+    slot++;
   }
-  i = 0;
-  do
-  {
-    ln.read((uint8_t*)&b[i], 1);
-    i++;
-  } while (b[i - 1] != 0x0a);
-  b[i - 1] = 0;
-  //to suppress extra char 0x0d (rc)  (for Windows users)
-  if (b[i - 2] == 0x0d) b[i - 2] = 0;
   ln.close();
-  return b;
+  return out;
 }
 /////////////////////////////////////////////////////////////////////////////////
 //  gets station name from LittleFS file "/namS"
@@ -1046,28 +2245,24 @@ char* Rlink(int st)
 /////////////////////////////////////////////////////////////////////////////////
 char* Rname(int st)
 {
-  int i;
-  static char b[20];
-  File ln = LittleFS.open("/nameS", FILE_READ);
-  i = 0;
-  uint8_t c;
-  while (i != st)
-  {
-    while (c != 0x0a)ln.read(&c, 1);
-    c = 0;
-    i++;
+  static char out[RADIO_NAME_MAX];
+  snprintf(out, sizeof(out), "Preset %d", st + 1);
+  if (st < 0 || st >= RADIO_PRESET_MAX) return out;
+  File ln = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
+  if (!ln) return out;
+
+  int slot = 0;
+  while (ln.available() && slot <= st) {
+    String line = ln.readStringUntil('\n');
+    line.trim();
+    if (slot == st && line.length() > 0) {
+      line.toCharArray(out, sizeof(out));
+      break;
+    }
+    slot++;
   }
-  i = 0;
-  do
-  {
-    ln.read((uint8_t*)&b[i], 1);
-    i++;
-  } while (b[i - 1] != 0x0a);
-  b[i - 1] = 0;
-  //to suppress extra char 0x0d (rc)  (for Windows users)
-  if (b[i - 2] == 0x0d) b[i - 2] = 0;
   ln.close();
-  return b;
+  return out;
 }
 /////////////////////////////////////////////////////////////////////////
 //  defines how many stations in LittleFS file "/linkS"
@@ -1075,24 +2270,94 @@ char* Rname(int st)
 ////////////////////////////////////////////////////////////////////////
 int maxStation(void)
 {
-  File ln = LittleFS.open("/linkS", FILE_READ);
-  uint8_t c;
-  int m = 0;
-  int t;
-  t = ln.size();
-  int i = 0;
-  do
-  {
-    while (c != 0x0a) {
-      ln.read(&c, 1);
-      i++;
-    }
-    c = 0;
-    m++;
-  } while (i < t);
+  File ln = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
+  if (!ln) {
+    printf("=========> 0 \n");
+    return 0;
+  }
+  int slot = 0;
+  int highestUsedSlot = 0;
+  while (ln.available() && slot < RADIO_PRESET_MAX) {
+    String line = ln.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) highestUsedSlot = slot + 1;
+    slot++;
+  }
   ln.close();
-  printf("=========> %d \n", m);
-  return m;
+  printf("=========> %d \n", highestUsedSlot);
+  return highestUsedSlot;
+}
+
+static bool stationSlotHasUrl(int slot)
+{
+  return Rlink(slot)[0] != 0;
+}
+
+static int normalizeStationSlot(int slot, int direction, int maxSlots)
+{
+  if (maxSlots <= 0) return 0;
+  if (direction == 0) direction = 1;
+  while (slot < 0) slot += maxSlots;
+  while (slot >= maxSlots) slot -= maxSlots;
+
+  for (int i = 0; i < maxSlots; i++) {
+    if (stationSlotHasUrl(slot)) return slot;
+    slot += (direction > 0) ? 1 : -1;
+    if (slot < 0) slot = maxSlots - 1;
+    if (slot >= maxSlots) slot = 0;
+  }
+  return 0;
+}
+
+static void deleteTaskIfRunning(TaskHandle_t &taskHandle)
+{
+  if (taskHandle != NULL) {
+    vTaskDelete(taskHandle);
+    taskHandle = NULL;
+  }
+}
+
+static void stopRuntimeTasksForSettings()
+{
+  deleteTaskIfRunning(radioH);
+  deleteTaskIfRunning(keybH);
+  deleteTaskIfRunning(batteryH);
+  deleteTaskIfRunning(jackH);
+  deleteTaskIfRunning(remoteH);
+  deleteTaskIfRunning(displayONOFFH);
+}
+
+static void enterSettingsFromButton()
+{
+  printf("ADC action button1: open settings portal\n");
+  BSettings = true;
+  toDisplay = 0;
+  displayON();
+  audio.stopSong();
+  connected = false;
+  stopRuntimeTasksForSettings();
+  settings();
+}
+
+static void drawStationSelectScreen()
+{
+  toDisplay = 0;
+  wakeTftBacklight();
+  tft.setRotation(1);
+  tft.fillRect(0, 72, 320, 132, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("Radio select", 160, 78, 2);
+  const int slot = S / 2;
+  if (stationSlotHasUrl(slot)) {
+    tft.setTextColor(TFT_SILVER, TFT_BLACK);
+    tft.drawString(Rname(slot), 160, 105, 4);
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString(("Preset " + String(slot + 1) + " empty").c_str(), 160, 105, 4);
+  }
+  tft.setTextColor(TFT_GREY, TFT_BLACK);
+  tft.drawString("Encoder: choose  Press knob: OK", 160, 165, 2);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1119,6 +2384,13 @@ static void playRadio(void* data)
       connected = false;
       //delay(100);
       linkS = Rlink(station);
+      if (!linkS || linkS[0] == 0) {
+        printf("station no %d empty, skipping\n", station);
+        station = normalizeStationSlot(station, 1, maxStation());
+        previousStation = -1;
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+        continue;
+      }
       mes[0] = 0;
       audio.connecttohost(linkS);
       previousStation = station;
@@ -1287,7 +2559,7 @@ void retrieveDisplay(void)
 
   tft.setTextColor(TFT_GREY, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
-  tft.drawString("1-Settings  2-Radio select", 20, 220, 2);
+  tft.drawString("1-Settings portal", 20, 220, 2);
   tft.drawString(version, 280, 220, 2);
 
   // restart battery display and display on/off
@@ -1341,6 +2613,10 @@ void settingsDisplay(int pos)
 ///////////////////////////////////////////////////////////////////////
 void settings(void)
 {
+  printf("SETTINGS portal\n");
+  startWifiCaptivePortal();
+  if (!captiveManualFallbackRequested) return;
+
   int j;
   int pos;
   char charSet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
@@ -1680,6 +2956,7 @@ void setup() {
     file = root.openNextFile();
     delay(100);
   }
+  ensureLocalRadioData();
 
   //////////////////////////////////////////////////
   //Encoders init
@@ -1719,6 +2996,7 @@ void setup() {
   gpio_set_pull_mode(JACK_DETECT, GPIO_PULLUP_ONLY);
 
   gpio_set_pull_mode(EN_4G, GPIO_PULLUP_ONLY);
+  initAdcButtons();
 
   //////////////////////////////////////////////////////
   // request to load the last version
@@ -1779,7 +3057,7 @@ void setup() {
   int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
   if (wifiCount == 0) {
     // No credentials yet, start the phone-friendly captive portal.
-    startWifiCaptivePortal();
+    settings();
   }
 
   WiFi.useStaticBuffers(true);
@@ -1812,7 +3090,7 @@ void setup() {
     tft.setTextColor(TFT_YELLOW);
     tft.drawString("Starting WiFi setup...", 160, 125, 2);
     delay(1000);
-    startWifiCaptivePortal();
+    settings();
   }
 
 
@@ -1872,6 +3150,19 @@ void setup() {
 
   ln.close();
   MS = maxStation() - 1;
+  if (MS < 0) {
+    writeDefaultPresets();
+    MS = maxStation() - 1;
+  }
+  if (station < 0 || station > MS || !stationSlotHasUrl(station)) {
+    station = normalizeStationSlot(0, 1, MS + 1);
+    File stationFile = LittleFS.open("/station", "w");
+    if (stationFile) {
+      sprintf(b, "%02d", station);
+      stationFile.write((uint8_t*)b, 2);
+      stationFile.close();
+    }
+  }
   previousStation = -1;
   printf("station = %d    vol = %d\n", station, vol);
   // volume encoder init
@@ -1882,7 +3173,7 @@ void setup() {
   spotifyConnectBegin(audio, handleSpotifyConnectEvent);
   // station encoder init
   staEncoder.setCount(station * 2);
-  S = VS = 0;
+  S = VS = station * 2;
 
   ////////////////////////////////////////////////////////////////
   // draw "wallpaper screen" and internet
@@ -1902,7 +3193,7 @@ void setup() {
 
   tft.setTextColor(TFT_GREY, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
-  tft.drawString("1-Settings  2-Radio select", 20, 220, 2);
+  tft.drawString("1-Settings portal", 20, 220, 2);
   tft.drawString(version, 280, 220, 2);
   toDisplay = 0;
   displayON();
@@ -1928,6 +3219,14 @@ void setup() {
 void loop() {
 
 
+  if (consumeAdcButtonEvent(sw0))
+  {
+    if (BSettings == false) enterSettingsFromButton();
+    else printf("ADC action button1 ignored: settings already active\n");
+  }
+
+  serviceSpotifyCoverDisplay();
+  debugAdcButtonsTick();
 
   //////////////////////////////////////////////////////////////////////
   // Volume via encoder
@@ -2008,15 +3307,13 @@ void loop() {
       modSta = true;
       CLICK2B = false;
       lastModTime = millis();
+      int direction = (S > VS) ? 1 : -1;
       if (S > MS * 2) S = 0;
       if (S < 0) S = MS * 2;
+      S = normalizeStationSlot(S / 2, direction, MS + 1) * 2;
       VS = S;
       staEncoder.setCount(S);
-      tft.setRotation(1);
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
-      tft.setTextColor(TFT_SILVER);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(S / 2), 180, 105, 4);
+      drawStationSelectScreen();
     }
 
 
@@ -2027,21 +3324,19 @@ void loop() {
     {
       displayON();
       if (modSta == false) S = station * 2;
-      if (REMOTE_KEY == LEFT_rem) S -= 2;
-      if (REMOTE_KEY == RIGHT_rem) S += 2;
+      int direction = (REMOTE_KEY == LEFT_rem) ? -1 : 1;
+      if (direction < 0) S -= 2;
+      else S += 2;
       REMOTE_KEY = 0;
       modSta = true;
       CLICK2B = false;
       lastModTime = millis();
       if (S > MS * 2) S = 0;
       if (S < 0) S = MS * 2;
+      S = normalizeStationSlot(S / 2, direction, MS + 1) * 2;
       staEncoder.setCount(S);
       VS = S;
-      tft.setRotation(1);
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
-      tft.setTextColor(TFT_SILVER);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(S / 2), 180, 105, 4);
+      drawStationSelectScreen();
     }
 
 
@@ -2054,7 +3349,12 @@ void loop() {
       if (modSta == true)
       {
         modSta = false;
-        station = S / 2;
+        int selectedStation = S / 2;
+        if (!stationSlotHasUrl(selectedStation)) {
+          selectedStation = normalizeStationSlot(selectedStation, 1, MS + 1);
+          S = selectedStation * 2;
+        }
+        station = selectedStation;
         printf("station = %d\n", station);
         staEncoder.setCount(S);
         char b[4];
@@ -2089,42 +3389,11 @@ void loop() {
       }
     }
 
-    ////////////////////////////////////////////////////////////////////////
-    // explicit call of Settings (sw0)
-    ////////////////////////////////////////////////////////////////////////
-    if ((button_get_level(sw0) == 0) && (BSettings == false))
-    {
-      while (button_get_level(sw0) == 0) delay(50);
-      BSettings = true;
-      displayON();
-      vTaskDelete(radioH);
-      vTaskDelete(keybH);
-      vTaskDelete(batteryH);
-      vTaskDelete(jackH);
-      vTaskDelete(remoteH);
-      vTaskDelete(displayONOFFH);
-      settings();
-    }
   }
 
-  if (button_get_level(sw1) == 0)
+  if (consumeAdcButtonEvent(sw1))
   {
-    while (button_get_level(sw1) == 0) delay(10);
-    displayON();
-    Bdonate = !Bdonate;
-    delay(100);
-    if (Bdonate == true)
-    {
-
-      // stop battery display and display ON/OFF
-      vTaskDelete(batteryH);
-      vTaskDelete(displayONOFFH);
-      QRcreate();
-    }
-    else
-    {
-      retrieveDisplay();
-    }
+    printf("ADC action button2: unused\n");
   }
 
 
@@ -2372,6 +3641,10 @@ static void audioEvent(Audio::msg_t msg) {
 }
 
 void fetchStationList() {
+  ensureLocalRadioData();
+  printf("Local radio presets/catalog ready; remote station server disabled.\n");
+  return;
+#if 0
   // Lire l'URL de base à partir du fichier /QR
   File ln = LittleFS.open("/QR", FILE_READ);
   if (!ln) {
@@ -2469,6 +3742,7 @@ void fetchStationList() {
     printf("Échec de la requête HTTP GET, erreur: %s\n", http.errorToString(httpCode).c_str());
   }
   http.end();
+#endif
 }
 void FactoryTest() {
 

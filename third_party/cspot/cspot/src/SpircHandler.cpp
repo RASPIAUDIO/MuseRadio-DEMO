@@ -41,6 +41,7 @@ SpircHandler::SpircHandler(std::shared_ptr<cspot::Context> ctx) {
 
     // Send playback start event, pause/unpause per request
     sendEvent(EventType::PLAYBACK_START, (int)track->requestedPosition);
+    sendEvent(EventType::TRACK_INFO, track->trackInfo);
     sendEvent(EventType::PLAY_PAUSE, paused);
   };
 
@@ -301,6 +302,10 @@ void SpircHandler::setPause(bool isPaused) {
 }
 
 void SpircHandler::sendEvent(EventType type) {
+  if (!eventHandler) {
+    return;
+  }
+
   auto event = std::make_unique<Event>();
   event->eventType = type;
   event->data = {};
@@ -308,6 +313,10 @@ void SpircHandler::sendEvent(EventType type) {
 }
 
 void SpircHandler::sendEvent(EventType type, EventData data) {
+  if (!eventHandler) {
+    return;
+  }
+
   auto event = std::make_unique<Event>();
   event->eventType = type;
   event->data = data;

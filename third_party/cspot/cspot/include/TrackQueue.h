@@ -103,11 +103,12 @@ class TrackQueue : public bell::Task {
   bool skipTrack(SkipDirection dir, bool expectNotify = true);
   bool updateTracks(uint32_t requestedPosition = 0, bool initial = false);
   TrackInfo getTrackInfo(std::string_view identifier);
+  TrackInfo getCurrentTrackInfo();
   std::shared_ptr<QueuedTrack> consumeTrack(
       std::shared_ptr<QueuedTrack> prevSong, int& offset);
 
  private:
-  static const int MAX_TRACKS_PRELOAD = 3;
+  static const int MAX_TRACKS_PRELOAD = 1;
 
   std::shared_ptr<cspot::AccessKeyFetcher> accessKeyFetcher;
   std::shared_ptr<PlaybackState> playbackState;
