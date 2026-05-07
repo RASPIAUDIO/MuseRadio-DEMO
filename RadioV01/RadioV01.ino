@@ -24,16 +24,19 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include "lwip/apps/sntp.h"
-#if ENABLE_SPOTIFY_CONNECT
+#if ENABLE_SPOTIFY_CONNECT || ENABLE_AIRPLAY
 #include "MuseHTTPClient.h"
 #else
 #include <HTTPClient.h>
 #endif
 #include <ArduinoJson.h>
 #include "SpotifyConnect.h"
-#if ENABLE_SPOTIFY_CONNECT
-#include "esp_heap_caps.h"
+#include "AirPlayService.h"
 #include "esp32s3/rom/tjpgd.h"
+#if ENABLE_SPOTIFY_CONNECT || ENABLE_AIRPLAY
+#include "esp_heap_caps.h"
+#endif
+#if ENABLE_SPOTIFY_CONNECT
 #include "freertos/queue.h"
 #endif
 
@@ -54,7 +57,7 @@ PNG png;
 
 
 
-#define version "V1.5"
+#define version "V1.6"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
@@ -409,6 +412,12 @@ static volatile uint32_t spotifyRadioResumeAtMs = 0;
 static String spotifyTrackTitle;
 static String spotifyTrackArtist;
 static String spotifyTrackCoverUrl;
+static volatile bool airPlayPlaybackActive = false;
+static volatile bool airPlayVolumeUpdateFromRemote = false;
+static volatile uint32_t airPlayRadioResumeAtMs = 0;
+static String airPlayTrackTitle;
+static String airPlayTrackArtist;
+static String airPlayTrackAlbum;
 #if ENABLE_SPOTIFY_CONNECT
 static const int SPOTIFY_COVER_X = 12;
 static const int SPOTIFY_COVER_Y = 92;
@@ -526,7 +535,8 @@ void ES8388vol_Set(uint8_t volx)
 #define lowVol   16
   if (volx > maxVol) volx = maxVol;
   if (volx == 0)ES8388_Write_Reg(25, 0x04); else ES8388_Write_Reg(25, 0x00);
-  bool spotifyCodecVolume = spotifyPlaybackActive || spotifyConnectActive();
+  bool externalCodecVolume = spotifyPlaybackActive || spotifyConnectActive() ||
+                             airPlayPlaybackActive || airPlayActive();
 
   //    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);
   //    printf("VOLX = %d  %d\n",volx, jackON);
@@ -544,7 +554,7 @@ void ES8388vol_Set(uint8_t volx)
     // ROUT1/LOUT1
     ES8388_Write_Reg(48, 0);
     ES8388_Write_Reg(49, 0);
-    if (spotifyCodecVolume)
+    if (externalCodecVolume)
     {
       audio.setVolume(maxVol);
       ES8388_Write_Reg(46, volx + 2);
@@ -1048,7 +1058,7 @@ static String captivePortalPage()
 {
   ensureLocalRadioData();
   String html;
-  html.reserve(42000);
+  html.reserve(22000);
   html += F("<!doctype html><html><head><meta charset='utf-8'>");
   html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Muse Radio Settings</title>");
@@ -1195,6 +1205,7 @@ static void captiveHandleSave()
   }
 
   saveWifiCredential(finalSsid.c_str(), password.c_str());
+  printf("Portal WiFi saved ssid=%s\n", finalSsid.c_str());
   portalRedirect("wifi");
 }
 
@@ -1402,6 +1413,10 @@ void refreshVolume(void)
   {
     spotifyConnectSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
   }
+  if ((airPlayPlaybackActive || airPlayActive()) && !airPlayVolumeUpdateFromRemote)
+  {
+    airPlaySetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
+  }
 }
 
 static String spotifyMetadataLine(const char* text, uint8_t wantedLine)
@@ -1457,9 +1472,11 @@ static void clearSpotifyTrackMetadata()
   spotifyTrackTitle = "";
   spotifyTrackArtist = "";
   spotifyTrackCoverUrl = "";
+#if ENABLE_SPOTIFY_CONNECT
   spotifyCoverPendingUrl = "";
   spotifyCoverRequestDueMs = 0;
   requestSpotifyCover("");
+#endif
 }
 
 #if ENABLE_SPOTIFY_CONNECT
@@ -1971,6 +1988,104 @@ static void drawSpotifyStatus(const char* line)
   }
 }
 
+static void updateAirPlayMetadata(const char* text)
+{
+  airPlayTrackTitle = spotifyMetadataLine(text, 0);
+  airPlayTrackArtist = spotifyMetadataLine(text, 1);
+  airPlayTrackAlbum = spotifyMetadataLine(text, 2);
+}
+
+static void clearAirPlayMetadata()
+{
+  airPlayTrackTitle = "";
+  airPlayTrackArtist = "";
+  airPlayTrackAlbum = "";
+}
+
+static void drawAirPlayTextLine(const String& text, int y, uint8_t font, uint16_t color)
+{
+  String fitted = fitSpotifyText(text, font, 242);
+  if (fitted.length() == 0) return;
+
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(fitted, 200, y, font);
+}
+
+static void drawAirPlayStatus(const char* line)
+{
+  tft.setRotation(1);
+  tft.fillRect(8, 78, 312, 112, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("AirPlay", 200, 86, 4);
+
+  const bool hasTrack = airPlayTrackTitle.length() > 0 || airPlayTrackArtist.length() > 0;
+  if (hasTrack)
+  {
+    drawAirPlayTextLine(airPlayTrackTitle.length() > 0 ? airPlayTrackTitle : "AirPlay", 122, 4, TFT_WHITE);
+    drawAirPlayTextLine(airPlayTrackArtist.length() > 0 ? airPlayTrackArtist : "Unknown artist", 151, 2, TFT_GREY);
+    if (airPlayTrackAlbum.length() > 0) drawAirPlayTextLine(airPlayTrackAlbum, 172, 2, TFT_SILVER);
+  }
+  else if (line && line[0])
+  {
+    drawAirPlayTextLine(line, 135, 2, TFT_WHITE);
+  }
+  else
+  {
+    drawAirPlayTextLine(airPlayDeviceName(), 135, 2, TFT_WHITE);
+  }
+}
+
+static void handleAirPlayEvent(AirPlayEvent event, uint32_t value, const char* text)
+{
+  switch (event)
+  {
+    case AirPlayEvent::Ready:
+      printf("[airplay] ready: %s\n", text ? text : airPlayDeviceName());
+      break;
+    case AirPlayEvent::Active:
+      airPlayPlaybackActive = true;
+      airPlayRadioResumeAtMs = 0;
+      audio.stopSong();
+      connected = false;
+      refreshVolume();
+      drawAirPlayStatus(text ? text : airPlayDeviceName());
+      break;
+    case AirPlayEvent::Inactive:
+      airPlayRadioResumeAtMs = millis() + 1500;
+      airPlayPlaybackActive = false;
+      connected = false;
+      clearAirPlayMetadata();
+      refreshVolume();
+      drawAirPlayStatus(text ? text : "Radio resumes...");
+      break;
+    case AirPlayEvent::Metadata:
+      updateAirPlayMetadata(text);
+      drawAirPlayStatus(nullptr);
+      break;
+    case AirPlayEvent::Volume:
+    {
+      int newVol = (int)((value * maxVol + 32767UL) / 65535UL);
+      if (newVol < 0) newVol = 0;
+      if (newVol > maxVol) newVol = maxVol;
+      if (newVol != vol)
+      {
+        airPlayVolumeUpdateFromRemote = true;
+        vol = newVol;
+        V = vol * pos360 / maxVol;
+        PV = V;
+        volEncoder.setCount(V);
+        refreshVolume();
+        airPlayVolumeUpdateFromRemote = false;
+        toDisplay = 3;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value, const char* text)
 {
   switch (event)
@@ -2370,7 +2485,9 @@ static void playRadio(void* data)
   while (1)
   {
     if (spotifyPlaybackActive || spotifyConnectActive() ||
-        (spotifyRadioResumeAtMs != 0 && (int32_t)(millis() - spotifyRadioResumeAtMs) < 0))
+        airPlayPlaybackActive || airPlayActive() ||
+        (spotifyRadioResumeAtMs != 0 && (int32_t)(millis() - spotifyRadioResumeAtMs) < 0) ||
+        (airPlayRadioResumeAtMs != 0 && (int32_t)(millis() - airPlayRadioResumeAtMs) < 0))
     {
       vTaskDelay(20 / portTICK_PERIOD_MS);
       continue;
@@ -2679,7 +2796,20 @@ void settings(void)
 
     int nSsid = WiFi.scanNetworks();
     printf("ssid# %d\n", nSsid);
+    if (nSsid <= 0) {
+      tft.fillRect(0, 70, 320, 140, TFT_NAVY);
+      tft.setTextColor(TFT_RED);
+      tft.setTextDatum(TC_DATUM);
+      tft.drawString("No WiFi network found", 160, 105, 4);
+      tft.setTextColor(TFT_YELLOW);
+      tft.drawString("Use the web portal manual SSID", 160, 145, 2);
+      delay(2500);
+      captiveManualFallbackRequested = false;
+      startWifiCaptivePortal();
+      return;
+    }
     if (nSsid > 6) nSsid = 6;
+    j = 0;
     staEncoder.setCount(0);
     while (gpio_get_level(CLICK2) == 1)
     {
@@ -2698,7 +2828,7 @@ void settings(void)
         tft.setTextDatum(TL_DATUM);
         if (i == j)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
         tft.setFreeFont(FSB12);
-        sprintf(s, "%d- %s", i + 1, WiFi.SSID(i).c_str());
+        snprintf(s, sizeof(s), "%d- %s", i + 1, WiFi.SSID(i).c_str());
         tft.drawString(s, 20, 80 + i * 25, GFXFF);
       }
       delay(100);
@@ -2782,7 +2912,7 @@ void settings(void)
       {
         if (PL != (charSetLength - 1))
         {
-          strcat((char*)pwd, selectedChar);
+          if (strlen((char*)pwd) < 64) strcat((char*)pwd, selectedChar);
           printf("pwd = %s\n", pwd);
         }
         else
@@ -2866,7 +2996,7 @@ void WiFiConnected(const char *ssid, const char *password)
 }
 static void improvWiFiInit(void* data)
 {
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.5", "Raspiaudio Radio");
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.6", "Raspiaudio Radio");
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
   while (true)
@@ -3171,6 +3301,7 @@ void setup() {
   PV = V;
   refreshVolume();
   spotifyConnectBegin(audio, handleSpotifyConnectEvent);
+  airPlayBegin(audio, handleAirPlayEvent);
   // station encoder init
   staEncoder.setCount(station * 2);
   S = VS = station * 2;

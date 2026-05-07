@@ -15,6 +15,7 @@ The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons,
 - Multiple saved Wi-Fi credentials through LittleFS `/wifi.json`.
 - Captive Wi-Fi setup portal when no saved network connects.
 - Optional Spotify Connect POC build through `cspot`.
+- Optional experimental AirPlay 1/RAOP receiver POC build.
 
 ## Source Code and Discussion
 
@@ -32,6 +33,21 @@ The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons,
 If no saved Wi-Fi network connects, the radio starts an access point named `MuseRadio-XXXX` with password `museradio`, shows a Wi-Fi QR code for that access point, and serves a local setup page at `http://192.168.4.1`. Scan the QR code to connect a phone to the radio, open `http://192.168.4.1`, choose a network, enter the password, and the radio saves it in `/wifi.json` before restarting. Press the OK/encoder button on the radio to skip the portal and use the manual on-screen credential entry.
 
 For installation or usage issues, open an issue on [GitHub](https://github.com/RASPIAUDIO/MuseRadio-DEMO/issues).
+
+## Release 1.6
+
+Version 1.6 adds an isolated AirPlay 1/RAOP proof of concept for local testing. This is an experimental, source-available, non-certified receiver; it must not be described as official Apple AirPlay compatibility or as an MFi-certified product.
+
+- Added `muse_radio_airplay_poc` with `ENABLE_AIRPLAY=1`.
+- Added `AirPlayService` and a local RAOP component derived from permissively licensed AirPlay 1 reference code.
+- The radio advertises itself on the local Wi-Fi as `Muse Radio-XXXX` through `_raop._tcp`.
+- When AirPlay starts, internet radio playback stops and the TFT shows a minimal `AirPlay` screen with title/artist metadata when available.
+- AirPlay volume controls the ES8388 codec output path, matching the Spotify codec-volume strategy.
+- When AirPlay disconnects, the firmware waits briefly before resuming the last radio station.
+- AirPlay 2 is not included in this release; it remains a separate spike because available ESP32 AirPlay 2 projects have heavier integration and licensing constraints.
+- The displayed firmware version is now `V1.6`.
+
+For a lightweight Windows smoke test without iTunes, use `tools/airplay_sine_test.ps1`. iTunes 12.13, a real iPhone, or a Mac is still recommended before claiming robust user compatibility.
 
 ## Release 1.5
 
@@ -75,9 +91,10 @@ Version 1.3 is the captive-portal Wi-Fi release for Muse Radio. It keeps the Ard
 
 - Multiple Wi-Fi credentials are stored in LittleFS at `/wifi.json` and loaded into `WiFiMulti` on boot.
 - Optional Spotify Connect POC is available in `muse_radio_spotify_poc`.
+- Optional experimental AirPlay 1/RAOP POC is available in `muse_radio_airplay_poc`.
 - When no saved Wi-Fi network connects, the radio starts a captive setup portal at `http://192.168.4.1` and displays a Wi-Fi QR code on the TFT.
 - The captive portal screen also offers the OK/encoder button as a shortcut to manual credential entry.
-- The displayed firmware version is now `V1.5`.
+- The displayed firmware version is now `V1.6`.
 - Long Wi-Fi passwords wrap onto two lines for readability.
 - `USBSerial` falls back to `Serial` when native USB CDC is not enabled.
 
@@ -97,6 +114,7 @@ The repository includes a `platformio.ini` configured for the Muse Radio ESP32-S
 ```bash
 python -m platformio run -e muse_radio
 python -m platformio run -e muse_radio_spotify_poc
+python -m platformio run -e muse_radio_airplay_poc
 python -m platformio run -e muse_radio -t upload --upload-port COM5
 python -m platformio run -e muse_radio -t uploadfs --upload-port COM5
 ```
@@ -126,6 +144,33 @@ python -m esptool --chip esp32s3 merge_bin --output .pio/build/muse_radio_spotif
 python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x0 .pio/build/muse_radio_spotify_poc/firmware.with-data.bin
 ```
 
+For the AirPlay 1 POC, use the isolated `muse_radio_airplay_poc` environment. This build is experimental and not Apple certified.
+
+```powershell
+python -m platformio run -e muse_radio_airplay_poc
+Copy-Item -Force .pio/build/muse_radio_airplay_poc/firmware.bin bin/MuseRadio-DEMO-V1.6-airplay-poc-app.bin
+python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x10000 bin/MuseRadio-DEMO-V1.6-airplay-poc-app.bin
+```
+
+To test RAOP from Windows without installing iTunes, install or place `ffmpeg` at `C:\ffmpeg\bin\ffmpeg.exe`, flash the app-only AirPlay image, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/airplay_sine_test.ps1 -ScanOnly
+powershell -ExecutionPolicy Bypass -File tools/airplay_sine_test.ps1 -Volume 45
+```
+
+The script creates a local `.venv-airplay-test`, installs pinned `pyatv==0.17.0`, scans `_raop._tcp`, and streams an 8-second sine wave to `Muse Radio-3BD8` by default. Override `-HostAddress`, `-Name`, or pass `-File path\to\audio.wav` for a specific test file.
+
+Use the app-only image above for normal updates; it preserves LittleFS credentials and presets. The factory-full image below includes the LittleFS data partition and will overwrite saved Wi-Fi credentials, Spotify auth cache, presets, and settings.
+
+```powershell
+python -m platformio run -e muse_radio_airplay_poc
+python -m platformio run -e muse_radio_airplay_poc -t buildfs
+$bootApp0 = "$env:USERPROFILE\.platformio\packages\framework-arduinoespressif32\tools\partitions\boot_app0.bin"
+python -m esptool --chip esp32s3 merge_bin --output bin/MuseRadio-DEMO-V1.6-airplay-poc-factory-full.bin --flash_mode dio --flash_freq 80m --flash_size 8MB 0x0 .pio/build/muse_radio_airplay_poc/bootloader.bin 0x8000 .pio/build/muse_radio_airplay_poc/partitions.bin 0xe000 $bootApp0 0x10000 .pio/build/muse_radio_airplay_poc/firmware.bin 0x310000 .pio/build/muse_radio_airplay_poc/littlefs.bin
+python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x0 bin/MuseRadio-DEMO-V1.6-airplay-poc-factory-full.bin
+```
+
 The LittleFS data directory is `RadioV01/data`. If upload does not start automatically, press the hidden IO0 button with a paperclip inserted in the headphone jack.
 
 ## Notes
@@ -133,4 +178,5 @@ The LittleFS data directory is `RadioV01/data`. If upload does not start automat
 - PSRAM is required by `ESP32-audioI2S` 3.4.5.
 - The ES8388 codec needs MCLK on GPIO0 with the current audio library.
 - Spotify Connect POC firmware is close to the 3 MB app partition limit: current clean build is about 95% of `app0`.
+- AirPlay 1/RAOP POC firmware is currently smaller than the Spotify POC, but it uses an unofficial legacy RAOP implementation and is not an MFi/Apple-certified receiver.
 - Legacy factory I2S tests can be re-enabled with `ENABLE_LEGACY_FACTORY_I2S=1`, but they are incompatible with the new audio driver path and are disabled by default.

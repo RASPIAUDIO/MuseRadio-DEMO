@@ -3304,6 +3304,19 @@ size_t Audio::writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate
             out[frame * 2 + 1] = ((int32_t)right) << 16;
         }
 
+        bool continueI2S = true;
+        audio_process_raw_samples(out, (int16_t)framesThisPass);
+        for (size_t frame = 0; frame < framesThisPass; frame++) {
+            calculateVUlevel(&out[frame * 2]);
+            IIR_filter(&out[frame * 2]);
+            Gain(&out[frame * 2]);
+        }
+        processSpectrum();
+        audio_process_i2s(out, (int16_t)framesThisPass, &continueI2S);
+        if (!continueI2S) {
+            break;
+        }
+
         size_t bytesWritten = 0;
         const size_t bytesToWrite = framesThisPass * OUT_FRAME_BYTES;
         esp_err_t err = i2s_channel_write(m_i2s_tx_handle, out, bytesToWrite, &bytesWritten, 50);

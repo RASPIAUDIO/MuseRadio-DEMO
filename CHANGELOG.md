@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6 - 2026-05-06
+
+- Added an isolated `muse_radio_airplay_poc` PlatformIO environment with `ENABLE_AIRPLAY=1`.
+- Added an experimental AirPlay 1/RAOP receiver POC; this is source-available, unofficial, and not Apple/MFi certified.
+- Added `AirPlayService` with ready, active, inactive, metadata, and volume events.
+- Added a local `muse_airplay_raop` component for RAOP/RTSP, RTP, ALAC decode, mDNS advertisement, and PCM output.
+- Added `GET /info` plist handling, numeric RTSP session IDs, and raw L16/44.1 kHz PCM receive support so `pyatv` can stream AirPlay 1 test audio from Windows without iTunes.
+- Added `tools/airplay_sine_test.ps1` to scan the Muse RAOP endpoint and stream a generated sine wave with pinned `pyatv==0.17.0`.
+- Reused the existing raw 44.1 kHz / 16-bit stereo PCM path in `ESP32-audioI2S` so AirPlay shares the Muse ES8388 I2S driver.
+- Added a minimal TFT `AirPlay` screen with title and artist metadata when the sender provides it.
+- AirPlay volume now drives the ES8388 codec output and radio playback resumes after AirPlay disconnects.
+- Fixed the AirPlay POC boot crash caused by RAOP/RTP static tasks using an invalid default core ID on ESP-IDF 5.5.
+- Hardened the Wi-Fi setup portal and manual fallback against empty scans and oversized manual password input.
+- Kept AirPlay 2 out of scope for this release because current ESP32 AirPlay 2 options need separate licensing and integration review.
+- Isolated the `cspot` CMake build so Spotify-specific sources are only built in `muse_radio_spotify_poc`.
+- Added `bin/MuseRadio-DEMO-V1.6-airplay-poc-app.bin` for data-preserving updates and `bin/MuseRadio-DEMO-V1.6-airplay-poc-factory-full.bin` for full factory flashes with LittleFS included at `0x310000`.
+- Bumped the displayed firmware version and Improv device version to 1.6.
+
 ## 1.5 - 2026-05-05
 
 - Stabilized Spotify Connect playback after the initial 1.4 POC.

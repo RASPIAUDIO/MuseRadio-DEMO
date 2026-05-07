@@ -5,6 +5,10 @@ idf_component_register(
   INCLUDE_DIRS "." "generated"
 )
 
+if(NOT CMAKE_BINARY_DIR MATCHES "muse_radio_spotify_poc")
+  return()
+endif()
+
 option(BUILD_SHARED_LIBS OFF)
 option(BUILD_TESTING OFF)
 option(BELL_DISABLE_TESTS "Disable bell tests" ON)
