@@ -33,8 +33,8 @@
 
 #if ENABLE_USB_DISPLAY
 #define USB_DISPLAY_PID              0x2986
-#define USB_DISPLAY_VENDOR_STR       "esp32s3udisp0_R320x240_Ejpg4_Fps5_Bl65536"
-#define USB_DISPLAY_PRODUCT_STR      "Muse Radio USB Display POC A441S2"
+#define USB_DISPLAY_VENDOR_STR       "esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536"
+#define USB_DISPLAY_PRODUCT_STR      "Muse Radio USB Display POC A441F10"
 #endif
 
 //--------------------------------------------------------------------+

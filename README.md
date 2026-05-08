@@ -40,11 +40,12 @@ For installation or usage issues, open an issue on [GitHub](https://github.com/R
 
 `muse_radio_usb_display_poc` is an experimental Windows USB screen build. It exposes the Muse as a composite USB device: a TinyUSB vendor display interface plus the existing UAC speaker output.
 
-- Target display mode: 320x240 landscape, JPEG quality 4, 5 FPS.
+- Target display mode: 320x240 landscape, JPEG quality 4, 10 FPS.
 - USB IDs for this POC: VID `0x303A`, PID `0x2986`.
-- Vendor interface string: `esp32s3udisp0_R320x240_Ejpg4_Fps5_Bl65536`.
+- Vendor interface string: `esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536`.
 - Audio remains PCM stereo, 16-bit, 44.1 kHz, through the ES8388 codec path.
 - The POC is not a smooth video target; frame drops are preferred over USB audio underruns.
+- The previous USB audio distortion was caused mainly by UAC cadence drift: 44.1 kHz was consumed as integer `44100 / 1000 = 44` frames/ms, effectively 44.0 kHz. The local UAC component now uses fractional frame accumulation so 10 ms consumes exactly 441 frames, keeps the default 10 ms UAC interval, and only lets display rendering proceed while the audio buffer is healthy.
 
 Build it with:
 
@@ -225,6 +226,7 @@ The LittleFS data directory is `RadioV01/data`. If upload does not start automat
 - USB Audio 1.7 is output-only; ES8388 microphone/I2S RX support is intentionally deferred.
 - USB Audio uses Espressif `usb_device_uac` 1.2.3, vendored locally with a PlatformIO CMake descriptor build fix.
 - USB Audio is Windows-first in this release. The macOS-specific UAC descriptor mode is disabled because it can prevent Windows recognition.
+- USB Display + Audio POC keeps 44.1 kHz exact with fractional UAC frame reads; this avoids the 44.0 kHz drift that caused buffer pressure and audible distortion.
 - Spotify Connect POC firmware is close to the 3 MB app partition limit: current clean build is about 95% of `app0`.
 - AirPlay 1/RAOP POC firmware is currently smaller than the Spotify POC, but it uses an unofficial legacy RAOP implementation and is not an MFi/Apple-certified receiver.
 - Legacy factory I2S tests can be re-enabled with `ENABLE_LEGACY_FACTORY_I2S=1`, but they are incompatible with the new audio driver path and are disabled by default.

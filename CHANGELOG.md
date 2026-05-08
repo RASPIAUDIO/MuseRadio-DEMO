@@ -5,12 +5,14 @@
 - Added isolated `muse_radio_usb_display_poc` PlatformIO environment with `ENABLE_USB_AUDIO=1` and `ENABLE_USB_DISPLAY=1`.
 - Added a TinyUSB vendor display interface alongside UAC speaker output for a Windows USB extended-screen POC.
 - Added `UsbDisplayService` with PSRAM frame buffers, JPEG/RGB565 frame receive, 320x240 landscape validation, TFT rendering, frame-drop counters, and display inactivity events.
-- The display POC uses VID `0x303A`, PID `0x2986`, and vendor interface string `esp32s3udisp0_R320x240_Ejpg4_Fps5_Bl65536` for the Espressif Windows driver path.
+- The display POC uses VID `0x303A`, PID `0x2986`, and vendor interface string `esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536` for the Espressif Windows driver path.
+- Raised the USB display POC target from 5 FPS to 10 FPS while keeping audio-first frame dropping.
 - Fixed USB display color rendering by pushing RGB565 frames with the byte order expected by the TFT_eSPI ST7789 path.
 - Removed the local `USB Display` status overlay so Windows-rendered frames are not covered by a black banner.
 - Reverted the mono USB audio test after issue research showed similar UAC glitches in mono, and kept 16-bit / 44.1 kHz stereo for Windows compatibility.
 - Bypassed the raw PCM software gain/EQ path so USB, Spotify, and AirPlay PCM keep their source level while volume remains codec-driven through the ES8388.
 - Corrected the local UAC speaker cadence for 44.1 kHz with fractional frame reads, restored the default 10 ms UAC interval, and fixed the new-play timeout unit.
+- Documented the UAC distortion root cause: integer 44.1 kHz consumption drifted to 44.0 kHz and created buffer pressure.
 - Added USB audio diagnostics for UAC bytes, buffered milliseconds, drops, underruns, I2S write latency, and host volume.
 - Lowered USB display rendering priority and drop frames when the USB audio buffer is below the safe threshold.
 - USB display activity stops internet radio and keeps the backlight on; radio resumes after display inactivity with the existing guard-delay pattern.

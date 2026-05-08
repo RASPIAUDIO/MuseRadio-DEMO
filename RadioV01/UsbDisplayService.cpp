@@ -33,7 +33,7 @@ namespace {
 constexpr uint16_t DISPLAY_WIDTH = 320;
 constexpr uint16_t DISPLAY_HEIGHT = 240;
 constexpr uint32_t INACTIVE_TIMEOUT_MS = 2000;
-constexpr uint32_t MIN_FRAME_INTERVAL_MS = 200;
+constexpr uint32_t MIN_FRAME_INTERVAL_MS = 100;
 constexpr size_t RX_CHUNK_BYTES = 64;
 constexpr size_t FRAME_LIMIT_BYTES = 65536;
 constexpr size_t FRAME_SLOT_COUNT = 3;
@@ -515,7 +515,7 @@ void usbDisplayBegin(TFT_eSPI& tft, UsbDisplayEventHandler handler)
     return;
   }
 
-  Serial.printf("[usb-display] ready device=%s resolution=%ux%u fps=5 frame_limit=%u\n",
+  Serial.printf("[usb-display] ready device=%s resolution=%ux%u fps=10 frame_limit=%u\n",
                 s_deviceName.c_str(), DISPLAY_WIDTH, DISPLAY_HEIGHT,
                 (unsigned)FRAME_LIMIT_BYTES);
   emit(UsbDisplayEvent::Ready, 0, s_deviceName.c_str());
