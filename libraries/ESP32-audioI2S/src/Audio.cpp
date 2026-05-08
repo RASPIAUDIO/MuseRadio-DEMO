@@ -3276,7 +3276,7 @@ uint32_t Audio::stopSong() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 size_t Audio::writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate, uint8_t channels) {
-    if (!data || len < 4 || channels != 2 || !m_f_I2S_init) return 0;
+    if (!data || !m_f_I2S_init || (channels != 1 && channels != 2)) return 0;
 
     if (m_i2s_items.sampleRate != sampleRate) {
         setSampleRate(sampleRate);
@@ -3286,32 +3286,30 @@ size_t Audio::writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate
         I2Sstart();
     }
 
-    constexpr size_t SRC_FRAME_BYTES = 4; // 16-bit stereo PCM
     constexpr size_t OUT_SAMPLES = 512;   // 256 stereo frames
     constexpr size_t OUT_FRAME_BYTES = 2 * sizeof(int32_t);
+    const size_t srcFrameBytes = channels * sizeof(int16_t);
+    if (len < srcFrameBytes) return 0;
+
     int32_t out[OUT_SAMPLES];
 
     size_t consumed = 0;
-    size_t frames = len / SRC_FRAME_BYTES;
+    size_t frames = len / srcFrameBytes;
 
     while (frames > 0) {
         const size_t framesThisPass = frames < (OUT_SAMPLES / 2) ? frames : (OUT_SAMPLES / 2);
         for (size_t frame = 0; frame < framesThisPass; frame++) {
-            const size_t src = consumed + frame * SRC_FRAME_BYTES;
+            const size_t src = consumed + frame * srcFrameBytes;
             const int16_t left = (int16_t)((uint16_t)data[src] | ((uint16_t)data[src + 1] << 8));
-            const int16_t right = (int16_t)((uint16_t)data[src + 2] | ((uint16_t)data[src + 3] << 8));
+            const int16_t right = channels == 1
+                                      ? left
+                                      : (int16_t)((uint16_t)data[src + 2] | ((uint16_t)data[src + 3] << 8));
             out[frame * 2] = ((int32_t)left) << 16;
             out[frame * 2 + 1] = ((int32_t)right) << 16;
         }
 
+        // Raw PCM sources keep their level intact; volume is handled by the external codec.
         bool continueI2S = true;
-        audio_process_raw_samples(out, (int16_t)framesThisPass);
-        for (size_t frame = 0; frame < framesThisPass; frame++) {
-            calculateVUlevel(&out[frame * 2]);
-            IIR_filter(&out[frame * 2]);
-            Gain(&out[frame * 2]);
-        }
-        processSpectrum();
         audio_process_i2s(out, (int16_t)framesThisPass, &continueI2S);
         if (!continueI2S) {
             break;
@@ -3325,7 +3323,7 @@ size_t Audio::writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate
         }
 
         const size_t framesWritten = bytesWritten / OUT_FRAME_BYTES;
-        consumed += framesWritten * SRC_FRAME_BYTES;
+        consumed += framesWritten * srcFrameBytes;
         frames -= framesWritten;
 
         if (framesWritten < framesThisPass) {

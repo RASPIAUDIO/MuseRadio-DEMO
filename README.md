@@ -2,7 +2,7 @@
 
 Internet radio demo project for the [Muse Radio](https://raspiaudio.com/product/muse-radio/) by RASPIAUDIO.
 
-The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons, IR remote control, OTA support, ES8388 codec output, headphone/speaker switching, and battery monitoring.
+The demo supports Wi-Fi streaming, USB Audio Class output, the integrated TFT display, hardware buttons, IR remote control, OTA support, ES8388 codec output, headphone/speaker switching, and battery monitoring.
 
 ## Features
 
@@ -14,6 +14,8 @@ The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons,
 - Battery level display.
 - Multiple saved Wi-Fi credentials through LittleFS `/wifi.json`.
 - Captive Wi-Fi setup portal when no saved network connects.
+- Windows-first USB Audio Class output in the main firmware.
+- Optional USB Display + Audio Windows POC build.
 - Optional Spotify Connect POC build through `cspot`.
 - Optional experimental AirPlay 1/RAOP receiver POC build.
 
@@ -33,6 +35,41 @@ The demo supports Wi-Fi streaming, the integrated TFT display, hardware buttons,
 If no saved Wi-Fi network connects, the radio starts an access point named `MuseRadio-XXXX` with password `museradio`, shows a Wi-Fi QR code for that access point, and serves a local setup page at `http://192.168.4.1`. Scan the QR code to connect a phone to the radio, open `http://192.168.4.1`, choose a network, enter the password, and the radio saves it in `/wifi.json` before restarting. Press the OK/encoder button on the radio to skip the portal and use the manual on-screen credential entry.
 
 For installation or usage issues, open an issue on [GitHub](https://github.com/RASPIAUDIO/MuseRadio-DEMO/issues).
+
+## USB Display + Audio POC
+
+`muse_radio_usb_display_poc` is an experimental Windows USB screen build. It exposes the Muse as a composite USB device: a TinyUSB vendor display interface plus the existing UAC speaker output.
+
+- Target display mode: 320x240 landscape, JPEG quality 4, 5 FPS.
+- USB IDs for this POC: VID `0x303A`, PID `0x2986`.
+- Vendor interface string: `esp32s3udisp0_R320x240_Ejpg4_Fps5_Bl65536`.
+- Audio remains PCM stereo, 16-bit, 44.1 kHz, through the ES8388 codec path.
+- The POC is not a smooth video target; frame drops are preferred over USB audio underruns.
+
+Build it with:
+
+```powershell
+python -m platformio run -e muse_radio_usb_display_poc
+```
+
+Use the Espressif USB extended screen driver first. Notes and driver links are in `tools/windows_usb_display_driver/README.md`.
+
+## Release 1.7
+
+Version 1.7 adds USB Audio Class output to the main `muse_radio` firmware. The Muse can act as a Windows USB speaker: PC -> USB -> Muse -> ES8388.
+
+- Added `ENABLE_USB_AUDIO=1` to the main `muse_radio` environment.
+- Added `UsbAudioService` around Espressif's `usb_device_uac` component and TinyUSB UAC speaker endpoint.
+- The USB audio profile is output-only, PCM stereo, 16-bit, 44.1 kHz.
+- USB PCM is buffered and sent through `Audio::writeRawPCM16(..., 44100, 2)`, so the existing ES8388/I2S output path remains shared.
+- The USB output path prerolls about 50 ms and aggregates USB packets into 20 ms I2S writes to reduce transient underruns.
+- USB Audio starts before Wi-Fi setup, and the USB CDC/Improv serial path is disabled in this build so UAC owns the native USB link.
+- When USB audio starts, internet radio playback is stopped and the TFT shows a minimal `USB Audio` screen.
+- When USB audio becomes inactive, the firmware waits briefly before resuming the previous radio mode.
+- Windows host volume and mute events are mapped to the ES8388 codec volume/mute path, not destructive software attenuation.
+- The USB product descriptor is `Muse Radio`; Windows may show the playback endpoint as `Speakers (usb uac)`.
+- Microphone/UAC input is not included in 1.7 and remains planned for a later build.
+- The displayed firmware version is now `V1.7`.
 
 ## Release 1.6
 
@@ -90,11 +127,12 @@ Version 1.3 is the captive-portal Wi-Fi release for Muse Radio. It keeps the Ard
 ## Recent Changes
 
 - Multiple Wi-Fi credentials are stored in LittleFS at `/wifi.json` and loaded into `WiFiMulti` on boot.
+- Main firmware exposes a Windows-first USB Audio Class output device for 44.1 kHz / 16-bit stereo playback.
 - Optional Spotify Connect POC is available in `muse_radio_spotify_poc`.
 - Optional experimental AirPlay 1/RAOP POC is available in `muse_radio_airplay_poc`.
 - When no saved Wi-Fi network connects, the radio starts a captive setup portal at `http://192.168.4.1` and displays a Wi-Fi QR code on the TFT.
 - The captive portal screen also offers the OK/encoder button as a shortcut to manual credential entry.
-- The displayed firmware version is now `V1.6`.
+- The displayed firmware version is now `V1.7`.
 - Long Wi-Fi passwords wrap onto two lines for readability.
 - `USBSerial` falls back to `Serial` when native USB CDC is not enabled.
 
@@ -113,10 +151,17 @@ The repository includes a `platformio.ini` configured for the Muse Radio ESP32-S
 
 ```bash
 python -m platformio run -e muse_radio
+python -m platformio run -e muse_radio_usb_display_poc
 python -m platformio run -e muse_radio_spotify_poc
 python -m platformio run -e muse_radio_airplay_poc
 python -m platformio run -e muse_radio -t upload --upload-port COM5
 python -m platformio run -e muse_radio -t uploadfs --upload-port COM5
+```
+
+USB Audio 1.7 changes native USB enumeration because the ESP32-S3 presents itself as a UAC device. If the native USB serial port disappears after flashing the USB Audio firmware, use the CP210x UART bridge for logs and uploads during tests. On the current bench this UART was observed as `COM8`; adapt the port to your Windows Device Manager.
+
+```bash
+python -m platformio run -e muse_radio -t upload --upload-port COM8
 ```
 
 PlatformIO also generates a combined binary at `.pio/build/muse_radio/firmware.factory.bin`. This "total" binary contains the bootloader, partition table, OTA boot app, and firmware image, and must be flashed at address `0x0`.
@@ -177,6 +222,9 @@ The LittleFS data directory is `RadioV01/data`. If upload does not start automat
 
 - PSRAM is required by `ESP32-audioI2S` 3.4.5.
 - The ES8388 codec needs MCLK on GPIO0 with the current audio library.
+- USB Audio 1.7 is output-only; ES8388 microphone/I2S RX support is intentionally deferred.
+- USB Audio uses Espressif `usb_device_uac` 1.2.3, vendored locally with a PlatformIO CMake descriptor build fix.
+- USB Audio is Windows-first in this release. The macOS-specific UAC descriptor mode is disabled because it can prevent Windows recognition.
 - Spotify Connect POC firmware is close to the 3 MB app partition limit: current clean build is about 95% of `app0`.
 - AirPlay 1/RAOP POC firmware is currently smaller than the Spotify POC, but it uses an unofficial legacy RAOP implementation and is not an MFi/Apple-certified receiver.
 - Legacy factory I2S tests can be re-enabled with `ENABLE_LEGACY_FACTORY_I2S=1`, but they are incompatible with the new audio driver path and are disabled by default.

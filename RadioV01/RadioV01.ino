@@ -32,6 +32,8 @@
 #include <ArduinoJson.h>
 #include "SpotifyConnect.h"
 #include "AirPlayService.h"
+#include "UsbAudioService.h"
+#include "UsbDisplayService.h"
 #include "esp32s3/rom/tjpgd.h"
 #if ENABLE_SPOTIFY_CONNECT || ENABLE_AIRPLAY
 #include "esp_heap_caps.h"
@@ -42,6 +44,14 @@
 
 #ifndef ENABLE_LEGACY_FACTORY_I2S
 #define ENABLE_LEGACY_FACTORY_I2S 0
+#endif
+
+#ifndef ENABLE_USB_AUDIO
+#define ENABLE_USB_AUDIO 0
+#endif
+
+#ifndef ENABLE_USB_DISPLAY
+#define ENABLE_USB_DISPLAY 0
 #endif
 
 // Provide a portable console alias: use USB CDC when available, else UART Serial
@@ -57,7 +67,15 @@ PNG png;
 
 
 
-#define version "V1.6"
+#ifndef MUSE_FIRMWARE_VERSION
+#define MUSE_FIRMWARE_VERSION "V1.7"
+#endif
+
+#ifndef MUSE_IMPROV_VERSION
+#define MUSE_IMPROV_VERSION "1.7"
+#endif
+
+#define version MUSE_FIRMWARE_VERSION
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
@@ -418,6 +436,11 @@ static volatile uint32_t airPlayRadioResumeAtMs = 0;
 static String airPlayTrackTitle;
 static String airPlayTrackArtist;
 static String airPlayTrackAlbum;
+static volatile bool usbAudioPlaybackActive = false;
+static volatile uint32_t usbAudioRadioResumeAtMs = 0;
+static volatile bool usbAudioVolumeUpdateFromHost = false;
+static volatile bool usbDisplayPlaybackActive = false;
+static volatile uint32_t usbDisplayRadioResumeAtMs = 0;
 #if ENABLE_SPOTIFY_CONNECT
 static const int SPOTIFY_COVER_X = 12;
 static const int SPOTIFY_COVER_Y = 92;
@@ -536,7 +559,8 @@ void ES8388vol_Set(uint8_t volx)
   if (volx > maxVol) volx = maxVol;
   if (volx == 0)ES8388_Write_Reg(25, 0x04); else ES8388_Write_Reg(25, 0x00);
   bool externalCodecVolume = spotifyPlaybackActive || spotifyConnectActive() ||
-                             airPlayPlaybackActive || airPlayActive();
+                             airPlayPlaybackActive || airPlayActive() ||
+                             usbAudioPlaybackActive || usbAudioActive();
 
   //    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);
   //    printf("VOLX = %d  %d\n",volx, jackON);
@@ -1419,6 +1443,44 @@ void refreshVolume(void)
   }
 }
 
+static void initAudioHardware()
+{
+  static bool initialized = false;
+  if (initialized) return;
+  initialized = true;
+
+  Wire.setPins(SDA, SCL);
+  Wire.begin();
+  const uint8_t codecStatus = ES8388_Init();
+  if (codecStatus == 0) printf("Codec init OK\n"); else printf("Codec init failed\n");
+
+  Audio::audio_info_callback = audioEvent;
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
+  audio.setVolumeSteps(maxVol + 1);
+  audio.setVolume(maxVol);
+
+  if (gpio_get_level(JACK_DETECT) == 0)
+  {
+    printf("Jack ON\n");
+    gpio_set_level(PA, 0);
+    ES8388_Write_Reg(29, 0x00);
+    ES8388_Write_Reg(28, 0x04);
+    ES8388_Write_Reg(4, 0x0C);
+    jackON = true;
+    refreshVolume();
+  }
+  else
+  {
+    printf("Jack OFF\n");
+    gpio_set_level(PA, 1);
+    ES8388_Write_Reg(29, 0x20);
+    ES8388_Write_Reg(28, 0x14);
+    ES8388_Write_Reg(4, 0x30);
+    jackON = false;
+    refreshVolume();
+  }
+}
+
 static String spotifyMetadataLine(const char* text, uint8_t wantedLine)
 {
   if (!text) return "";
@@ -2036,6 +2098,117 @@ static void drawAirPlayStatus(const char* line)
   }
 }
 
+static void drawUsbAudioStatus(const char* line)
+{
+  tft.setRotation(1);
+  tft.fillRect(8, 78, 312, 112, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+  tft.drawString("USB Audio", 200, 86, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(line && line[0] ? line : usbAudioDeviceName(), 200, 128, 2);
+  tft.setTextColor(TFT_GREY, TFT_BLACK);
+  tft.drawString("Windows sound card - 44.1 kHz", 200, 154, 2);
+}
+
+static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char* text)
+{
+  switch (event)
+  {
+    case UsbAudioEvent::Ready:
+      printf("[usb-audio] ready: %s\n", text ? text : usbAudioDeviceName());
+      break;
+    case UsbAudioEvent::Active:
+      usbAudioPlaybackActive = true;
+      usbAudioRadioResumeAtMs = 0;
+      audio.stopSong();
+      connected = false;
+      refreshVolume();
+      if (!(usbDisplayPlaybackActive || usbDisplayActive()))
+      {
+        drawUsbAudioStatus(text ? text : usbAudioDeviceName());
+      }
+      break;
+    case UsbAudioEvent::Inactive:
+      usbAudioRadioResumeAtMs = millis() + 1500;
+      usbAudioPlaybackActive = false;
+      connected = false;
+      refreshVolume();
+      if (!(usbDisplayPlaybackActive || usbDisplayActive()))
+      {
+        drawUsbAudioStatus(text ? text : "Radio resumes...");
+      }
+      break;
+    case UsbAudioEvent::Volume:
+    {
+      int newVol = (int)((value * maxVol + 50UL) / 100UL);
+      if (newVol < 0) newVol = 0;
+      if (newVol > maxVol) newVol = maxVol;
+      if (newVol != vol)
+      {
+        usbAudioVolumeUpdateFromHost = true;
+        vol = newVol;
+        V = vol * pos360 / maxVol;
+        PV = V;
+        volEncoder.setCount(V);
+        refreshVolume();
+        usbAudioVolumeUpdateFromHost = false;
+        toDisplay = 3;
+      }
+      break;
+    }
+    case UsbAudioEvent::Mute:
+      if (value && !muteON)
+      {
+        Pvol = vol;
+        vol = 0;
+        muteON = true;
+        refreshVolume();
+        toDisplay = 1;
+      }
+      else if (!value && muteON)
+      {
+        vol = Pvol;
+        muteON = false;
+        refreshVolume();
+        toDisplay = 2;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static void handleUsbDisplayEvent(UsbDisplayEvent event, uint32_t value, const char* text)
+{
+  switch (event)
+  {
+    case UsbDisplayEvent::Ready:
+      printf("[usb-display] ready: %s\n", text ? text : usbDisplayDeviceName());
+      break;
+    case UsbDisplayEvent::Active:
+      usbDisplayPlaybackActive = true;
+      usbDisplayRadioResumeAtMs = 0;
+      audio.stopSong();
+      connected = false;
+      displayON();
+      break;
+    case UsbDisplayEvent::Inactive:
+      usbDisplayRadioResumeAtMs = millis() + 1500;
+      usbDisplayPlaybackActive = false;
+      connected = false;
+      break;
+    case UsbDisplayEvent::Dropped:
+      if ((value % 25) == 1)
+      {
+        printf("[usb-display] dropped frames=%lu\n", (unsigned long)value);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
 static void handleAirPlayEvent(AirPlayEvent event, uint32_t value, const char* text)
 {
   switch (event)
@@ -2486,8 +2659,12 @@ static void playRadio(void* data)
   {
     if (spotifyPlaybackActive || spotifyConnectActive() ||
         airPlayPlaybackActive || airPlayActive() ||
+        usbAudioPlaybackActive || usbAudioActive() ||
+        usbDisplayPlaybackActive || usbDisplayActive() ||
         (spotifyRadioResumeAtMs != 0 && (int32_t)(millis() - spotifyRadioResumeAtMs) < 0) ||
-        (airPlayRadioResumeAtMs != 0 && (int32_t)(millis() - airPlayRadioResumeAtMs) < 0))
+        (airPlayRadioResumeAtMs != 0 && (int32_t)(millis() - airPlayRadioResumeAtMs) < 0) ||
+        (usbAudioRadioResumeAtMs != 0 && (int32_t)(millis() - usbAudioRadioResumeAtMs) < 0) ||
+        (usbDisplayRadioResumeAtMs != 0 && (int32_t)(millis() - usbDisplayRadioResumeAtMs) < 0))
     {
       vTaskDelay(20 / portTICK_PERIOD_MS);
       continue;
@@ -2604,7 +2781,7 @@ static void battery(void* data)
       }
     }
 
-    if (display == true)
+    if ((display == true) && !(usbDisplayPlaybackActive || usbDisplayActive()))
     {
       tft.setRotation(1);
       tft.fillCircle(280, 35, 40, TFT_BLACK);
@@ -2651,7 +2828,13 @@ static void displayONOFF(void* data)
   while (true)
   {
     displayT -= 100;
-    if (displayT > 0) gpio_set_level(backLight, 1); else gpio_set_level(backLight, 0);
+    if (usbDisplayPlaybackActive || usbDisplayActive()) {
+      gpio_set_level(backLight, 1);
+    } else if (displayT > 0) {
+      gpio_set_level(backLight, 1);
+    } else {
+      gpio_set_level(backLight, 0);
+    }
     delay(100);
   }
 }
@@ -2996,7 +3179,7 @@ void WiFiConnected(const char *ssid, const char *password)
 }
 static void improvWiFiInit(void* data)
 {
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.6", "Raspiaudio Radio");
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", MUSE_IMPROV_VERSION, "Raspiaudio Radio");
   improvSerial.onImprovConnected(WiFiConnected);
   delay(500);
   while (true)
@@ -3058,18 +3241,21 @@ void loadLastOTA(void)
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
 
-  uint8_t res;
+#if !ENABLE_USB_AUDIO
   USBSerial.begin(115200);
+#endif
   printf("PSRAM: %s, size=%u, free=%u\n",
          psramFound() ? "yes" : "no",
          (unsigned)ESP.getPsramSize(),
          (unsigned)ESP.getFreePsram());
 
+#if !ENABLE_USB_AUDIO
   // Start the Improv Wi-Fi over Serial task immediately
   xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
 
   // Small delay to ensure Improv Serial is ready
   vTaskDelay(100 / portTICK_PERIOD_MS);
+#endif
 
   /////////////////////////////////////////////////////
   // Little FS init
@@ -3175,6 +3361,11 @@ void setup() {
   tft.drawString(version, 280, 220, 2);
   delay(2000);
 
+  // Initialize USB Audio before Wi-Fi so Windows sees the sound card even if setup enters the captive portal.
+  initAudioHardware();
+  usbDisplayBegin(tft, handleUsbDisplayEvent);
+  usbAudioBegin(audio, handleUsbAudioEvent);
+
   {
     printf("WiFi\n");
     gpio_set_level(EN_4G, 0);
@@ -3196,10 +3387,14 @@ void setup() {
   //   wifiMulti.run();
   const uint32_t connectTimeoutMs = 20000;
   if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
+#if !ENABLE_USB_AUDIO
     USBSerial.print("WiFi connected: ");
     USBSerial.print(WiFi.SSID());
     USBSerial.print(" ");
     USBSerial.println(WiFi.RSSI());
+#else
+    printf("WiFi connected: %s %d\n", WiFi.SSID().c_str(), WiFi.RSSI());
+#endif
     started = true;
 
     ////////////////////////////////////////////////////////////////
@@ -3228,39 +3423,7 @@ void setup() {
   ///////////////////////////////////////////////////////////////
   // Audio init
   //////////////////////////////////////////////////////////////
-  //ES8388 codec init
-  Wire.setPins(SDA, SCL);
-  Wire.begin();
-  res = ES8388_Init();
-  if (res == 0)printf("Codec init OK\n"); else printf("Codec init failed\n");
-
-  // audio lib init
-  Audio::audio_info_callback = audioEvent;
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
-  audio.setVolumeSteps(maxVol + 1);
-  audio.setVolume(maxVol);
-
-  // connections init
-  if (gpio_get_level(JACK_DETECT) == 0)
-  {
-    printf("Jack ON\n");
-    gpio_set_level(PA, 0);          // amp off
-    ES8388_Write_Reg(29, 0x00);     // stereo
-    ES8388_Write_Reg(28, 0x04);     // no phase inversion + click free power up/down
-    ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2
-    jackON = true;
-    refreshVolume();
-  }
-  else
-  {
-    printf("Jack OFF\n");
-    gpio_set_level(PA, 1);          // amp on
-    ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
-    ES8388_Write_Reg(28, 0x14);     // Right DAC phase inversion + click free power up/down
-    ES8388_Write_Reg(4, 0x30);      // Rout1/Lout1
-    jackON = false;
-    refreshVolume();
-  }
+  initAudioHardware();
 
   ///////////////////////////////////////////////////////////////
   // recovering params (station & vol)
@@ -3358,6 +3521,7 @@ void loop() {
 
   serviceSpotifyCoverDisplay();
   debugAdcButtonsTick();
+  const bool usbDisplayBusy = usbDisplayPlaybackActive || usbDisplayActive();
 
   //////////////////////////////////////////////////////////////////////
   // Volume via encoder
@@ -3377,7 +3541,7 @@ void loop() {
     File ln = LittleFS.open("/volume", "w");
     ln.write((uint8_t*)b, 2);
     ln.close();
-    toDisplay = 3;
+    if (!usbDisplayBusy) toDisplay = 3;
   }
   //////////////////////////////////////////////////////////////////////
   // volume via remote keys
@@ -3399,7 +3563,7 @@ void loop() {
     File ln = LittleFS.open("/volume", "w");
     ln.write((uint8_t*)b, 2);
     ln.close();
-    toDisplay = 3;
+    if (!usbDisplayBusy) toDisplay = 3;
   }
 
   ///////////////////////////////////////////////////////////////////////
@@ -3412,7 +3576,7 @@ void loop() {
     refreshVolume();
     muteB = false;
     muteON = true;
-    toDisplay = 1;
+    if (!usbDisplayBusy) toDisplay = 1;
   }
   if ((muteB == true) && (muteON == true))
   {
@@ -3420,11 +3584,11 @@ void loop() {
     refreshVolume();
     muteB = false;
     muteON = false;
-    toDisplay = 2;
+    if (!usbDisplayBusy) toDisplay = 2;
   }
 
 
-  if (Bdonate == false)
+  if ((Bdonate == false) && !usbDisplayBusy)
   {
     ////////////////////////////////////////////////////////////////////////
     //  station search via encoder
@@ -3532,7 +3696,7 @@ void loop() {
   /////////////////////////////////////////////////////////////////////////
   // Display refresh
   /////////////////////////////////////////////////////////////////////////
-  if ((toDisplay != 0) && (Bdonate == false))
+  if ((toDisplay != 0) && (Bdonate == false) && !usbDisplayBusy)
   {
     displayON();
     switch (toDisplay)

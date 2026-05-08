@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.8-display-poc - Unreleased
+
+- Added isolated `muse_radio_usb_display_poc` PlatformIO environment with `ENABLE_USB_AUDIO=1` and `ENABLE_USB_DISPLAY=1`.
+- Added a TinyUSB vendor display interface alongside UAC speaker output for a Windows USB extended-screen POC.
+- Added `UsbDisplayService` with PSRAM frame buffers, JPEG/RGB565 frame receive, 320x240 landscape validation, TFT rendering, frame-drop counters, and display inactivity events.
+- The display POC uses VID `0x303A`, PID `0x2986`, and vendor interface string `esp32s3udisp0_R320x240_Ejpg4_Fps5_Bl65536` for the Espressif Windows driver path.
+- Fixed USB display color rendering by pushing RGB565 frames with the byte order expected by the TFT_eSPI ST7789 path.
+- Removed the local `USB Display` status overlay so Windows-rendered frames are not covered by a black banner.
+- Reverted the mono USB audio test after issue research showed similar UAC glitches in mono, and kept 16-bit / 44.1 kHz stereo for Windows compatibility.
+- Bypassed the raw PCM software gain/EQ path so USB, Spotify, and AirPlay PCM keep their source level while volume remains codec-driven through the ES8388.
+- Corrected the local UAC speaker cadence for 44.1 kHz with fractional frame reads, restored the default 10 ms UAC interval, and fixed the new-play timeout unit.
+- Added USB audio diagnostics for UAC bytes, buffered milliseconds, drops, underruns, I2S write latency, and host volume.
+- Lowered USB display rendering priority and drop frames when the USB audio buffer is below the safe threshold.
+- USB display activity stops internet radio and keeps the backlight on; radio resumes after display inactivity with the existing guard-delay pattern.
+- Documented the Espressif Windows driver path in `tools/windows_usb_display_driver/README.md`.
+
+## 1.7 - 2026-05-07
+
+- Added Windows-first USB Audio Class output to the main `muse_radio` firmware with `ENABLE_USB_AUDIO=1`.
+- Added `UsbAudioService` around Espressif `usb_device_uac` 1.2.3 and TinyUSB UAC speaker output.
+- Vendorized `usb_device_uac` locally and patched only the CMake descriptor build path needed by PlatformIO.
+- The UAC profile is output-only PCM stereo, 16-bit, 44.1 kHz; ES8388 microphone/UAC input is deferred.
+- USB product descriptor is `Muse Radio`; endpoint naming remains Windows-dependent.
+- USB PCM is queued from the UAC OUT callback and written through the existing `Audio::writeRawPCM16(..., 44100, 2)` path, avoiding a second I2S TX driver.
+- Hardened USB audio against transient crackles by moving UI/radio switching out of the UAC callback, lowering UAC bandwidth from 48 kHz to 44.1 kHz, increasing the UAC speaker interval to 50 ms, adding a 50 ms preroll, aggregating USB packets into 20 ms I2S writes, and logging drop/underrun counters.
+- USB Audio now initializes before Wi-Fi setup so Windows can enumerate the sound card even when Wi-Fi falls back to the captive portal.
+- Disabled the Improv serial/USB CDC startup path in the USB Audio build because the native USB link is owned by UAC.
+- Internet radio stops when USB audio becomes active and resumes after a short inactivity/disconnect guard.
+- Windows host volume and mute events now map to the ES8388 codec volume/mute path instead of software PCM attenuation.
+- Added a minimal TFT `USB Audio` status screen.
+- Refactored PlatformIO environments so the main firmware builds as Arduino + ESP-IDF with USB Audio, while Spotify and AirPlay POC environments remain isolated.
+- Bumped the displayed firmware version and Improv device version to 1.7.
+
 ## 1.6 - 2026-05-06
 
 - Added an isolated `muse_radio_airplay_poc` PlatformIO environment with `ENABLE_AIRPLAY=1`.
