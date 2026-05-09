@@ -32,7 +32,6 @@ uint32_t tud_vendor_n_read(uint8_t itf, void* buffer, uint32_t bufsize);
 namespace {
 constexpr uint16_t DISPLAY_WIDTH = 320;
 constexpr uint16_t DISPLAY_HEIGHT = 240;
-constexpr uint32_t INACTIVE_TIMEOUT_MS = 2000;
 constexpr uint32_t MIN_FRAME_INTERVAL_MS = 100;
 constexpr size_t RX_CHUNK_BYTES = 64;
 constexpr size_t FRAME_LIMIT_BYTES = 65536;
@@ -136,13 +135,6 @@ void emitActive()
   s_lastFrameMs = millis();
   if (!s_active.exchange(true)) {
     emit(UsbDisplayEvent::Active, 0, usbDisplayDeviceName());
-  }
-}
-
-void emitInactive()
-{
-  if (s_active.exchange(false)) {
-    emit(UsbDisplayEvent::Inactive, 0, "Display idle");
   }
 }
 
@@ -443,12 +435,6 @@ void renderTask(void*)
     if (xQueueReceive(s_fullQueue, &slot, 200 / portTICK_PERIOD_MS) == pdTRUE) {
       drawFrame(slot);
       returnSlot(slot);
-    }
-
-    const uint32_t last = s_lastFrameMs.load();
-    if (s_active.load() && last != 0 &&
-        (int32_t)(millis() - last) > (int32_t)INACTIVE_TIMEOUT_MS) {
-      emitInactive();
     }
   }
 }

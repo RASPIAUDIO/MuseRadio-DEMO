@@ -286,6 +286,7 @@ decode_results results;
 void displayON(void)
 {
   displayT = TEMPO;
+  gpio_set_level(backLight, 1);
 }
 
 #define ES8388_ADDR 0x10
@@ -2098,6 +2099,7 @@ static void drawAirPlayStatus(const char* line)
   }
 }
 
+#if !ENABLE_USB_DISPLAY
 static void drawUsbAudioStatus(const char* line)
 {
   tft.setRotation(1);
@@ -2110,6 +2112,7 @@ static void drawUsbAudioStatus(const char* line)
   tft.setTextColor(TFT_GREY, TFT_BLACK);
   tft.drawString("Windows sound card - 44.1 kHz", 200, 154, 2);
 }
+#endif
 
 static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char* text)
 {
@@ -2124,20 +2127,24 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
       audio.stopSong();
       connected = false;
       refreshVolume();
+#if !ENABLE_USB_DISPLAY
       if (!(usbDisplayPlaybackActive || usbDisplayActive()))
       {
         drawUsbAudioStatus(text ? text : usbAudioDeviceName());
       }
+#endif
       break;
     case UsbAudioEvent::Inactive:
       usbAudioRadioResumeAtMs = millis() + 1500;
       usbAudioPlaybackActive = false;
       connected = false;
       refreshVolume();
+#if !ENABLE_USB_DISPLAY
       if (!(usbDisplayPlaybackActive || usbDisplayActive()))
       {
         drawUsbAudioStatus(text ? text : "Radio resumes...");
       }
+#endif
       break;
     case UsbAudioEvent::Volume:
     {
@@ -2194,9 +2201,10 @@ static void handleUsbDisplayEvent(UsbDisplayEvent event, uint32_t value, const c
       displayON();
       break;
     case UsbDisplayEvent::Inactive:
-      usbDisplayRadioResumeAtMs = millis() + 1500;
-      usbDisplayPlaybackActive = false;
+      usbDisplayPlaybackActive = true;
+      usbDisplayRadioResumeAtMs = 0;
       connected = false;
+      displayON();
       break;
     case UsbDisplayEvent::Dropped:
       if ((value % 25) == 1)
@@ -2825,17 +2833,16 @@ static void remote(void* data)
 ////////////////////////////////////////////////////////////////////////
 static void displayONOFF(void* data)
 {
+  (void)data;
   while (true)
   {
-    displayT -= 100;
-    if (usbDisplayPlaybackActive || usbDisplayActive()) {
-      gpio_set_level(backLight, 1);
-    } else if (displayT > 0) {
-      gpio_set_level(backLight, 1);
-    } else {
-      gpio_set_level(backLight, 0);
-    }
-    delay(100);
+    displayT = TEMPO;
+    gpio_set_level(backLight, 1);
+#ifdef TFT_BL
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+#endif
+    delay(1000);
   }
 }
 ////////////////////////////////////////////////////////////////////
