@@ -16,6 +16,8 @@
 - Added USB audio diagnostics for UAC bytes, buffered milliseconds, drops, underruns, I2S write latency, and host volume.
 - Lowered USB display rendering priority and drop frames when the USB audio buffer is below the safe threshold.
 - USB display activity stops internet radio and remains latched; screen inactivity no longer resumes radio.
+- Added a last-frame cache and 3 s replay keepalive so static USB display images stay visible.
+- Ignore incoming all-black blanking frames when a previous Windows frame is available.
 - Disabled backlight sleep across modes on the experimental branch.
 - Documented the Espressif Windows driver path in `tools/windows_usb_display_driver/README.md`.
 

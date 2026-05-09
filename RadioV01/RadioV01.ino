@@ -442,6 +442,7 @@ static volatile uint32_t usbAudioRadioResumeAtMs = 0;
 static volatile bool usbAudioVolumeUpdateFromHost = false;
 static volatile bool usbDisplayPlaybackActive = false;
 static volatile uint32_t usbDisplayRadioResumeAtMs = 0;
+static bool littleFsMounted = false;
 #if ENABLE_SPOTIFY_CONNECT
 static const int SPOTIFY_COVER_X = 12;
 static const int SPOTIFY_COVER_Y = 92;
@@ -3267,19 +3268,20 @@ void setup() {
   /////////////////////////////////////////////////////
   // Little FS init
   /////////////////////////////////////////////////////
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS initialisation failed!");
-    while (1) for (;;);
+  littleFsMounted = LittleFS.begin();
+  if (!littleFsMounted) {
+    Serial.println("LittleFS initialisation failed; continuing without data partition");
+  } else {
+    //    LittleFS.format();
+    File root = LittleFS.open("/", "r");
+    File file = root.openNextFile();
+    while (file) {
+      printf("FILE: /%s\n", file.name());
+      file = root.openNextFile();
+      delay(100);
+    }
+    ensureLocalRadioData();
   }
-  //    LittleFS.format();
-  File root = LittleFS.open("/", "r");
-  File file = root.openNextFile();
-  while (file) {
-    printf("FILE: /%s\n", file.name());
-    file = root.openNextFile();
-    delay(100);
-  }
-  ensureLocalRadioData();
 
   //////////////////////////////////////////////////
   //Encoders init

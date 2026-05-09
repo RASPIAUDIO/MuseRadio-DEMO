@@ -33,11 +33,14 @@ namespace {
 constexpr uint16_t DISPLAY_WIDTH = 320;
 constexpr uint16_t DISPLAY_HEIGHT = 240;
 constexpr uint32_t MIN_FRAME_INTERVAL_MS = 100;
+constexpr uint32_t DISPLAY_KEEPALIVE_MS = 3000;
 constexpr size_t RX_CHUNK_BYTES = 64;
 constexpr size_t FRAME_LIMIT_BYTES = 65536;
 constexpr size_t FRAME_SLOT_COUNT = 3;
 constexpr size_t JPEG_WORK_BYTES = 4096;
 constexpr size_t TILE_PIXELS = 1024;
+constexpr uint8_t BLANK_CHANNEL_THRESHOLD = 8;
+constexpr uint32_t BLANK_NONBLACK_PIXEL_LIMIT = 64;
 constexpr UBaseType_t RENDER_TASK_PRIORITY = 2;
 constexpr BaseType_t RENDER_TASK_CORE = 1;
 
@@ -94,13 +97,25 @@ uint32_t s_skipExpected = 0;
 uint8_t s_rxBuf[RX_CHUNK_BYTES];
 uint8_t* s_jpegWork = nullptr;
 uint16_t* s_tile = nullptr;
+uint8_t* s_lastFrameData = nullptr;
+uint32_t s_lastFrameLen = 0;
+uint16_t s_lastFrameWidth = 0;
+uint16_t s_lastFrameHeight = 0;
+uint8_t s_lastFrameType = 0;
+uint32_t s_lastFrameId = 0;
+bool s_lastFrameValid = false;
+bool s_replayingLastFrame = false;
+uint32_t s_decodeNonBlackPixels = 0;
 String s_deviceName;
 std::atomic<bool> s_started(false);
 std::atomic<bool> s_active(false);
 std::atomic<uint32_t> s_lastFrameMs(0);
 std::atomic<uint32_t> s_lastDrawMs(0);
+std::atomic<uint32_t> s_lastKeepaliveMs(0);
 std::atomic<uint32_t> s_frames(0);
 std::atomic<uint32_t> s_dropped(0);
+std::atomic<uint32_t> s_blankFrames(0);
+std::atomic<uint32_t> s_keepaliveReplays(0);
 
 uint16_t rgbTo565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -138,6 +153,23 @@ void emitActive()
   }
 }
 
+void wakePanel(bool includeSleepOut)
+{
+  if (!s_tft) return;
+  if (includeSleepOut) {
+#if defined(TFT_SLPOUT)
+    s_tft->writecommand(TFT_SLPOUT);
+#elif defined(ST7789_SLPOUT)
+    s_tft->writecommand(ST7789_SLPOUT);
+#endif
+  }
+#if defined(TFT_DISPON)
+  s_tft->writecommand(TFT_DISPON);
+#elif defined(ST7789_DISPON)
+  s_tft->writecommand(ST7789_DISPON);
+#endif
+}
+
 void countDrop(uint32_t bytes)
 {
   const uint32_t dropped = s_dropped.fetch_add(1) + 1;
@@ -146,6 +178,39 @@ void countDrop(uint32_t bytes)
                   (unsigned long)dropped, (unsigned long)bytes);
   }
   emit(UsbDisplayEvent::Dropped, dropped, nullptr);
+}
+
+void cacheLastFrame(const FrameSlot* slot)
+{
+  if (!slot || !slot->data || !s_lastFrameData || slot->len == 0 ||
+      slot->len > FRAME_LIMIT_BYTES) {
+    return;
+  }
+
+  memcpy(s_lastFrameData, slot->data, slot->len);
+  s_lastFrameLen = slot->len;
+  s_lastFrameWidth = slot->width;
+  s_lastFrameHeight = slot->height;
+  s_lastFrameType = slot->type;
+  s_lastFrameId = slot->frameId;
+  s_lastFrameValid = true;
+}
+
+bool rgb565FrameLooksBlank(const FrameSlot* slot)
+{
+  if (!slot || !slot->data || slot->len < (DISPLAY_WIDTH * DISPLAY_HEIGHT * 2UL)) {
+    return false;
+  }
+
+  uint32_t nonBlack = 0;
+  const uint8_t* data = slot->data;
+  const size_t pixelCount = (size_t)DISPLAY_WIDTH * DISPLAY_HEIGHT;
+  for (size_t i = 0; i < pixelCount; i++) {
+    if ((data[i * 2] | data[i * 2 + 1]) != 0) {
+      if (++nonBlack > BLANK_NONBLACK_PIXEL_LIMIT) return false;
+    }
+  }
+  return true;
 }
 
 bool audioAllowsDisplayFrame()
@@ -297,6 +362,11 @@ UINT jpegOutput(JDEC*, void* bitmap, JRECT* rect)
       const uint8_t r = src[srcIndex + 0];
       const uint8_t g = src[srcIndex + 1];
       const uint8_t b = src[srcIndex + 2];
+      if (r > BLANK_CHANNEL_THRESHOLD ||
+          g > BLANK_CHANNEL_THRESHOLD ||
+          b > BLANK_CHANNEL_THRESHOLD) {
+        s_decodeNonBlackPixels++;
+      }
       s_tile[(size_t)y * (size_t)drawW + (size_t)x] = rgbTo565(r, g, b);
     }
   }
@@ -305,8 +375,9 @@ UINT jpegOutput(JDEC*, void* bitmap, JRECT* rect)
   return 1;
 }
 
-bool drawJpegFrame(const FrameSlot* slot)
+bool drawJpegFrame(const FrameSlot* slot, bool* blank)
 {
+  if (blank) *blank = false;
   if (!slot || !slot->data || slot->len == 0 || !s_jpegWork) return false;
 
   JDEC decoder = {};
@@ -319,6 +390,7 @@ bool drawJpegFrame(const FrameSlot* slot)
   }
 
   const bool oldSwap = s_tft->getSwapBytes();
+  s_decodeNonBlackPixels = 0;
   s_tft->setSwapBytes(true);
   s_tft->startWrite();
   res = jd_decomp(&decoder, jpegOutput, 0);
@@ -330,12 +402,16 @@ bool drawJpegFrame(const FrameSlot* slot)
                   (int)res, (unsigned long)slot->len);
     return false;
   }
+  if (blank) {
+    *blank = s_decodeNonBlackPixels <= BLANK_NONBLACK_PIXEL_LIMIT;
+  }
   return true;
 }
 
-bool drawRgb565Frame(const FrameSlot* slot)
+bool drawRgb565Frame(const FrameSlot* slot, bool* blank)
 {
   if (!slot || !slot->data || slot->len < (DISPLAY_WIDTH * DISPLAY_HEIGHT * 2UL)) return false;
+  if (blank) *blank = rgb565FrameLooksBlank(slot);
   const bool oldSwap = s_tft->getSwapBytes();
   s_tft->setSwapBytes(true);
   s_tft->pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, (uint16_t*)slot->data);
@@ -343,9 +419,69 @@ bool drawRgb565Frame(const FrameSlot* slot)
   return true;
 }
 
+bool renderFrameToTft(const FrameSlot* slot, bool* blank)
+{
+  if (blank) *blank = false;
+  if (slot->type == UDISP_TYPE_JPG) {
+    return drawJpegFrame(slot, blank);
+  }
+  if (slot->type == UDISP_TYPE_RGB565) {
+    return drawRgb565Frame(slot, blank);
+  }
+  return false;
+}
+
+bool replayLastFrame(const char* reason)
+{
+  if (!s_tft || !s_lastFrameValid || !s_lastFrameData || s_lastFrameLen == 0) {
+    return false;
+  }
+
+  FrameSlot cached = {};
+  cached.data = s_lastFrameData;
+  cached.len = s_lastFrameLen;
+  cached.expected = s_lastFrameLen;
+  cached.width = s_lastFrameWidth;
+  cached.height = s_lastFrameHeight;
+  cached.type = s_lastFrameType;
+  cached.frameId = s_lastFrameId;
+
+  wakePanel(true);
+  s_tft->setRotation(1);
+  s_replayingLastFrame = true;
+  bool blank = false;
+  const bool ok = renderFrameToTft(&cached, &blank);
+  s_replayingLastFrame = false;
+
+  if (ok) {
+    const uint32_t count = s_keepaliveReplays.fetch_add(1) + 1;
+    s_lastKeepaliveMs = millis();
+    if ((count % 20) == 1) {
+      Serial.printf("[usb-display] replay last frame reason=%s count=%lu\n",
+                    reason ? reason : "idle", (unsigned long)count);
+    }
+  }
+  return ok;
+}
+
+void keepDisplayAlive()
+{
+  if (!s_active.load() || !s_lastFrameValid) return;
+  const uint32_t now = millis();
+  const uint32_t lastDraw = s_lastDrawMs.load();
+  const uint32_t lastKeepalive = s_lastKeepaliveMs.load();
+  const uint32_t lastRefresh = lastDraw > lastKeepalive ? lastDraw : lastKeepalive;
+  if (lastRefresh != 0 &&
+      (int32_t)(now - lastRefresh) < (int32_t)DISPLAY_KEEPALIVE_MS) {
+    return;
+  }
+  replayLastFrame("keepalive");
+}
+
 void drawFrame(const FrameSlot* slot)
 {
   if (!s_tft || !slot) return;
+  wakePanel(false);
   s_tft->setRotation(1);
   emitActive();
 
@@ -362,14 +498,23 @@ void drawFrame(const FrameSlot* slot)
   }
   s_lastDrawMs = now;
 
-  bool ok = false;
-  if (slot->type == UDISP_TYPE_JPG) {
-    ok = drawJpegFrame(slot);
-  } else if (slot->type == UDISP_TYPE_RGB565) {
-    ok = drawRgb565Frame(slot);
+  bool blank = false;
+  bool ok = renderFrameToTft(slot, &blank);
+
+  if (ok && blank && s_lastFrameValid && !s_replayingLastFrame) {
+    const uint32_t blankCount = s_blankFrames.fetch_add(1) + 1;
+    if ((blankCount % 10) == 1) {
+      Serial.printf("[usb-display] ignored blank frame count=%lu bytes=%lu\n",
+                    (unsigned long)blankCount, (unsigned long)slot->len);
+    }
+    replayLastFrame("blank");
+    return;
   }
 
   if (ok) {
+    if (!blank && !s_replayingLastFrame) {
+      cacheLastFrame(slot);
+    }
     const uint32_t frameCount = s_frames.fetch_add(1) + 1;
     if ((frameCount % 50) == 0) {
       Serial.printf("[usb-display] frames=%lu dropped=%lu last=%lu bytes\n",
@@ -424,6 +569,17 @@ bool allocateBuffers()
     Serial.println("[usb-display] jpeg scratch allocation failed");
     return false;
   }
+  if (!s_lastFrameData) {
+    s_lastFrameData = (uint8_t*)heap_caps_malloc(FRAME_LIMIT_BYTES,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_lastFrameData) {
+      s_lastFrameData = (uint8_t*)heap_caps_malloc(FRAME_LIMIT_BYTES,
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!s_lastFrameData) {
+      Serial.println("[usb-display] last-frame cache allocation failed; keepalive disabled");
+    }
+  }
   return true;
 }
 
@@ -435,6 +591,8 @@ void renderTask(void*)
     if (xQueueReceive(s_fullQueue, &slot, 200 / portTICK_PERIOD_MS) == pdTRUE) {
       drawFrame(slot);
       returnSlot(slot);
+    } else {
+      keepDisplayAlive();
     }
   }
 }

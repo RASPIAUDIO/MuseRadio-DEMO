@@ -46,6 +46,8 @@ For installation or usage issues, open an issue on [GitHub](https://github.com/R
 - Audio remains PCM stereo, 16-bit, 44.1 kHz, through the ES8388 codec path.
 - The POC is not a smooth video target; frame drops are preferred over USB audio underruns.
 - USB display mode latches active after the first received frame; lack of screen updates no longer resumes internet radio.
+- The display service caches the last non-black frame and replays it periodically so a static Windows desktop stays visible.
+- Incoming all-black blanking frames are ignored when a previous frame is available.
 - The firmware does not draw local USB status text over the Windows-rendered frame in this POC.
 - Backlight sleep is disabled in all modes on this experimental branch.
 - The previous USB audio distortion was caused mainly by UAC cadence drift: 44.1 kHz was consumed as integer `44100 / 1000 = 44` frames/ms, effectively 44.0 kHz. The local UAC component now uses fractional frame accumulation so 10 ms consumes exactly 441 frames, keeps the default 10 ms UAC interval, and only lets display rendering proceed while the audio buffer is healthy.
