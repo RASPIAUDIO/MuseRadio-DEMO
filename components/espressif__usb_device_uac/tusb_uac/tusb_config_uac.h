@@ -62,8 +62,13 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ     CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT * (SPK_INTERVAL_MS + 1)
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX        CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT // Maximum EP IN size for all AS alternate settings used
 
-// Number of Standard AS Interface Descriptors (4.9.1) defined per audio function - this is required to be able to remember the current alternate settings of these interfaces - We restrict us here to have a constant number for all audio functions (which means this has to be the maximum number of AS interfaces an audio function has and a second audio function with less AS interfaces just wastes a few bytes)
+// Number of Standard AS Interface Descriptors (4.9.1) defined per audio function.
+// The headset profile has one AS interface for speaker OUT and one for mic IN.
+#if SPEAK_CHANNEL_NUM && MIC_CHANNEL_NUM
+#define CFG_TUD_AUDIO_FUNC_1_N_AS_INT             2
+#else
 #define CFG_TUD_AUDIO_FUNC_1_N_AS_INT             1
+#endif
 
 // Size of control request buffer
 #define CFG_TUD_AUDIO_FUNC_1_CTRL_BUF_SZ    64

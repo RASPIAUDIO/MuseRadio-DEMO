@@ -21,6 +21,10 @@
 - Disabled backlight sleep across modes on the experimental branch.
 - Documented the Espressif Windows driver path in `tools/windows_usb_display_driver/README.md`.
 - Added `bin/MuseRadio-DEMO-V1.8-display-poc-factory-full.bin`, a full flash image with LittleFS included at `0x310000`.
+- Added a POC USB microphone profile: stereo 16-bit / 44.1 kHz UAC input from the ES8388 ADC on the Muse Radio differential microphones.
+- Extended the local `ESP32-audioI2S` copy with optional I2S RX and `readRawPCM16()` so USB mic capture shares the same I2S clocking path instead of creating a competing driver.
+- Applied the Muse Radio ADC/ALC microphone setup from `RASPIAUDIO/Muse_library` and fixed 44.1 kHz microphone packet cadence with the same fractional-frame strategy as speaker output.
+- Bumped the USB descriptor serial/product suffix to `A441M2` so Windows re-enumerates the new speaker + microphone profile.
 
 ## 1.7 - 2026-05-07
 

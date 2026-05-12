@@ -4,9 +4,14 @@
 #define ENABLE_USB_AUDIO 0
 #endif
 
+#ifndef ENABLE_USB_MIC
+#define ENABLE_USB_MIC 0
+#endif
+
 #if ENABLE_USB_AUDIO
 
 #include <atomic>
+#include <cstring>
 
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -60,6 +65,8 @@ std::atomic<uint32_t> s_bufferedBytes(0);
 std::atomic<uint32_t> s_droppedBytes(0);
 std::atomic<uint32_t> s_underrunCount(0);
 std::atomic<uint32_t> s_uacBytesRead(0);
+std::atomic<uint32_t> s_micBytesSent(0);
+std::atomic<uint32_t> s_micShortReads(0);
 std::atomic<uint32_t> s_i2sWriteMaxUs(0);
 std::atomic<uint32_t> s_hostVolume(100);
 uint8_t* s_pcmBlocks = nullptr;
@@ -458,6 +465,24 @@ esp_err_t uacOutputCb(uint8_t* buf, size_t len, void*)
   return ESP_OK;
 }
 
+esp_err_t uacInputCb(uint8_t* buf, size_t len, size_t* bytesRead, void*)
+{
+  if (!buf || !bytesRead) return ESP_ERR_INVALID_ARG;
+  size_t readLen = 0;
+#if ENABLE_USB_MIC
+  if (s_audio && len > 0) {
+    readLen = s_audio->readRawPCM16(buf, len, SAMPLE_RATE, CHANNELS);
+  }
+#endif
+  if (readLen < len) {
+    memset(buf + readLen, 0, len - readLen);
+    s_micShortReads.fetch_add(1);
+  }
+  *bytesRead = len;
+  s_micBytesSent.fetch_add((uint32_t)len);
+  return ESP_OK;
+}
+
 void uacSetMuteCb(uint32_t mute, void*)
 {
   Serial.printf("[usb-audio] mute=%lu\n", (unsigned long)mute);
@@ -485,18 +510,23 @@ void monitorTask(void*)
     }
     static uint32_t lastLogMs = 0;
     static uint32_t lastUacBytes = 0;
+    static uint32_t lastMicBytes = 0;
     static uint32_t lastDropped = 0;
     static uint32_t lastUnderruns = 0;
-    if (s_active.load() && (int32_t)(nowMs - lastLogMs) > 2000) {
+    const uint32_t micBytes = s_micBytesSent.load();
+    if ((s_active.load() || micBytes != lastMicBytes) && (int32_t)(nowMs - lastLogMs) > 2000) {
       const uint32_t uacBytes = s_uacBytesRead.load();
       const uint32_t dropped = s_droppedBytes.load();
       const uint32_t underruns = s_underrunCount.load();
       const uint32_t bufferedBytes = s_bufferedBytes.load();
       const uint32_t i2sMaxUs = s_i2sWriteMaxUs.exchange(0);
       lastLogMs = nowMs;
-      Serial.printf("[usb-audio] stats uac=%u +%u buffer=%ums dropped=%u +%u underruns=%u +%u i2s_max_us=%u volume=%u fill=%u free=%u\n",
+      Serial.printf("[usb-audio] stats uac=%u +%u mic=%u +%u mic_short=%u buffer=%ums dropped=%u +%u underruns=%u +%u i2s_max_us=%u volume=%u fill=%u free=%u\n",
                     (unsigned)uacBytes,
                     (unsigned)(uacBytes - lastUacBytes),
+                    (unsigned)micBytes,
+                    (unsigned)(micBytes - lastMicBytes),
+                    (unsigned)s_micShortReads.load(),
                     (unsigned)bufferedMsFromBytes(bufferedBytes),
                     (unsigned)dropped,
                     (unsigned)(dropped - lastDropped),
@@ -507,6 +537,7 @@ void monitorTask(void*)
                     s_pcmFillQueue ? (unsigned)uxQueueMessagesWaiting(s_pcmFillQueue) : 0,
                     s_pcmFreeQueue ? (unsigned)uxQueueMessagesWaiting(s_pcmFreeQueue) : 0);
       lastUacBytes = uacBytes;
+      lastMicBytes = micBytes;
       lastDropped = dropped;
       lastUnderruns = underruns;
     }
@@ -550,7 +581,7 @@ void usbAudioBegin(Audio& audio, UsbAudioEventHandler handler)
 
   uac_device_config_t config = {};
   config.output_cb = uacOutputCb;
-  config.input_cb = nullptr;
+  config.input_cb = ENABLE_USB_MIC ? uacInputCb : nullptr;
   config.set_mute_cb = uacSetMuteCb;
   config.set_volume_cb = uacSetVolumeCb;
   config.cb_ctx = nullptr;
@@ -562,8 +593,9 @@ void usbAudioBegin(Audio& audio, UsbAudioEventHandler handler)
     return;
   }
 
-  Serial.printf("[usb-audio] ready device=%s rate=%u channels=%u\n",
-                s_deviceName.c_str(), (unsigned)SAMPLE_RATE, (unsigned)CHANNELS);
+  Serial.printf("[usb-audio] ready device=%s rate=%u speaker_channels=%u mic_channels=%u\n",
+                s_deviceName.c_str(), (unsigned)SAMPLE_RATE, (unsigned)CHANNELS,
+                ENABLE_USB_MIC ? (unsigned)CHANNELS : 0U);
   emit(UsbAudioEvent::Ready, 0, s_deviceName.c_str());
 }
 

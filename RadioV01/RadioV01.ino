@@ -390,13 +390,12 @@ int ES8388_Init(void)
   // ADC Volume RADC volume = 0dB
   ES8388_Write_Reg(17, 0x00);
 
-  // ALC
-  ES8388_Write_Reg(0x12, 0xfd); // Reg 0x12 = 0xe2 (ALC enable, PGA Max. Gain=23.5dB, Min. Gain=0dB)
-  //ES8388_Write_Reg(0x12, 0x22); // Reg 0x12 = 0xe2 (ALC enable, PGA Max. Gain=23.5dB, Min. Gain=0dB)
-  ES8388_Write_Reg( 0x13, 0xF9); // Reg 0x13 = 0xc0 (ALC Target=-4.5dB, ALC Hold time =0 mS)
-  ES8388_Write_Reg( 0x14, 0x02); // Reg 0x14 = 0x12(Decay time =820uS , Attack time = 416 uS)
-  ES8388_Write_Reg( 0x15, 0x06); // Reg 0x15 = 0x06(ALC mode)
-  ES8388_Write_Reg( 0x16, 0xc3); // Reg 0x16 = 0xc3(nose gate = -40.5dB, NGG = 0x01(mute ADC))
+  // ALC values from RASPIAUDIO/Muse_library for the Muse Radio differential mics.
+  ES8388_Write_Reg(0x12, 0xf8);
+  ES8388_Write_Reg(0x13, 0x30);
+  ES8388_Write_Reg(0x14, 0x57);
+  ES8388_Write_Reg(0x15, 0x06);
+  ES8388_Write_Reg(0x16, 0x89);
   ES8388_Write_Reg( 0x02, 0x55); // Reg 0x16 = 0x55 (Start up DLL, STM and Digital block for recording);
 
   // ES8388_Write_Reg(3, 0x09);
@@ -1457,7 +1456,7 @@ static void initAudioHardware()
   if (codecStatus == 0) printf("Codec init OK\n"); else printf("Codec init failed\n");
 
   Audio::audio_info_callback = audioEvent;
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK, I2S_DIN);
   audio.setVolumeSteps(maxVol + 1);
   audio.setVolume(maxVol);
 

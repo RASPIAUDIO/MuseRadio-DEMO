@@ -64,7 +64,9 @@ typedef struct {
     size_t spk_bytes_per_ms;
     size_t mic_bytes_per_ms;
     size_t spk_bytes_per_frame;
+    size_t mic_bytes_per_frame;
     uint32_t spk_frame_accum;
+    uint32_t mic_frame_accum;
     bool spk_active;
     bool mic_active;
 } uac_device_t;
@@ -85,6 +87,19 @@ static size_t spk_bytes_for_ms(uint32_t interval_ms, uint32_t *next_accum)
     size_t frames = (size_t)(frames_q / 1000);
     *next_accum = (uint32_t)(frames_q % 1000);
     return frames * s_uac_device->spk_bytes_per_frame;
+}
+
+static size_t mic_bytes_for_ms(uint32_t interval_ms, uint32_t *next_accum)
+{
+    if (!s_uac_device || !next_accum || s_uac_device->mic_bytes_per_frame == 0 || interval_ms == 0) {
+        return 0;
+    }
+
+    uint64_t frames_q = (uint64_t)s_uac_device->mic_frame_accum +
+                        (uint64_t)s_uac_device->current_sample_rate * interval_ms;
+    size_t frames = (size_t)(frames_q / 1000);
+    *next_accum = (uint32_t)(frames_q % 1000);
+    return frames * s_uac_device->mic_bytes_per_frame;
 }
 
 static void usb_phy_init(void)
@@ -376,10 +391,15 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
         s_uac_device->mic_data_size = 0;
         s_uac_device->mic_resolution = mic_resolutions_per_format[alt - 1];
         s_uac_device->mic_active = true;
-        s_uac_device->mic_bytes_per_ms = s_uac_device->current_sample_rate / 1000 * MIC_CHANNEL_NUM * s_uac_device->mic_resolution / 8;
+        s_uac_device->mic_bytes_per_frame = MIC_CHANNEL_NUM * s_uac_device->mic_resolution / 8;
+        s_uac_device->mic_bytes_per_ms = (s_uac_device->current_sample_rate * s_uac_device->mic_bytes_per_frame) / 1000;
+        s_uac_device->mic_frame_accum = 0;
         xTaskNotifyGive(s_uac_device->mic_task_handle);
         TU_LOG1("Microphone interface %d-%d opened", itf, alt);
-        printf("Microphone interface %d-%d opened\n", itf, alt);
+        printf("Microphone interface %d-%d opened rate=%"PRIu32" frame_bytes=%u nominal_ms_bytes=%u\n",
+               itf, alt, s_uac_device->current_sample_rate,
+               (unsigned)s_uac_device->mic_bytes_per_frame,
+               (unsigned)s_uac_device->mic_bytes_per_ms);
     }
 #endif
 
@@ -442,7 +462,9 @@ bool tud_audio_tx_done_pre_load_cb(uint8_t rhport, uint8_t itf, uint8_t ep_in, u
     (void)itf;
     (void)ep_in;
     (void)cur_alt_setting;
-    size_t bytes_require = MIC_INTERVAL_MS * s_uac_device->mic_bytes_per_ms;
+    size_t bytes_require = s_uac_device->mic_data_size > 0
+                                ? (size_t)s_uac_device->mic_data_size
+                                : CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ;
 
     tu_fifo_t *sw_in_fifo = tud_audio_get_ep_in_ff();
     uint16_t fifo_remained = tu_fifo_remaining(sw_in_fifo);
@@ -496,7 +518,12 @@ static void usb_mic_task(void *pvParam)
         }
         // clear the notification
         // read data from the microphone chunk by chunk
-        size_t bytes_require = MIC_INTERVAL_MS * s_uac_device->mic_bytes_per_ms;
+        uint32_t next_accum = s_uac_device->mic_frame_accum;
+        size_t bytes_require = mic_bytes_for_ms(MIC_INTERVAL_MS, &next_accum);
+        if (bytes_require == 0) {
+            vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(MIC_INTERVAL_MS));
+            continue;
+        }
         if (s_uac_device->user_cfg.input_cb) {
             size_t bytes_read = 0;
             esp_err_t ret = s_uac_device->user_cfg.input_cb((uint8_t *)s_uac_device->mic_buf_write, bytes_require, &bytes_read, s_uac_device->user_cfg.cb_ctx);
@@ -509,6 +536,7 @@ static void usb_mic_task(void *pvParam)
             s_uac_device->mic_buf_write = s_uac_device->mic_buf_read;
             s_uac_device->mic_buf_read = tmp_buf;
             s_uac_device->mic_data_size = bytes_read;
+            s_uac_device->mic_frame_accum = next_accum;
             UAC_EXIT_CRITICAL();
         }
 

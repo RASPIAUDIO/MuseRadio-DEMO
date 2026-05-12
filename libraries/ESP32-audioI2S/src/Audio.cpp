@@ -353,7 +353,11 @@ Audio::Audio(uint8_t i2sPort) {
     m_i2s_chan_cfg.auto_clear = true;                     // i2s will always send zero automatically if no data to send
     m_i2s_chan_cfg.allow_pd = false;
     m_i2s_chan_cfg.intr_priority = 2;
+#if AUDIO_ENABLE_I2S_RX
+    i2s_new_channel(&m_i2s_chan_cfg, &m_i2s_tx_handle, &m_i2s_rx_handle);
+#else
     i2s_new_channel(&m_i2s_chan_cfg, &m_i2s_tx_handle, NULL);
+#endif
 
     memset(&m_i2s_std_cfg, 0, sizeof(i2s_std_config_t));
     m_i2s_std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO); // Set to enable bit shift in Philips mode
@@ -369,6 +373,11 @@ Audio::Audio(uint8_t i2sPort) {
     m_i2s_std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
     m_i2s_std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     i2s_channel_init_std_mode(m_i2s_tx_handle, &m_i2s_std_cfg);
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) {
+        i2s_channel_init_std_mode(m_i2s_rx_handle, &m_i2s_std_cfg);
+    }
+#endif
 
     calculateVolumeLimits(); // first init, vol = 21, vol_steps = 21
     startAudioTask();
@@ -379,6 +388,12 @@ Audio::~Audio() {
     setDefaults();
 
     i2s_channel_disable(m_i2s_tx_handle);
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) {
+        i2s_channel_disable(m_i2s_rx_handle);
+        i2s_del_channel(m_i2s_rx_handle);
+    }
+#endif
     i2s_del_channel(m_i2s_tx_handle);
     stopAudioTask();
     vSemaphoreDelete(mutex_playAudioData);
@@ -417,6 +432,11 @@ esp_err_t Audio::I2Sstart() {
     esp_err_t err = ESP_FAIL;
     if (!m_f_i2s_channel_enabled) {
         err = i2s_channel_enable(m_i2s_tx_handle);
+#if AUDIO_ENABLE_I2S_RX
+        if (err == ESP_OK && m_i2s_rx_handle) {
+            err = i2s_channel_enable(m_i2s_rx_handle);
+        }
+#endif
         if (err == ESP_OK) m_f_i2s_channel_enabled = true;
     }
     return err;
@@ -427,7 +447,12 @@ esp_err_t Audio::I2Sstop() {
     m_samplesBuff48K.clear();                                           // Clear samplesBuff48K
     std::fill(std::begin(m_inputHistory), std::end(m_inputHistory), 0); // Clear history in samplesBuff48K
     esp_err_t err = ESP_FAIL;
-    if (m_f_i2s_channel_enabled) err = i2s_channel_disable(m_i2s_tx_handle);
+    if (m_f_i2s_channel_enabled) {
+#if AUDIO_ENABLE_I2S_RX
+        if (m_i2s_rx_handle) i2s_channel_disable(m_i2s_rx_handle);
+#endif
+        err = i2s_channel_disable(m_i2s_tx_handle);
+    }
     m_f_i2s_channel_enabled = false;
     return err;
 }
@@ -3334,6 +3359,73 @@ size_t Audio::writeRawPCM16(const uint8_t* data, size_t len, uint32_t sampleRate
     return consumed;
 }
 
+size_t Audio::readRawPCM16(uint8_t* data, size_t len, uint32_t sampleRate, uint8_t channels) {
+#if AUDIO_ENABLE_I2S_RX
+    if (!data || !m_i2s_rx_handle || !m_f_I2S_init || (channels != 1 && channels != 2)) return 0;
+
+    if (m_i2s_items.sampleRate != sampleRate) {
+        setSampleRate(sampleRate);
+    }
+
+    if (!m_f_i2s_channel_enabled) {
+        I2Sstart();
+    }
+
+    constexpr size_t RX_WORDS = 512;
+    constexpr size_t RX_FRAME_WORDS = 2;
+    constexpr size_t RX_FRAME_BYTES = RX_FRAME_WORDS * sizeof(int32_t);
+    const size_t dstFrameBytes = channels * sizeof(int16_t);
+    if (len < dstFrameBytes) return 0;
+
+    int32_t rx[RX_WORDS];
+    size_t produced = 0;
+    size_t frames = len / dstFrameBytes;
+
+    while (frames > 0) {
+        const size_t framesThisPass = frames < (RX_WORDS / RX_FRAME_WORDS) ? frames : (RX_WORDS / RX_FRAME_WORDS);
+        const size_t bytesToRead = framesThisPass * RX_FRAME_BYTES;
+        size_t bytesRead = 0;
+        esp_err_t err = i2s_channel_read(m_i2s_rx_handle, rx, bytesToRead, &bytesRead, 20);
+        if (!(err == ESP_OK || err == ESP_ERR_TIMEOUT) || bytesRead < RX_FRAME_BYTES) {
+            break;
+        }
+
+        const size_t framesRead = bytesRead / RX_FRAME_BYTES;
+        for (size_t frame = 0; frame < framesRead; frame++) {
+            const int16_t left = (int16_t)(rx[frame * 2] >> 16);
+            const int16_t right = (int16_t)(rx[frame * 2 + 1] >> 16);
+            const size_t dst = produced + frame * dstFrameBytes;
+            if (channels == 1) {
+                const int32_t mixed = ((int32_t)left + (int32_t)right) / 2;
+                const int16_t mono = (int16_t)mixed;
+                data[dst] = (uint8_t)(mono & 0xff);
+                data[dst + 1] = (uint8_t)(((uint16_t)mono >> 8) & 0xff);
+            } else {
+                data[dst] = (uint8_t)(left & 0xff);
+                data[dst + 1] = (uint8_t)(((uint16_t)left >> 8) & 0xff);
+                data[dst + 2] = (uint8_t)(right & 0xff);
+                data[dst + 3] = (uint8_t)(((uint16_t)right >> 8) & 0xff);
+            }
+        }
+
+        produced += framesRead * dstFrameBytes;
+        frames -= framesRead;
+
+        if (framesRead < framesThisPass) {
+            break;
+        }
+    }
+
+    return produced;
+#else
+    (void)data;
+    (void)len;
+    (void)sampleRate;
+    (void)channels;
+    return 0;
+#endif
+}
+
 bool Audio::pauseResume() {
     xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
     bool retVal = false;
@@ -5854,16 +5946,16 @@ void Audio::calculateAudioTime(uint16_t bytesDecoderIn, uint16_t samples_decoder
     }
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-bool Audio::setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK) {
+bool Audio::setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK, int8_t DIN) {
 
     bool result = true;
 
-    i2s_std_gpio_config_t gpio_cfg = {};
-    gpio_cfg.bclk = (gpio_num_t)BCLK;
-    gpio_cfg.din = (gpio_num_t)I2S_GPIO_UNUSED;
-    gpio_cfg.dout = (gpio_num_t)DOUT;
-    gpio_cfg.mclk = (gpio_num_t)MCLK;
-    gpio_cfg.ws = (gpio_num_t)LRC;
+    i2s_std_gpio_config_t tx_gpio_cfg = {};
+    tx_gpio_cfg.bclk = (gpio_num_t)BCLK;
+    tx_gpio_cfg.din = (gpio_num_t)I2S_GPIO_UNUSED;
+    tx_gpio_cfg.dout = (gpio_num_t)DOUT;
+    tx_gpio_cfg.mclk = (gpio_num_t)MCLK;
+    tx_gpio_cfg.ws = (gpio_num_t)LRC;
 
 #if (ESP_ARDUINO_VERSION_MAJOR < 3)
     AUDIO_LOG_ERROR("Arduino Version must be 3.0.0 or higher!");
@@ -5910,10 +6002,21 @@ bool Audio::setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK) {
     info(*this, evt_info, "audioI2S %s", audioI2SVers);
 
     I2Sstop();
-    if (i2s_channel_reconfig_std_gpio(m_i2s_tx_handle, &gpio_cfg) != ESP_OK) {
+    if (i2s_channel_reconfig_std_gpio(m_i2s_tx_handle, &tx_gpio_cfg) != ESP_OK) {
         result = false;
         goto exit;
     }
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) {
+        i2s_std_gpio_config_t rx_gpio_cfg = tx_gpio_cfg;
+        rx_gpio_cfg.din = (gpio_num_t)DIN;
+        rx_gpio_cfg.dout = (gpio_num_t)I2S_GPIO_UNUSED;
+        if (i2s_channel_reconfig_std_gpio(m_i2s_rx_handle, &rx_gpio_cfg) != ESP_OK) {
+            result = false;
+            goto exit;
+        }
+    }
+#endif
     I2Sstart();
 
 exit:
@@ -6249,6 +6352,9 @@ void Audio::setI2SCommFMT_LSB(bool commFMT) {
 void Audio::reconfigI2S() {
 
     i2s_channel_disable(m_i2s_tx_handle);
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) i2s_channel_disable(m_i2s_rx_handle);
+#endif
 
     if (m_i2s_items.commFMT) {
         m_i2s_std_cfg.slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
@@ -6256,6 +6362,9 @@ void Audio::reconfigI2S() {
         m_i2s_std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
     }
     i2s_channel_reconfig_std_slot(m_i2s_tx_handle, &m_i2s_std_cfg.slot_cfg);
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) i2s_channel_reconfig_std_slot(m_i2s_rx_handle, &m_i2s_std_cfg.slot_cfg);
+#endif
 
     if (m_f_output48KHz) {
         m_resampler.phase = 0; // prepare resampler
@@ -6268,7 +6377,13 @@ void Audio::reconfigI2S() {
         m_i2s_std_cfg.clk_cfg.sample_rate_hz = m_i2s_items.sampleRate;
     }
     i2s_channel_reconfig_std_clock(m_i2s_tx_handle, &m_i2s_std_cfg.clk_cfg);
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) i2s_channel_reconfig_std_clock(m_i2s_rx_handle, &m_i2s_std_cfg.clk_cfg);
+#endif
     i2s_channel_enable(m_i2s_tx_handle);
+#if AUDIO_ENABLE_I2S_RX
+    if (m_i2s_rx_handle) i2s_channel_enable(m_i2s_rx_handle);
+#endif
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::calculateVUlevel(int32_t* sample) { // Envelope-Follower
