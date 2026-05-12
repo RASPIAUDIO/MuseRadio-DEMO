@@ -20,6 +20,7 @@
 - Ignore incoming all-black blanking frames when a previous Windows frame is available.
 - Disabled backlight sleep across modes on the experimental branch.
 - Documented the Espressif Windows driver path in `tools/windows_usb_display_driver/README.md`.
+- Added `bin/MuseRadio-DEMO-V1.8-display-poc-factory-full.bin`, a full flash image with LittleFS included at `0x310000`.
 
 ## 1.7 - 2026-05-07
 

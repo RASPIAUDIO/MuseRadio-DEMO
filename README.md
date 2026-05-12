@@ -58,6 +58,18 @@ Build it with:
 python -m platformio run -e muse_radio_usb_display_poc
 ```
 
+The full factory image for this POC is:
+
+```text
+bin/MuseRadio-DEMO-V1.8-display-poc-factory-full.bin
+```
+
+Flash it at address `0x0`. This image includes LittleFS and overwrites saved Wi-Fi credentials, presets, and settings:
+
+```powershell
+python -m esptool --chip esp32s3 -p COM5 -b 921600 write_flash 0x0 bin/MuseRadio-DEMO-V1.8-display-poc-factory-full.bin
+```
+
 Use the Espressif USB extended screen driver first. Notes and driver links are in `tools/windows_usb_display_driver/README.md`.
 
 ## Release 1.7
