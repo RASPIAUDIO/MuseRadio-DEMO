@@ -18,3 +18,7 @@ bool usbAudioActive();
 uint32_t usbAudioBufferedMs();
 bool usbAudioBufferHealthy();
 const char* usbAudioDeviceName();
+void usbAudioSetLocalVolume(uint8_t volume, uint8_t maxVolume);
+void usbAudioSetLocalMute(bool muted);
+void usbAudioSendHostVolumeDelta(int8_t steps);
+void usbAudioSendHostMuteToggle();

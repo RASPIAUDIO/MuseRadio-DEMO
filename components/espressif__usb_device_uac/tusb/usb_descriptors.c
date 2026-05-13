@@ -34,8 +34,10 @@
 #if ENABLE_USB_DISPLAY
 #define USB_DISPLAY_PID              0x2986
 #define USB_DISPLAY_VENDOR_STR       "esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536"
-#define USB_DISPLAY_PRODUCT_STR      "Muse Radio USB Display POC A441M2"
+#define USB_DISPLAY_PRODUCT_STR      "Muse Radio"
 #endif
+
+#define REPORT_ID_CONSUMER_CONTROL   1
 
 //--------------------------------------------------------------------+
 // Device Descriptors
@@ -79,20 +81,35 @@ uint8_t const *tud_descriptor_device_cb(void)
 //--------------------------------------------------------------------+
 #define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + \
                                   CFG_TUD_VENDOR * TUD_VENDOR_DESC_LEN + \
+                                  CFG_TUD_HID * TUD_HID_DESC_LEN + \
                                   CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN)
 #if ENABLE_USB_DISPLAY
 #define EPNUM_VENDOR      0x01
 #define EPNUM_AUDIO_OUT   0x02
 #define EPNUM_AUDIO_FB    0x82
 #define EPNUM_AUDIO_IN    0x83
+#define EPNUM_HID         0x84
 #define STR_INDEX_VENDOR  4
-#define STR_INDEX_AUDIO   5
+#define STR_INDEX_HID     5
+#define STR_INDEX_AUDIO   6
 #else
 #define EPNUM_AUDIO_OUT   0x01
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
-#define STR_INDEX_AUDIO   4
+#define EPNUM_HID         0x83
+#define STR_INDEX_HID     4
+#define STR_INDEX_AUDIO   5
 #endif
+
+uint8_t const desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(REPORT_ID_CONSUMER_CONTROL))
+};
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    (void)instance;
+    return desc_hid_report;
+}
 
 uint8_t const desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
@@ -101,6 +118,8 @@ uint8_t const desc_configuration[] = {
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, STR_INDEX_VENDOR, EPNUM_VENDOR, 0x80 | EPNUM_VENDOR, CFG_TUD_VENDOR_EPSIZE),
 #endif
+    // Interface number, string index, protocol, report descriptor length, EP In address, EP size, interval
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, STR_INDEX_HID, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 5),
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STR_INDEX_AUDIO, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
 };
@@ -130,17 +149,42 @@ char const *string_desc_arr [] = {
     CONFIG_UAC_TUSB_SERIAL_NUM,         // 3: Serials, should use chip ID
 #if ENABLE_USB_DISPLAY
     USB_DISPLAY_VENDOR_STR,             // 4: USB display vendor Interface
-    "usb uac",                          // 5: UAC control Interface
+    "media keys",                       // 5: HID consumer controls
+    "Muse Radio",                       // 6: UAC control Interface
 #else
-    "usb uac",                      // 4: UAC control Interface
+    "media keys",                   // 4: HID consumer controls
+    "Muse Radio",                   // 5: UAC control Interface
 #endif
 #if SPEAK_CHANNEL_NUM
-    "speaker",                     // 5: Speak Interface
+    "Muse Radio",                  // Speaker streaming interface
 #endif
 #if MIC_CHANNEL_NUM
-    "microphone",                   // 6: Mic Interface
+    "Muse Radio",                  // Microphone streaming interface
 #endif
 };
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type, uint8_t* buffer,
+                               uint16_t reqlen)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type,
+                           uint8_t const* buffer, uint16_t bufsize)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)bufsize;
+}
 
 static uint16_t _desc_str[32];
 

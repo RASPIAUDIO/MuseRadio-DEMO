@@ -123,6 +123,8 @@ static const int ADC_BUTTON_COUNT = sizeof(ADC_BUTTON_REFERENCE) / sizeof(ADC_BU
 static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPIAUDIO/ota/main/RadioLast.ota";
 
 TaskHandle_t radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiInitH;
+static TaskHandle_t captivePortalTaskH = nullptr;
+static volatile bool captivePortalTaskActive = false;
 
 
 Arduino_ESP32_OTA ota;
@@ -304,6 +306,33 @@ uint8_t ES8388_Write_Reg(uint8_t reg, uint8_t val)
   return res;
 }
 
+bool ES8388_Read_Reg(uint8_t reg, uint8_t *val)
+{
+  if (!val) return false;
+  Wire.beginTransmission(ES8388_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint16_t)ES8388_ADDR, (uint8_t)1, true) != 1) return false;
+  *val = Wire.read();
+  return true;
+}
+
+void ES8388_Dump_ADC_Regs()
+{
+#if ENABLE_USB_MIC
+  printf("ES8388 ADC regs:");
+  for (uint8_t reg = 0x09; reg <= 0x16; reg++) {
+    uint8_t val = 0;
+    if (ES8388_Read_Reg(reg, &val)) {
+      printf(" %02X=%02X", reg, val);
+    } else {
+      printf(" %02X=??", reg);
+    }
+  }
+  printf("\n");
+#endif
+}
+
 //////////////////////////////////////////////////////////////////
 //
 // init CODEC chip ES8388 (via I2C)
@@ -365,11 +394,11 @@ int ES8388_Init(void)
   ES8388_Write_Reg(3, 0xFF);
 
 
-  // ADC amp 24dB
-  ES8388_Write_Reg(9, 0x88);
+  // ADC PGA +21 dB. The +24 dB setting worked but raised the mic noise floor.
+  ES8388_Write_Reg(9, 0x77);
 
 
-  // differential input
+  // Two differential microphone pairs: LADC = LIN1-RIN1, RADC = LIN2-RIN2.
   ES8388_Write_Reg(10, 0xFC);
   ES8388_Write_Reg(11, 0x02);
 
@@ -377,12 +406,13 @@ int ES8388_Init(void)
   //Select LIN2and RIN2 as differential input pairs
   //ES8388_Write_Reg(11,0x82);
 
-  //i2S 16b
-  ES8388_Write_Reg(12, 0x0C);
+  // ADC I2S, 32-bit serial slot. USB still exports the top 16 bits as PCM16.
+  ES8388_Write_Reg(12, 0x10);
   //MCLK 256
   ES8388_Write_Reg(13, 0x02);
-  // ADC high pass filter
-  // ES8388_Write_Reg(14,0x30);
+  // Keep ADC high-pass filters enabled and invert RADC polarity. The Muse Radio
+  // differential mic pairs are opposite in phase when captured as stereo.
+  ES8388_Write_Reg(14, 0x70);
 
   // ADC Volume LADC volume = 0dB
   ES8388_Write_Reg(16, 0x00);
@@ -390,12 +420,13 @@ int ES8388_Init(void)
   // ADC Volume RADC volume = 0dB
   ES8388_Write_Reg(17, 0x00);
 
-  // ALC values from RASPIAUDIO/Muse_library for the Muse Radio differential mics.
-  ES8388_Write_Reg(0x12, 0xf8);
-  ES8388_Write_Reg(0x13, 0x30);
-  ES8388_Write_Reg(0x14, 0x57);
+  // Lower-noise ALC profile from the ES8388 guide: stereo, max gain +23.5 dB,
+  // min gain 0 dB, voice target, fast attack/decay, noise gate enabled.
+  ES8388_Write_Reg(0x12, 0xe2);
+  ES8388_Write_Reg(0x13, 0xa0);
+  ES8388_Write_Reg(0x14, 0x12);
   ES8388_Write_Reg(0x15, 0x06);
-  ES8388_Write_Reg(0x16, 0x89);
+  ES8388_Write_Reg(0x16, 0xc3);
   ES8388_Write_Reg( 0x02, 0x55); // Reg 0x16 = 0x55 (Start up DLL, STM and Digital block for recording);
 
   // ES8388_Write_Reg(3, 0x09);
@@ -413,6 +444,7 @@ int ES8388_Init(void)
   st += ES8388_Write_Reg(47, 15);
   st += ES8388_Write_Reg(48, 33);
   st += ES8388_Write_Reg(49, 33);
+  ES8388_Dump_ADC_Regs();
   return st;
 
 }
@@ -553,56 +585,32 @@ static void wakeTftBacklight()
 
 void ES8388vol_Set(uint8_t volx)
 {
-
-  // mute
-  ES8388_Write_Reg(25, 0x04);
-#define lowVol   16
   if (volx > maxVol) volx = maxVol;
-  if (volx == 0)ES8388_Write_Reg(25, 0x04); else ES8388_Write_Reg(25, 0x00);
-  bool externalCodecVolume = spotifyPlaybackActive || spotifyConnectActive() ||
-                             airPlayPlaybackActive || airPlayActive() ||
-                             usbAudioPlaybackActive || usbAudioActive();
+  const bool muted = (volx == 0);
+  const uint8_t codecVol = muted ? 0 : (uint8_t)(volx + 2);
 
-  //    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);
-  //    printf("VOLX = %d  %d\n",volx, jackON);
+  ES8388_Write_Reg(25, muted ? 0x04 : 0x00);
+  audio.setVolume(maxVol);
   if (jackON == true)
   {
     // LOUT2/ROUT2
-    audio.setVolume(maxVol);
     ES8388_Write_Reg(46, 0);
     ES8388_Write_Reg(47, 0);
-    ES8388_Write_Reg(48, volx + 2);
-    ES8388_Write_Reg(49, volx + 2);
+    ES8388_Write_Reg(48, codecVol);
+    ES8388_Write_Reg(49, codecVol);
   }
   else
   {
     // ROUT1/LOUT1
     ES8388_Write_Reg(48, 0);
     ES8388_Write_Reg(49, 0);
-    if (externalCodecVolume)
-    {
-      audio.setVolume(maxVol);
-      ES8388_Write_Reg(46, volx + 2);
-      ES8388_Write_Reg(47, volx + 2);
-    }
-    else if (volx > lowVol)
-    {
-      audio.setVolume(maxVol);
-      ES8388_Write_Reg(46, volx + 2);
-      ES8388_Write_Reg(47, volx + 2);
-    }
-    else
-    {
-      audio.setVolume(maxVol * volx / lowVol);
-      ES8388_Write_Reg(46, lowVol);
-      ES8388_Write_Reg(47, lowVol);
-    }
+    ES8388_Write_Reg(46, codecVol);
+    ES8388_Write_Reg(47, codecVol);
   }
   // RDAC/LDAC (digital)
   ES8388_Write_Reg(26, 0x00);
   ES8388_Write_Reg(27, 0x00);
-  // unmute
-  ES8388_Write_Reg(25, 0x00);
+  ES8388_Write_Reg(25, muted ? 0x04 : 0x00);
 
 }
 //////////////////////////////////////////////////////////////////////////
@@ -1346,9 +1354,12 @@ static void waitCaptiveManualButtonReleased()
 
 static void startWifiCaptivePortal()
 {
-  gpio_set_level(backLight, 1);
-  forceTftPowerOn();
-  tft.init();
+  const bool displayOwnedByUsbAtStart = usbDisplayPlaybackActive || usbDisplayActive();
+  if (!displayOwnedByUsbAtStart) {
+    gpio_set_level(backLight, 1);
+    forceTftPowerOn();
+    tft.init();
+  }
   ensureLocalRadioData();
   WiFi.disconnect(false);
   WiFi.mode(WIFI_AP_STA);
@@ -1364,16 +1375,20 @@ static void startWifiCaptivePortal()
   WiFi.softAPConfig(captivePortalIP, captivePortalIP, IPAddress(255, 255, 255, 0));
   bool apStarted = WiFi.softAP(captiveApName.c_str(), CAPTIVE_AP_PASSWORD);
   if (!apStarted) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(TFT_RED);
-    tft.drawString("WiFi setup AP failed", 160, 105, 4);
+    if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextColor(TFT_RED);
+      tft.drawString("WiFi setup AP failed", 160, 105, 4);
+    }
     delay(2000);
     captiveManualFallbackRequested = true;
     return;
   }
 
-  drawCaptivePortalScreen();
+  if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
+    drawCaptivePortalScreen();
+  }
   captiveScanCount = WiFi.scanNetworks(false, true);
 
   captiveDns.start(CAPTIVE_DNS_PORT, "*", captivePortalIP);
@@ -1410,14 +1425,36 @@ static void startWifiCaptivePortal()
       return;
     }
     if (captiveRestartPending) {
-      tft.fillScreen(TFT_NAVY);
-      tft.setTextDatum(TC_DATUM);
-      tft.setTextColor(TFT_GREEN);
-      tft.drawString("Restarting...", 160, 105, 4);
+      if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
+        tft.fillScreen(TFT_NAVY);
+        tft.setTextDatum(TC_DATUM);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString("Restarting...", 160, 105, 4);
+      }
       delay(1000);
       esp_restart();
     }
     delay(10);
+  }
+}
+
+static void captivePortalTask(void*)
+{
+  captivePortalTaskActive = true;
+  startWifiCaptivePortal();
+  captivePortalTaskActive = false;
+  captivePortalTaskH = nullptr;
+  vTaskDelete(nullptr);
+}
+
+static void startWifiCaptivePortalBackground()
+{
+  if (captivePortalTaskH || captivePortalTaskActive) return;
+  const BaseType_t rc = xTaskCreatePinnedToCore(captivePortalTask, "wifi_portal", 8192,
+                                                nullptr, 2, &captivePortalTaskH, 1);
+  if (rc != pdPASS) {
+    captivePortalTaskH = nullptr;
+    Serial.printf("Captive portal task create failed rc=%ld\n", (long)rc);
   }
 }
 
@@ -1432,8 +1469,14 @@ void refreshVolume(void)
     if (vol == 0) gpio_set_level(PA, 0);
     else gpio_set_level(PA, 1);
   }
-  audio.setVolume(maxVol / 2, 0);
   ES8388vol_Set(vol);
+#if ENABLE_USB_AUDIO
+  if (!usbAudioVolumeUpdateFromHost)
+  {
+    usbAudioSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
+    usbAudioSetLocalMute(muteON || vol == 0);
+  }
+#endif
   if (spotifyPlaybackActive || spotifyConnectActive())
   {
     spotifyConnectSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
@@ -2151,9 +2194,15 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
       int newVol = (int)((value * maxVol + 50UL) / 100UL);
       if (newVol < 0) newVol = 0;
       if (newVol > maxVol) newVol = maxVol;
-      if (newVol != vol)
+      if (newVol != vol || (newVol > 0 && muteON) || (newVol == 0 && !muteON))
       {
         usbAudioVolumeUpdateFromHost = true;
+        if (newVol == 0 && !muteON) {
+          Pvol = vol;
+          muteON = true;
+        } else if (newVol > 0 && muteON) {
+          muteON = false;
+        }
         vol = newVol;
         V = vol * pos360 / maxVol;
         PV = V;
@@ -2167,17 +2216,27 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
     case UsbAudioEvent::Mute:
       if (value && !muteON)
       {
+        usbAudioVolumeUpdateFromHost = true;
         Pvol = vol;
         vol = 0;
         muteON = true;
+        V = 0;
+        PV = V;
+        volEncoder.setCount(V);
         refreshVolume();
+        usbAudioVolumeUpdateFromHost = false;
         toDisplay = 1;
       }
       else if (!value && muteON)
       {
+        usbAudioVolumeUpdateFromHost = true;
         vol = Pvol;
         muteON = false;
+        V = vol * pos360 / maxVol;
+        PV = V;
+        volEncoder.setCount(V);
         refreshVolume();
+        usbAudioVolumeUpdateFromHost = false;
         toDisplay = 2;
       }
       break;
@@ -3382,19 +3441,20 @@ void setup() {
   // WiFi init
   ////////////////////////////////////////////////
   started = false;
+  bool wifiSetupPortalNeeded = false;
   WifiCred wifiList[WIFI_MAX_NETWORKS];
   int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
   if (wifiCount == 0) {
-    // No credentials yet, start the phone-friendly captive portal.
-    settings();
+    printf("No WiFi credentials; starting background portal and continuing USB services\n");
+    wifiSetupPortalNeeded = true;
+  } else {
+    WiFi.useStaticBuffers(true);
+    WiFi.mode(WIFI_STA);
+    wifiMultiFromList(wifiMulti, wifiList, wifiCount);
+    //   wifiMulti.run();
   }
-
-  WiFi.useStaticBuffers(true);
-  WiFi.mode(WIFI_STA);
-  wifiMultiFromList(wifiMulti, wifiList, wifiCount);
-  //   wifiMulti.run();
   const uint32_t connectTimeoutMs = 20000;
-  if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
+  if (!wifiSetupPortalNeeded && wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
 #if !ENABLE_USB_AUDIO
     USBSerial.print("WiFi connected: ");
     USBSerial.print(WiFi.SSID());
@@ -3415,15 +3475,10 @@ void setup() {
 
   }
   else {
-    Serial.println("WiFi not connected!");
-    tft.fillRect(0, 0, 320, 240, TFT_BLACK);
-    tft.setTextColor(TFT_RED);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString("Connection failed...", 160, 75, 4);
-    tft.setTextColor(TFT_YELLOW);
-    tft.drawString("Starting WiFi setup...", 160, 125, 2);
-    delay(1000);
-    settings();
+    if (!wifiSetupPortalNeeded) {
+      Serial.println("WiFi not connected; starting background portal and continuing USB services");
+      wifiSetupPortalNeeded = true;
+    }
   }
 
 
@@ -3439,17 +3494,23 @@ void setup() {
 
   // previous station
   ln = LittleFS.open("/station", "r");
-  ln.read((uint8_t*)b, 2);
-  b[2] = 0;
-  station = atoi(b);
-  ln.close();
+  station = 0;
+  if (ln) {
+    ln.read((uint8_t*)b, 2);
+    b[2] = 0;
+    station = atoi(b);
+    ln.close();
+  }
   // previous volume
   ln = LittleFS.open("/volume", "r");
-  ln.read((uint8_t*)b, 2);
-  b[2] = 0;
-  vol = atoi(b);
-
-  ln.close();
+  vol = maxVol;
+  if (ln) {
+    ln.read((uint8_t*)b, 2);
+    b[2] = 0;
+    vol = atoi(b);
+    ln.close();
+  }
+  if (vol < 0 || vol > maxVol) vol = maxVol;
   MS = maxStation() - 1;
   if (MS < 0) {
     writeDefaultPresets();
@@ -3515,6 +3576,9 @@ void setup() {
   xTaskCreatePinnedToCore(remote, "remote", 5000, NULL, 5, &remoteH, 1);
   // Task managing display turn on:turn off
   xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);
+  if (wifiSetupPortalNeeded) {
+    startWifiCaptivePortalBackground();
+  }
 }
 
 
@@ -3538,12 +3602,22 @@ void loop() {
   V = volEncoder.getCount();
   if (V != PV)
   {
+    const int previousVol = vol;
     PV = V;
     if (V < 0) V = 0;
     if (V > pos360) V = pos360;
     volEncoder.setCount(V);
     vol = V * maxVol / pos360;
+    if (vol == 0 && !muteON) {
+      Pvol = 1;
+      muteON = true;
+    } else if (vol > 0 && muteON) {
+      muteON = false;
+    }
     refreshVolume();
+#if ENABLE_USB_AUDIO
+    usbAudioSendHostVolumeDelta((int8_t)(vol - previousVol));
+#endif
     printf("============> %d  %d\n", V, vol);
     sprintf(b, "%02d", vol);
     File ln = LittleFS.open("/volume", "w");
@@ -3556,6 +3630,7 @@ void loop() {
   //////////////////////////////////////////////////////////////////////
   if ((REMOTE_KEY == VOLP_rem) || (REMOTE_KEY == VOLM_rem))
   {
+    const int previousVol = vol;
     if (muteON == true) {
       vol = Pvol;
       muteON = false;
@@ -3565,7 +3640,16 @@ void loop() {
     REMOTE_KEY = 0;
     if (vol > maxVol) vol = maxVol;
     if (vol < 0) vol = 0;
+    if (vol == 0 && !muteON) {
+      Pvol = 1;
+      muteON = true;
+    } else if (vol > 0 && muteON) {
+      muteON = false;
+    }
     refreshVolume();
+#if ENABLE_USB_AUDIO
+    usbAudioSendHostVolumeDelta((int8_t)(vol - previousVol));
+#endif
     volEncoder.setCount(vol * pos360 / maxVol);
     sprintf(b, "%02d", vol);
     File ln = LittleFS.open("/volume", "w");
@@ -3581,17 +3665,29 @@ void loop() {
   {
     Pvol = vol;
     vol = 0;
-    refreshVolume();
-    muteB = false;
     muteON = true;
+    V = 0;
+    PV = V;
+    volEncoder.setCount(V);
+    refreshVolume();
+#if ENABLE_USB_AUDIO
+    usbAudioSendHostMuteToggle();
+#endif
+    muteB = false;
     if (!usbDisplayBusy) toDisplay = 1;
   }
   if ((muteB == true) && (muteON == true))
   {
     vol = Pvol;
-    refreshVolume();
-    muteB = false;
     muteON = false;
+    V = vol * pos360 / maxVol;
+    PV = V;
+    volEncoder.setCount(V);
+    refreshVolume();
+#if ENABLE_USB_AUDIO
+    usbAudioSendHostMuteToggle();
+#endif
+    muteB = false;
     if (!usbDisplayBusy) toDisplay = 2;
   }
 
@@ -3669,9 +3765,12 @@ void loop() {
         if (muteON == true)
         {
           vol = Pvol;
+          muteON = false;
+          V = vol * pos360 / maxVol;
+          PV = V;
+          volEncoder.setCount(V);
           refreshVolume();
           muteB = false;
-          muteON = false;
         }
       }
     }

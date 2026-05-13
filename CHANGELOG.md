@@ -25,6 +25,12 @@
 - Extended the local `ESP32-audioI2S` copy with optional I2S RX and `readRawPCM16()` so USB mic capture shares the same I2S clocking path instead of creating a competing driver.
 - Applied the Muse Radio ADC/ALC microphone setup from `RASPIAUDIO/Muse_library` and fixed 44.1 kHz microphone packet cadence with the same fractional-frame strategy as speaker output.
 - Bumped the USB descriptor serial/product suffix to `A441M2` so Windows re-enumerates the new speaker + microphone profile.
+- Tuned the ES8388 USB microphone path for lower static noise: kept the two-pair differential routing, reduced ADC PGA from +24 dB to +21 dB, switched ADC serial output to 32-bit slots to match the shared I2S clocking, and used the ES8388 guide's gated voice ALC profile.
+- Inverted the ES8388 right ADC microphone polarity so the two differential mic channels no longer cancel when monitored or mixed as stereo.
+- Added one shared master volume path for internet radio and USB audio: Windows UAC volume updates the radio knob state, knob/remote/mute send USB HID consumer volume/mute keys back to Windows, and actual gain is applied through ES8388 output registers rather than PCM attenuation.
+- Increased USB speaker buffering for display jitter and kept PCM unattenuated so USB audio quality depends on ES8388 codec gain, not software volume.
+- Fixed first boot with no saved Wi-Fi credentials in the USB display POC by starting the captive portal in the background, so USB display/audio can enumerate without the setup path blocking or reboot-looping.
+- Renamed the USB product, UAC control interface, speaker stream, and microphone stream to `Muse Radio`, and bumped the USB descriptor serial suffix to `A441M4` so Windows re-enumerates the updated names.
 
 ## 1.7 - 2026-05-07
 

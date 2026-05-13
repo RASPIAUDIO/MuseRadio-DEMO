@@ -22,6 +22,7 @@ static const char *TAG = "usbd_uac";
 const uint32_t sample_rates[] = {DEFAULT_SAMPLE_RATE};
 
 #define N_SAMPLE_RATES  TU_ARRAY_SIZE(sample_rates)
+#define HID_REPORT_ID_CONSUMER_CONTROL 1
 
 enum {
     VOLUME_CTRL_0_DB = 0,
@@ -75,6 +76,14 @@ static uac_device_t *s_uac_device = NULL;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 #define UAC_ENTER_CRITICAL()    portENTER_CRITICAL(&s_mux)
 #define UAC_EXIT_CRITICAL()     portEXIT_CRITICAL(&s_mux)
+
+static int16_t volume_percent_to_uac_db(uint32_t volume)
+{
+    if (volume > 100) {
+        volume = 100;
+    }
+    return (int16_t)(((int32_t)volume - 100) * 128);
+}
 
 static size_t spk_bytes_for_ms(uint32_t interval_ms, uint32_t *next_accum)
 {
@@ -602,4 +611,64 @@ esp_err_t uac_device_init(uac_device_config_t *config)
 
     ESP_LOGI(TAG, "UAC Device Start, Version: %d.%d.%d", USB_DEVICE_UAC_VER_MAJOR, USB_DEVICE_UAC_VER_MINOR, USB_DEVICE_UAC_VER_PATCH);
     return ESP_OK;
+}
+
+esp_err_t uac_device_set_volume_percent(uint32_t volume)
+{
+    ESP_RETURN_ON_FALSE(s_uac_device != NULL, ESP_ERR_INVALID_STATE, TAG, "uac device not initialized");
+    if (volume > 100) {
+        volume = 100;
+    }
+
+    const int16_t uac_volume = volume_percent_to_uac_db(volume);
+    UAC_ENTER_CRITICAL();
+    for (uint8_t channel = 0; channel <= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX; channel++) {
+        s_uac_device->volume[channel] = uac_volume;
+    }
+    UAC_EXIT_CRITICAL();
+
+    return ESP_OK;
+}
+
+esp_err_t uac_device_set_mute_state(bool mute)
+{
+    ESP_RETURN_ON_FALSE(s_uac_device != NULL, ESP_ERR_INVALID_STATE, TAG, "uac device not initialized");
+
+    UAC_ENTER_CRITICAL();
+    for (uint8_t channel = 0; channel <= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX; channel++) {
+        s_uac_device->mute[channel] = mute ? 1 : 0;
+    }
+    UAC_EXIT_CRITICAL();
+
+    return ESP_OK;
+}
+
+esp_err_t uac_device_send_hid_consumer_control(uint16_t usage)
+{
+#if CFG_TUD_HID
+    ESP_RETURN_ON_FALSE(s_uac_device != NULL, ESP_ERR_INVALID_STATE, TAG, "uac device not initialized");
+    ESP_RETURN_ON_FALSE(tud_mounted(), ESP_ERR_INVALID_STATE, TAG, "usb not mounted");
+
+    for (uint8_t attempt = 0; attempt < 8 && !tud_hid_ready(); attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    ESP_RETURN_ON_FALSE(tud_hid_ready(), ESP_ERR_TIMEOUT, TAG, "hid not ready");
+
+    const uint16_t key = usage;
+    ESP_RETURN_ON_FALSE(tud_hid_report(HID_REPORT_ID_CONSUMER_CONTROL, &key, sizeof(key)),
+                        ESP_FAIL, TAG, "hid press failed");
+
+    for (uint8_t attempt = 0; attempt < 8 && !tud_hid_ready(); attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    if (tud_hid_ready()) {
+        const uint16_t release = 0;
+        (void)tud_hid_report(HID_REPORT_ID_CONSUMER_CONTROL, &release, sizeof(release));
+    }
+
+    return ESP_OK;
+#else
+    (void)usage;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }

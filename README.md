@@ -43,14 +43,18 @@ For installation or usage issues, open an issue on [GitHub](https://github.com/R
 - Target display mode: 320x240 landscape, JPEG quality 4, 10 FPS.
 - USB IDs for this POC: VID `0x303A`, PID `0x2986`.
 - Vendor interface string: `esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536`.
+- Windows speaker and microphone endpoints are both advertised as `Muse Radio`.
 - Audio remains PCM stereo, 16-bit, 44.1 kHz, through the ES8388 codec path.
 - USB microphone input is enabled as a stereo 16-bit / 44.1 kHz UAC source. The two Muse Radio differential microphone channels are captured from the ES8388 ADC over I2S `DIN GPIO4`.
+- The ES8388 microphone path keeps two-pair differential routing, inverts the right ADC channel to align stereo phase, uses 32-bit ADC serial slots on the shared I2S clock, and logs ADC registers at boot for validation.
+- Volume is shared between the Muse knob, remote volume keys, and Windows. Host UAC volume/mute updates drive the ES8388 codec, while local knob/remote changes send standard USB HID consumer volume/mute keys back to Windows. PCM stays at full scale.
 - The POC is not a smooth video target; frame drops are preferred over USB audio underruns.
 - USB display mode latches active after the first received frame; lack of screen updates no longer resumes internet radio.
 - The display service caches the last non-black frame and replays it periodically so a static Windows desktop stays visible.
 - Incoming all-black blanking frames are ignored when a previous frame is available.
 - The firmware does not draw local USB status text over the Windows-rendered frame in this POC.
 - Backlight sleep is disabled in all modes on this experimental branch.
+- First boot without saved Wi-Fi credentials keeps the USB display/audio runtime alive and starts the captive portal in the background instead of blocking setup.
 - The previous USB audio distortion was caused mainly by UAC cadence drift: 44.1 kHz was consumed as integer `44100 / 1000 = 44` frames/ms, effectively 44.0 kHz. The local UAC component now uses fractional frame accumulation so 10 ms consumes exactly 441 frames, keeps the default 10 ms UAC interval, and only lets display rendering proceed while the audio buffer is healthy.
 - The microphone wiring and ES8388 ADC setup are based on [RASPIAUDIO/Muse_library](https://github.com/RASPIAUDIO/Muse_library), especially the Muse Radio `museS3` and recorder examples.
 

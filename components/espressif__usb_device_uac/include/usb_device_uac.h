@@ -46,6 +46,36 @@ typedef struct  {
  */
 esp_err_t uac_device_init(uac_device_config_t *config);
 
+/**
+ * @brief Update the speaker feature-unit volume exposed to the USB host.
+ *
+ * This updates the value returned by UAC GET_CUR without touching PCM samples.
+ * The hardware/application is still responsible for applying the actual gain.
+ *
+ * @param volume Volume in percent, 0..100.
+ * @return ESP_OK on success.
+ */
+esp_err_t uac_device_set_volume_percent(uint32_t volume);
+
+/**
+ * @brief Update the speaker feature-unit mute state exposed to the USB host.
+ *
+ * @param mute true to mute, false to unmute.
+ * @return ESP_OK on success.
+ */
+esp_err_t uac_device_set_mute_state(bool mute);
+
+/**
+ * @brief Send one HID consumer-control key press to the USB host.
+ *
+ * This is used for host-visible media keys such as volume up/down and mute.
+ * It does not change PCM samples or codec gain.
+ *
+ * @param usage HID consumer usage, for example 0x00E9 volume increment.
+ * @return ESP_OK on success.
+ */
+esp_err_t uac_device_send_hid_consumer_control(uint16_t usage);
+
 #ifdef __cplusplus
 }
 #endif

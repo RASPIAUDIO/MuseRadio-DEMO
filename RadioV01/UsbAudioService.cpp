@@ -29,15 +29,18 @@ constexpr uint32_t PCM_BYTES_PER_SECOND = SAMPLE_RATE * PCM_FRAME_BYTES;
 constexpr size_t PCM_BLOCK_BYTES = 2048;
 constexpr size_t PCM_BLOCK_TARGET_BYTES = (SAMPLE_RATE * PCM_FRAME_BYTES * 10) / 1000;
 constexpr size_t PCM_WRITE_TARGET_BYTES = (SAMPLE_RATE * PCM_FRAME_BYTES * 20) / 1000;
-constexpr uint32_t PCM_PREBUFFER_BYTES = (SAMPLE_RATE * PCM_FRAME_BYTES * 50) / 1000;
-constexpr uint32_t PCM_DISPLAY_SAFE_BUFFER_MS = 25;
-constexpr size_t PCM_BLOCK_COUNT = 96;
+constexpr uint32_t PCM_PREBUFFER_BYTES = (SAMPLE_RATE * PCM_FRAME_BYTES * 90) / 1000;
+constexpr uint32_t PCM_DISPLAY_SAFE_BUFFER_MS = 60;
+constexpr size_t PCM_BLOCK_COUNT = 128;
 constexpr UBaseType_t PCM_OUTPUT_TASK_PRIORITY = 6;
 constexpr BaseType_t PCM_OUTPUT_TASK_CORE = 0;
 constexpr UBaseType_t MONITOR_TASK_PRIORITY = 2;
 constexpr BaseType_t MONITOR_TASK_CORE = 1;
 constexpr UBaseType_t EVENT_TASK_PRIORITY = 4;
 constexpr BaseType_t EVENT_TASK_CORE = 1;
+constexpr uint16_t HID_USAGE_CONSUMER_VOLUME_INCREMENT = 0x00E9;
+constexpr uint16_t HID_USAGE_CONSUMER_VOLUME_DECREMENT = 0x00EA;
+constexpr uint16_t HID_USAGE_CONSUMER_MUTE = 0x00E2;
 
 struct PcmBlockRef {
   uint16_t index;
@@ -620,6 +623,51 @@ const char* usbAudioDeviceName()
   return s_deviceName.c_str();
 }
 
+void usbAudioSetLocalVolume(uint8_t volume, uint8_t maxVolume)
+{
+  if (maxVolume == 0) return;
+  uint32_t percent = ((uint32_t)volume * 100UL + (maxVolume / 2)) / maxVolume;
+  if (percent > 100) percent = 100;
+  s_hostVolume = percent;
+  const esp_err_t err = uac_device_set_volume_percent(percent);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[usb-audio] local volume sync failed err=%d\n", (int)err);
+  }
+}
+
+void usbAudioSetLocalMute(bool muted)
+{
+  const esp_err_t err = uac_device_set_mute_state(muted);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[usb-audio] local mute sync failed err=%d\n", (int)err);
+  }
+}
+
+void usbAudioSendHostVolumeDelta(int8_t steps)
+{
+  if (steps == 0) return;
+  const uint16_t usage = steps > 0 ? HID_USAGE_CONSUMER_VOLUME_INCREMENT
+                                   : HID_USAGE_CONSUMER_VOLUME_DECREMENT;
+  uint8_t count = (uint8_t)abs((int)steps);
+  if (count > 16) count = 16;
+  while (count--) {
+    const esp_err_t err = uac_device_send_hid_consumer_control(usage);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT) {
+      Serial.printf("[usb-audio] HID volume sync failed err=%d\n", (int)err);
+      break;
+    }
+    vTaskDelay(8 / portTICK_PERIOD_MS);
+  }
+}
+
+void usbAudioSendHostMuteToggle()
+{
+  const esp_err_t err = uac_device_send_hid_consumer_control(HID_USAGE_CONSUMER_MUTE);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT) {
+    Serial.printf("[usb-audio] HID mute sync failed err=%d\n", (int)err);
+  }
+}
+
 #else
 
 namespace {
@@ -653,5 +701,13 @@ const char* usbAudioDeviceName()
   }
   return s_deviceName.c_str();
 }
+
+void usbAudioSetLocalVolume(uint8_t, uint8_t) {}
+
+void usbAudioSetLocalMute(bool) {}
+
+void usbAudioSendHostVolumeDelta(int8_t) {}
+
+void usbAudioSendHostMuteToggle() {}
 
 #endif
