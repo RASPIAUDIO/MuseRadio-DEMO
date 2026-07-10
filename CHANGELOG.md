@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0-rc1 - Unreleased
+
+- Added the reproducible `muse_radio_radio_and_more` environment with Arduino ESP32 3.3.8, ESP-IDF 5.5.4, 8 MB flash, and 8 MB PSRAM.
+- Combined local internet radio, Spotify Connect, experimental AirPlay 1/RAOP, USB Audio, USB microphone, and USB display in one build.
+- Added a central audio-mode controller with deterministic priority: USB Audio, Spotify, AirPlay, then radio.
+- Prevented inactive sources from writing PCM or changing the ES8388 codec volume.
+- Added a guarded radio resume after Spotify, AirPlay, or USB playback ends.
+- Ported the radio-stable LittleFS protections: mount without formatting, atomic writes, backup recovery, validated settings, and a PSRAM preset cache.
+- Kept radio presets local and disabled the legacy remote station-list update path.
+- Added multi-network Wi-Fi management, local radio catalog search, up to 99 presets, manual stream entry, and manual hidden-SSID entry.
+- Changed settings access to a 5-second ADC check-button hold; ADC buttons 1, 2, and 3 directly select presets 1, 2, and 3.
+- Added captive-portal exit with the check button and automatic return after 60 seconds without a client.
+- Preserved full-scale PCM and mapped USB, Spotify, and AirPlay volume to the ES8388 codec, with delayed atomic persistence.
+- Updated the embedded France Culture preset to the direct Radio France Icecast stream.
+- Removed legacy `/mode`, `/QR`, `/ssid`, and `/pwd` files from the public LittleFS image.
+
 ## 1.8-display-poc - Unreleased
 
 - Added isolated `muse_radio_usb_display_poc` PlatformIO environment with `ENABLE_USB_AUDIO=1` and `ENABLE_USB_DISPLAY=1`.

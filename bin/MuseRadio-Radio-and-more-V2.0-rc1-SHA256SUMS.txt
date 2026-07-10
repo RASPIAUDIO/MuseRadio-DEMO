@@ -1,0 +1,2 @@
+ad4fbf4197b8d580676b64794260fa2ac4e77697a02c8c24e2ffb4b72e74efb0  MuseRadio-Radio-and-more-V2.0-rc1-app.bin
+97954e8904e7b0b4de88d10baf145b3c2063070690a8ae68b43d75e2bd2772e8  MuseRadio-Radio-and-more-V2.0-rc1-full.bin

@@ -3922,43 +3922,7 @@ void settings(void)
   gpio_set_level(backLight, 1);
   printf("SETTINGS!!!\n");
   tft.setRotation(1);
-  headerL("SETTINGS", "1- Select your WiFi access", TFT_NAVY);
-  settingsDisplay(0);
-  //  delay(2000);
   pos = 0;
-  staEncoder.setCount(0);
-  while (gpio_get_level(CLICK2) == 1)
-  {
-    /*
-        if(button_get_level(sw0) == 0)
-        {
-          if(button_get_level(sw0) == 0) delay(50);
-          retrieveDisplay();
-          return;
-        }
-    */
-    int V;
-    V = staEncoder.getCount();
-    if (V > 0)
-    {
-      pos++;
-      if (pos > 1)pos = 1;
-      settingsDisplay(pos);
-      staEncoder.setCount(0);
-    }
-
-    if (V < 0)
-    {
-      pos--;
-      if (pos < 0) pos = 0;
-      settingsDisplay(pos);
-      staEncoder.setCount(0);
-    }
-    delay(100);
-  }
-
-
-  if (pos == 0)
   {
     headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
     tft.setTextColor(TFT_RED);

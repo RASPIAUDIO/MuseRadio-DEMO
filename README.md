@@ -2,7 +2,7 @@
 
 Internet radio demo project for the [Muse Radio](https://raspiaudio.com/product/muse-radio/) by RASPIAUDIO.
 
-The demo supports Wi-Fi streaming, USB Audio Class output, the integrated TFT display, hardware buttons, IR remote control, OTA support, ES8388 codec output, headphone/speaker switching, and battery monitoring.
+The `radio-and-more` branch combines the stable local internet radio with Spotify Connect, experimental AirPlay 1, USB Audio, USB microphone, and USB display support. The simpler `radio-only-stable` branch remains available for users who only need internet radio.
 
 ## Features
 
@@ -19,6 +19,26 @@ The demo supports Wi-Fi streaming, USB Audio Class output, the integrated TFT di
 - Optional Spotify Connect POC build through `cspot`.
 - Optional experimental AirPlay 1/RAOP receiver POC build.
 
+## Radio & more V2.0-rc1
+
+`muse_radio_radio_and_more` is the integrated product build. Audio ownership is centralized with this priority: USB Audio, Spotify Connect, AirPlay, then internet radio. Only the active source can write PCM or control the ES8388 volume, and the previous radio station resumes after an external source disconnects.
+
+- Local-first radio presets and catalog: no remote station server can overwrite the user's list.
+- Atomic LittleFS updates with recovery for Wi-Fi, presets, volume, station, Spotify auth, and USB display preference.
+- Captive portal with multiple saved networks, scanned SSIDs, manual hidden-SSID entry, network removal, up to 99 radio presets, and manual stream URLs.
+- Hold the ADC check button for 5 seconds to open settings. ADC buttons 1, 2, and 3 select presets 1, 2, and 3 directly.
+- Spotify Connect metadata is displayed; album art remains experimental.
+- AirPlay 1/RAOP is experimental, source-available, not Apple certified, and must not be presented as official commercial AirPlay compatibility.
+- USB speaker and microphone use PCM stereo, 16-bit, 44.1 kHz. USB display remains experimental and yields rendering time when audio buffers are low.
+
+Build it with:
+
+```powershell
+python -m platformio run -e muse_radio_radio_and_more
+```
+
+For an update that preserves Wi-Fi credentials, presets, and settings, flash only the application at `0x10000`. A full web-installer image includes default LittleFS data and replaces saved configuration.
+
 ## Source Code and Discussion
 
 - Source code: [github.com/RASPIAUDIO/MuseRadio-DEMO](https://github.com/RASPIAUDIO/MuseRadio-DEMO)
@@ -28,9 +48,9 @@ The demo supports Wi-Fi streaming, USB Audio Class output, the integrated TFT di
 
 1. Visit [apps.raspiaudio.com](https://apps.raspiaudio.com) with Chrome.
 2. Power on the Muse Radio and connect it over USB.
-3. Select "Muse Radio - Radio".
+3. Select "Radio & more" for the integrated preview, or "Radio stable" for the radio-only firmware.
 4. Click "Connect" and choose the serial port.
-5. Configure Wi-Fi credentials in the browser, through the on-screen menu, or through the fallback captive portal.
+5. Configure Wi-Fi through the captive portal. Manual on-screen entry remains available as a fallback.
 
 If no saved Wi-Fi network connects, the radio starts an access point named `MuseRadio-XXXX` with password `museradio`, shows a Wi-Fi QR code for that access point, and serves a local setup page at `http://192.168.4.1`. Scan the QR code to connect a phone to the radio, open `http://192.168.4.1`, choose a network, enter the password, and the radio saves it in `/wifi.json` before restarting. Press the OK/encoder button on the radio to skip the portal and use the manual on-screen credential entry.
 
