@@ -35,6 +35,7 @@
 #include "UsbAudioService.h"
 #include "UsbDisplayService.h"
 #include "DebugLog.h"
+#include "AudioModeController.h"
 #include "esp32s3/rom/tjpgd.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -121,6 +122,8 @@ PNG png;
 #define sw3             3
 #define ADC_BUTTON_DEBUG 0
 #define ADC_BUTTON_THRESHOLD 250
+#define ADC_SETTINGS_HOLD_MS 5000
+#define CAPTIVE_IDLE_RETURN_MS 60000
 static const int ADC_BUTTON_REFERENCE[] = {1863, 2355, 486, 930};
 static const int ADC_BUTTON_COUNT = sizeof(ADC_BUTTON_REFERENCE) / sizeof(ADC_BUTTON_REFERENCE[0]);
 
@@ -140,22 +143,23 @@ Arduino_ESP32_OTA::Error ota_err = Arduino_ESP32_OTA::Error::None;
 
 
 WiFiClient espClient;
-PubSubClient client(espClient);
 
 time_t now;
 struct tm timeinfo;
 char timeStr[60];
 Audio audio;
+SemaphoreHandle_t codecMutex = nullptr;
 static void audioEvent(Audio::msg_t msg);
 void settings(void);
 int button_get_level(int nb);
 static void debugAdcButtonsTick();
+static int readAdcButtonIndex(int *rawOut, int *diffOut);
 WiFiMulti wifiMulti;              //////////////////////////////////////
 #define maxVol 31
 #define pos360 31
 int vol = maxVol;
 int Pvol;
-uint8_t mode;
+uint8_t mode = '1';
 uint8_t ssid[80];
 uint8_t pwd[80];
 
@@ -170,6 +174,167 @@ uint8_t pwd[80];
 #define RADIO_NAME_PATH "/nameS"
 #define RADIO_LINK_PATH "/linkS"
 struct WifiCred { char ssid[33]; char pwd[65]; };
+struct CachedRadioPreset {
+  char name[RADIO_NAME_MAX];
+  char url[RADIO_URL_MAX];
+};
+static CachedRadioPreset *radioPresetCache = nullptr;
+static int radioPresetCacheCount = 0;
+static bool radioPresetCacheInPsram = false;
+static bool reloadRadioPresetCache();
+
+static bool commitTempFile(const String &tempPath, const char *targetPath)
+{
+  const String backupPath = String(targetPath) + ".bak";
+  LittleFS.remove(backupPath);
+  const bool hadTarget = LittleFS.exists(targetPath);
+  if (hadTarget && !LittleFS.rename(targetPath, backupPath)) {
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  if (!LittleFS.rename(tempPath, targetPath)) {
+    if (hadTarget) LittleFS.rename(backupPath, targetPath);
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  if (hadTarget) LittleFS.remove(backupPath);
+  return true;
+}
+
+static bool writeTextAtomically(const char *path, const String &content)
+{
+  const String tempPath = String(path) + ".tmp";
+  LittleFS.remove(tempPath);
+  File f = LittleFS.open(tempPath, FILE_WRITE);
+  if (!f) return false;
+  const size_t written = f.write((const uint8_t *)content.c_str(), content.length());
+  f.flush();
+  f.close();
+  if (written != content.length()) {
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  return commitTempFile(tempPath, path);
+}
+
+static bool stageTextFile(const String &tempPath, const String &content)
+{
+  LittleFS.remove(tempPath);
+  File f = LittleFS.open(tempPath, FILE_WRITE);
+  if (!f) return false;
+  const size_t written = f.write((const uint8_t *)content.c_str(), content.length());
+  f.flush();
+  f.close();
+  if (written == content.length()) return true;
+  LittleFS.remove(tempPath);
+  return false;
+}
+
+static bool writeTextPairAtomically(const char *firstPath, const String &firstContent,
+                                    const char *secondPath, const String &secondContent)
+{
+  const String firstTemp = String(firstPath) + ".tmp";
+  const String secondTemp = String(secondPath) + ".tmp";
+  const String firstBackup = String(firstPath) + ".bak";
+  const String secondBackup = String(secondPath) + ".bak";
+  if (!stageTextFile(firstTemp, firstContent) || !stageTextFile(secondTemp, secondContent)) {
+    LittleFS.remove(firstTemp);
+    LittleFS.remove(secondTemp);
+    return false;
+  }
+
+  LittleFS.remove(firstBackup);
+  LittleFS.remove(secondBackup);
+  const bool hadFirst = LittleFS.exists(firstPath);
+  const bool hadSecond = LittleFS.exists(secondPath);
+  if (hadFirst && !LittleFS.rename(firstPath, firstBackup)) goto rollback_staged;
+  if (hadSecond && !LittleFS.rename(secondPath, secondBackup)) {
+    if (hadFirst) LittleFS.rename(firstBackup, firstPath);
+    goto rollback_staged;
+  }
+  if (!LittleFS.rename(firstTemp, firstPath)) goto rollback_backups;
+  if (!LittleFS.rename(secondTemp, secondPath)) {
+    LittleFS.remove(firstPath);
+    goto rollback_backups;
+  }
+
+  if (hadFirst) LittleFS.remove(firstBackup);
+  if (hadSecond) LittleFS.remove(secondBackup);
+  return true;
+
+rollback_backups:
+  LittleFS.remove(firstPath);
+  LittleFS.remove(secondPath);
+  if (hadFirst) LittleFS.rename(firstBackup, firstPath);
+  if (hadSecond) LittleFS.rename(secondBackup, secondPath);
+rollback_staged:
+  LittleFS.remove(firstTemp);
+  LittleFS.remove(secondTemp);
+  return false;
+}
+
+static void recoverAtomicFile(const char *path)
+{
+  const String tempPath = String(path) + ".tmp";
+  const String backupPath = String(path) + ".bak";
+  LittleFS.remove(tempPath);
+  if (!LittleFS.exists(path) && LittleFS.exists(backupPath)) {
+    LittleFS.rename(backupPath, path);
+  } else if (LittleFS.exists(path)) {
+    LittleFS.remove(backupPath);
+  }
+}
+
+static void recoverAtomicPair(const char *firstPath, const char *secondPath)
+{
+  const String firstTemp = String(firstPath) + ".tmp";
+  const String secondTemp = String(secondPath) + ".tmp";
+  const String firstBackup = String(firstPath) + ".bak";
+  const String secondBackup = String(secondPath) + ".bak";
+  LittleFS.remove(firstTemp);
+  LittleFS.remove(secondTemp);
+
+  const bool pairIncomplete = !LittleFS.exists(firstPath) || !LittleFS.exists(secondPath);
+  const bool hasBackup = LittleFS.exists(firstBackup) || LittleFS.exists(secondBackup);
+  if (pairIncomplete && hasBackup) {
+    LittleFS.remove(firstPath);
+    LittleFS.remove(secondPath);
+    if (LittleFS.exists(firstBackup)) LittleFS.rename(firstBackup, firstPath);
+    if (LittleFS.exists(secondBackup)) LittleFS.rename(secondBackup, secondPath);
+  } else {
+    LittleFS.remove(firstBackup);
+    LittleFS.remove(secondBackup);
+  }
+}
+
+static void recoverStoredFiles()
+{
+  recoverAtomicFile(WIFI_JSON_PATH);
+  recoverAtomicFile(RADIO_CATALOG_PATH);
+  recoverAtomicFile(USB_DISPLAY_PROFILE_PATH);
+  recoverAtomicFile("/station");
+  recoverAtomicFile("/volume");
+  recoverAtomicPair(RADIO_NAME_PATH, RADIO_LINK_PATH);
+}
+
+static int loadStoredInt(const char *path, int fallback, int minimum, int maximum)
+{
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) return fallback;
+  String value = f.readString();
+  f.close();
+  value.trim();
+  if (!value.length()) return fallback;
+  char *end = nullptr;
+  const long parsed = strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || *end != 0 || parsed < minimum || parsed > maximum) return fallback;
+  return (int)parsed;
+}
+
+static bool saveStoredInt(const char *path, int value)
+{
+  return writeTextAtomically(path, String(value));
+}
 
 // Load stored WiFi credentials from LittleFS JSON into an array.
 // Returns count loaded. Backward-compatible: if only /ssid and /pwd exist,
@@ -179,14 +344,26 @@ int loadWifiList(WifiCred list[], int maxItems)
   int count = 0;
   File f = LittleFS.open(WIFI_JSON_PATH, FILE_READ);
   if (f) {
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
-    if (!err && doc.containsKey("networks") && doc["networks"].is<JsonArray>()) {
-      for (JsonObject obj : doc["networks"].as<JsonArray>()) {
+    JsonArray networks = doc["networks"].as<JsonArray>();
+    if (!err && !networks.isNull()) {
+      for (JsonObject obj : networks) {
         if (count >= maxItems) break;
         const char* s = obj["ssid"] | "";
         const char* p = obj["pwd"] | "";
+        const size_t ssidLength = strlen(s);
+        const size_t passwordLength = strlen(p);
+        if (ssidLength == 0 || ssidLength > 32 || passwordLength > 64) continue;
+        bool duplicate = false;
+        for (int i = 0; i < count; i++) {
+          if (strcmp(list[i].ssid, s) == 0) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (duplicate) continue;
         strncpy(list[count].ssid, s, sizeof(list[count].ssid));
         list[count].ssid[sizeof(list[count].ssid)-1] = 0;
         strncpy(list[count].pwd, p, sizeof(list[count].pwd));
@@ -204,7 +381,7 @@ int loadWifiList(WifiCred list[], int maxItems)
     size_t sn = sFile.readBytes((char*)ssid, sizeof(ssid)-1); ((char*)ssid)[sn] = 0;
     size_t pn = pFile.readBytes((char*)pwd, sizeof(pwd)-1); ((char*)pwd)[pn] = 0;
     sFile.close(); pFile.close();
-    if (sn > 0 && pn >= 0) {
+    if (sn > 0 && sn <= 32 && pn <= 64) {
       strncpy(list[0].ssid, (char*)ssid, sizeof(list[0].ssid)); list[0].ssid[sizeof(list[0].ssid)-1]=0;
       strncpy(list[0].pwd, (char*)pwd, sizeof(list[0].pwd)); list[0].pwd[sizeof(list[0].pwd)-1]=0;
       count = 1;
@@ -213,20 +390,19 @@ int loadWifiList(WifiCred list[], int maxItems)
   return count;
 }
 
-void saveWifiList(const WifiCred list[], int count)
+bool saveWifiList(const WifiCred list[], int count)
 {
-  DynamicJsonDocument doc(3072);
-  JsonArray arr = doc.createNestedArray("networks");
+  JsonDocument doc;
+  JsonArray arr = doc["networks"].to<JsonArray>();
   for (int i = 0; i < count; i++) {
-    JsonObject o = arr.createNestedObject();
+    JsonObject o = arr.add<JsonObject>();
     o["ssid"] = list[i].ssid;
     o["pwd"]  = list[i].pwd;
   }
-  File f = LittleFS.open(WIFI_JSON_PATH, FILE_WRITE);
-  if (f) {
-    serializeJson(doc, f);
-    f.close();
-  }
+  String json;
+  json.reserve(2048);
+  if (serializeJson(doc, json) == 0) return false;
+  return writeTextAtomically(WIFI_JSON_PATH, json);
 }
 
 int indexOfSsid(const WifiCred list[], int count, const char* target)
@@ -304,24 +480,31 @@ void displayON(void)
 ///////////////////////////////////////////////////////////////////////
 uint8_t ES8388_Write_Reg(uint8_t reg, uint8_t val)
 {
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
   uint8_t buf[2], res;
   buf[0] = reg;
   buf[1] = val;
   Wire.beginTransmission(ES8388_ADDR);
   Wire.write(buf, 2);
   res = Wire.endTransmission();
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
   return res;
 }
 
 bool ES8388_Read_Reg(uint8_t reg, uint8_t *val)
 {
   if (!val) return false;
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
+  bool success = false;
   Wire.beginTransmission(ES8388_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((uint16_t)ES8388_ADDR, (uint8_t)1, true) != 1) return false;
-  *val = Wire.read();
-  return true;
+  if (Wire.endTransmission(false) == 0 &&
+      Wire.requestFrom((uint16_t)ES8388_ADDR, (uint8_t)1, true) == 1) {
+    *val = Wire.read();
+    success = true;
+  }
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
+  return success;
 }
 
 void ES8388_Dump_ADC_Regs()
@@ -734,6 +917,7 @@ extern "C" void muse_usb_debug_command(const char *command)
 //
 int ES8388_Init(void)
 {
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
   // provides MCLK
   //    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);
   //    WRITE_PERI_REG(PIN_CTRL, READ_PERI_REG(PIN_CTRL)& 0xFFFFFFF0);
@@ -816,6 +1000,7 @@ int ES8388_Init(void)
   st += ES8388_Write_Reg(48, 33);
   st += ES8388_Write_Reg(49, 33);
   ES8388_Dump_ADC_Regs();
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
   return st;
 
 }
@@ -829,21 +1014,17 @@ int previousStation;
 int MS;
 bool connected = true;
 static volatile bool spotifyPlaybackActive = false;
-static volatile uint32_t spotifyRadioResumeAtMs = 0;
 static String spotifyTrackTitle;
 static String spotifyTrackArtist;
 static String spotifyTrackCoverUrl;
 static volatile bool airPlayPlaybackActive = false;
 static volatile bool airPlayVolumeUpdateFromRemote = false;
-static volatile uint32_t airPlayRadioResumeAtMs = 0;
 static String airPlayTrackTitle;
 static String airPlayTrackArtist;
 static String airPlayTrackAlbum;
 static volatile bool usbAudioPlaybackActive = false;
-static volatile uint32_t usbAudioRadioResumeAtMs = 0;
 static volatile bool usbAudioVolumeUpdateFromHost = false;
 static volatile bool usbDisplayPlaybackActive = false;
-static volatile uint32_t usbDisplayRadioResumeAtMs = 0;
 static volatile uint8_t localUiDisplayOverrideMask = 0;
 static bool littleFsMounted = false;
 static bool usbDisplayProfileEnabled = true;
@@ -889,11 +1070,7 @@ static void saveUsbDisplayProfilePreference(bool enabled)
   usbDisplayProfileRtcMagic = USB_DISPLAY_PROFILE_RTC_MAGIC;
   usbDisplayProfileRtcValue = enabled ? 1 : 0;
   if (littleFsMounted) {
-    File f = LittleFS.open(USB_DISPLAY_PROFILE_PATH, FILE_WRITE);
-    if (f) {
-      f.write((const uint8_t*)(enabled ? "1" : "0"), 1);
-      f.close();
-    }
+    writeTextAtomically(USB_DISPLAY_PROFILE_PATH, enabled ? "1" : "0");
   }
 #endif
 }
@@ -982,6 +1159,14 @@ bool VALB = false;
 #define OK_keyB VALB
 bool jaugeB = false;
 static volatile uint32_t adcButtonEvents = 0;
+static bool volumeSavePending = false;
+static uint32_t volumeChangedAtMs = 0;
+
+static void scheduleVolumeSave()
+{
+  volumeSavePending = true;
+  volumeChangedAtMs = millis();
+}
 
 // remote keys
 #define RET_rem       0x906F
@@ -1049,6 +1234,7 @@ static void wakeTftBacklight()
 
 void ES8388vol_Set(uint8_t volx)
 {
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
   if (volx > maxVol) volx = maxVol;
   const bool muted = (volx == 0);
   const uint8_t codecVol = muted ? 0 : (uint8_t)(volx + 2);
@@ -1076,6 +1262,7 @@ void ES8388vol_Set(uint8_t volx)
   ES8388_Write_Reg(27, 0x00);
   ES8388_Write_Reg(25, muted ? 0x04 : 0x00);
 
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
 }
 //////////////////////////////////////////////////////////////////////////
 // Print the header for a display screen
@@ -1138,6 +1325,8 @@ static IPAddress captivePortalIP(192, 168, 4, 1);
 static String captiveApName;
 static int captiveScanCount = 0;
 static bool captiveRestartPending = false;
+static uint32_t captiveRestartAtMs = 0;
+static bool captiveReturnToRadioEnabled = false;
 static bool captiveManualFallbackRequested = false;
 static uint32_t captivePortalLastDrawMs = 0;
 
@@ -1183,7 +1372,7 @@ static String captiveWifiQrPayload()
 
 static const char DEFAULT_RADIO_PRESETS[] =
   "RFI|http://live02.rfi.fr/rfimonde-96k.mp3\n"
-  "France Culture|http://direct.franceculture.fr/live/franceculture-hifi.aac\n"
+  "France Culture|http://icecast.radiofrance.fr/franceculture-hifi.aac?id=openapi\n"
   "FIP|http://direct.fipradio.fr/live/fip-hifi.aac\n"
   "RTL|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg\n"
   "RMC|https://audio.bfmtv.com/rmcradio_128.mp3\n"
@@ -1204,7 +1393,7 @@ static const char DEFAULT_RADIO_PRESETS[] =
 static const char DEFAULT_RADIO_CATALOG[] =
   "France Inter|General|FR|http://direct.franceinter.fr/live/franceinter-hifi.aac\n"
   "France Info|News|FR|http://direct.franceinfo.fr/live/franceinfo-hifi.aac\n"
-  "France Culture|Culture|FR|http://direct.franceculture.fr/live/franceculture-hifi.aac\n"
+  "France Culture|Culture|FR|http://icecast.radiofrance.fr/franceculture-hifi.aac?id=openapi\n"
   "France Musique|Classical|FR|http://direct.franceinter.fr/live/francemusique-hifi.aac\n"
   "FIP|Music|FR|http://direct.fipradio.fr/live/fip-hifi.aac\n"
   "FIP Jazz|Jazz|FR|http://direct.fipradio.fr/live/fip-webradio2.mp3\n"
@@ -1266,15 +1455,11 @@ static bool fileMissingOrEmpty(const char *path)
 
 static bool writeDefaultPresets()
 {
-  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_WRITE);
-  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
-  if (!nameFile || !linkFile) {
-    if (nameFile) nameFile.close();
-    if (linkFile) linkFile.close();
-    return false;
-  }
-
   String data = DEFAULT_RADIO_PRESETS;
+  String nameContent;
+  String linkContent;
+  nameContent.reserve(512);
+  linkContent.reserve(1024);
   int start = 0;
   int written = 0;
   while (start < (int)data.length() && written < RADIO_PRESET_MAX) {
@@ -1289,26 +1474,23 @@ static bool writeDefaultPresets()
       name.trim();
       url.trim();
       if (url.length()) {
-        nameFile.println(name);
-        linkFile.println(url);
+        nameContent += name;
+        nameContent += '\n';
+        linkContent += url;
+        linkContent += '\n';
         written++;
       }
     }
     start = end + 1;
   }
 
-  nameFile.close();
-  linkFile.close();
-  return written > 0;
+  return written > 0 && writeTextPairAtomically(
+    RADIO_NAME_PATH, nameContent, RADIO_LINK_PATH, linkContent);
 }
 
 static bool writeDefaultCatalog()
 {
-  File f = LittleFS.open(RADIO_CATALOG_PATH, FILE_WRITE);
-  if (!f) return false;
-  f.write((const uint8_t*)DEFAULT_RADIO_CATALOG, sizeof(DEFAULT_RADIO_CATALOG) - 1);
-  f.close();
-  return true;
+  return writeTextAtomically(RADIO_CATALOG_PATH, String(DEFAULT_RADIO_CATALOG));
 }
 
 static void repairStationUrlPrefixes()
@@ -1332,10 +1514,35 @@ static void repairStationUrlPrefixes()
   in.close();
 
   if (changed) {
-    File out = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
-    if (out) {
-      out.print(content);
-      out.close();
+    writeTextAtomically(RADIO_LINK_PATH, content);
+  }
+}
+
+static void migrateFranceCultureStream()
+{
+  static const char *currentUrl =
+    "http://icecast.radiofrance.fr/franceculture-hifi.aac?id=openapi";
+  static const char *legacyUrls[] = {
+    "http://direct.franceculture.fr/live/franceculture-hifi.aac",
+    "https://stream.radiofrance.fr/franceculture/franceculture_hifi.m3u8"
+  };
+  const char *paths[] = {RADIO_LINK_PATH, RADIO_CATALOG_PATH};
+
+  for (const char *path : paths) {
+    File in = LittleFS.open(path, FILE_READ);
+    if (!in) continue;
+    String content = in.readString();
+    in.close();
+    bool changed = false;
+    for (const char *legacyUrl : legacyUrls) {
+      if (content.indexOf(legacyUrl) >= 0) {
+        content.replace(legacyUrl, currentUrl);
+        changed = true;
+      }
+    }
+    if (changed) {
+      const bool saved = writeTextAtomically(path, content);
+      printf("France Culture stream migration path=%s ok=%d\n", path, saved ? 1 : 0);
     }
   }
 }
@@ -1349,6 +1556,7 @@ static void ensureLocalRadioData()
   if (fileMissingOrEmpty(RADIO_CATALOG_PATH)) {
     writeDefaultCatalog();
   }
+  migrateFranceCultureStream();
 }
 
 static bool isValidRadioUrl(const String &url)
@@ -1385,43 +1593,38 @@ static int loadStationPresets(String names[], String urls[], int maxItems)
   return highestUsedSlot;
 }
 
-static bool saveStationPresets(String names[], String urls[], int count)
+static bool saveRadioPresetCache(int count)
 {
+  if (radioPresetCache == nullptr) return false;
   if (count < 0) count = 0;
   if (count > RADIO_PRESET_MAX) count = RADIO_PRESET_MAX;
-  while (count > 0) {
-    urls[count - 1].trim();
-    if (urls[count - 1].length() > 0) break;
-    count--;
-  }
+  while (count > 0 && radioPresetCache[count - 1].url[0] == '\0') count--;
   if (count <= 0) return false;
 
-  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_WRITE);
-  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
-  if (!nameFile || !linkFile) {
-    if (nameFile) nameFile.close();
-    if (linkFile) linkFile.close();
-    return false;
-  }
+  String nameContent;
+  String linkContent;
+  nameContent.reserve(count * 24);
+  linkContent.reserve(count * 96);
 
   for (int i = 0; i < count; i++) {
-    names[i].trim();
-    urls[i].trim();
-    if (!urls[i].length()) {
-      nameFile.println();
-      linkFile.println();
+    CachedRadioPreset &preset = radioPresetCache[i];
+    if (preset.url[0] == '\0') {
+      nameContent += '\n';
+      linkContent += '\n';
     } else {
-      if (names[i].length() == 0) names[i] = "Preset " + String(i + 1);
-      if (names[i].length() >= RADIO_NAME_MAX) names[i] = names[i].substring(0, RADIO_NAME_MAX - 1);
-      if (urls[i].length() >= RADIO_URL_MAX) urls[i] = urls[i].substring(0, RADIO_URL_MAX - 1);
-      nameFile.println(names[i]);
-      linkFile.println(urls[i]);
+      if (preset.name[0] == '\0') {
+        snprintf(preset.name, sizeof(preset.name), "Preset %d", i + 1);
+      }
+      nameContent += preset.name;
+      nameContent += '\n';
+      linkContent += preset.url;
+      linkContent += '\n';
     }
   }
-
-  nameFile.close();
-  linkFile.close();
-  return true;
+  const bool saved = writeTextPairAtomically(
+    RADIO_NAME_PATH, nameContent, RADIO_LINK_PATH, linkContent);
+  if (saved) radioPresetCacheCount = count;
+  return saved;
 }
 
 static bool setStationPreset(int slotIndex, String name, String url)
@@ -1434,13 +1637,15 @@ static bool setStationPreset(int slotIndex, String name, String url)
   if (name.length() >= RADIO_NAME_MAX) name = name.substring(0, RADIO_NAME_MAX - 1);
   if (url.length() >= RADIO_URL_MAX) return false;
 
-  String names[RADIO_PRESET_MAX];
-  String urls[RADIO_PRESET_MAX];
-  int count = loadStationPresets(names, urls, RADIO_PRESET_MAX);
+  if (!reloadRadioPresetCache() && radioPresetCache == nullptr) return false;
+  int count = radioPresetCacheCount;
   if (slotIndex >= count) count = slotIndex + 1;
-  names[slotIndex] = name;
-  urls[slotIndex] = url;
-  bool saved = saveStationPresets(names, urls, count);
+  name.toCharArray(radioPresetCache[slotIndex].name,
+                   sizeof(radioPresetCache[slotIndex].name));
+  url.toCharArray(radioPresetCache[slotIndex].url,
+                  sizeof(radioPresetCache[slotIndex].url));
+  bool saved = saveRadioPresetCache(count);
+  if (!saved) reloadRadioPresetCache();
   printf("Radio preset save slot=%d count=%d ok=%d name=%s url=%s\n",
          slotIndex + 1, count, saved ? 1 : 0, name.c_str(), url.c_str());
   return saved;
@@ -1448,16 +1653,19 @@ static bool setStationPreset(int slotIndex, String name, String url)
 
 static bool clearStationPreset(int slotIndex)
 {
-  String names[RADIO_PRESET_MAX];
-  String urls[RADIO_PRESET_MAX];
-  int count = loadStationPresets(names, urls, RADIO_PRESET_MAX);
   if (slotIndex < 0 || slotIndex >= RADIO_PRESET_MAX) return false;
+  if (!reloadRadioPresetCache() && radioPresetCache == nullptr) return false;
+  int count = radioPresetCacheCount;
   if (slotIndex >= count) return false;
-  names[slotIndex] = "";
-  urls[slotIndex] = "";
-  if (count <= 0) return writeDefaultPresets();
-  bool saved = saveStationPresets(names, urls, count);
-  if (!saved) return writeDefaultPresets();
+  memset(&radioPresetCache[slotIndex], 0, sizeof(radioPresetCache[slotIndex]));
+  bool saved = saveRadioPresetCache(count);
+  if (!saved) {
+    if (!writeDefaultPresets()) {
+      reloadRadioPresetCache();
+      return false;
+    }
+    saved = reloadRadioPresetCache();
+  }
   printf("Radio preset clear slot=%d count=%d ok=%d\n", slotIndex + 1, count, saved ? 1 : 0);
   return saved;
 }
@@ -1479,34 +1687,19 @@ static bool splitCatalogLine(const String &line, String &name, String &category,
   return name.length() && url.length();
 }
 
-static void saveWifiCredential(const char *newSsid, const char *newPassword)
+static bool saveWifiCredential(const char *newSsid, const char *newPassword)
 {
-  if (newSsid == nullptr || newSsid[0] == 0) return;
+  if (newSsid == nullptr || newSsid[0] == 0 || strlen(newSsid) > 32) return false;
   if (newPassword == nullptr) newPassword = "";
-
-  uint8_t bm = '1';
-  File f = LittleFS.open("/mode", FILE_WRITE);
-  if (f) {
-    f.write(&bm, 1);
-    f.close();
-  }
-
-  f = LittleFS.open("/pwd", "w");
-  if (f) {
-    f.write((const uint8_t*)newPassword, strlen(newPassword) + 1);
-    f.close();
-  }
-
-  f = LittleFS.open("/ssid", FILE_WRITE);
-  if (f) {
-    f.write((const uint8_t*)newSsid, strlen(newSsid) + 1);
-    f.close();
-  }
+  if (strlen(newPassword) > 64) return false;
 
   WifiCred list[WIFI_MAX_NETWORKS];
   int count = loadWifiList(list, WIFI_MAX_NETWORKS);
+  const bool isNewNetwork = indexOfSsid(list, count, newSsid) < 0;
+  const int previousCount = count;
   count = addOrUpdateWifi(list, count, newSsid, newPassword);
-  saveWifiList(list, count);
+  if (isNewNetwork && count == previousCount) return false;
+  return saveWifiList(list, count);
 }
 
 static void appendPortalMessage(String &html)
@@ -1555,6 +1748,7 @@ static void appendCatalogOptions(String &html)
 static String captivePortalPage()
 {
   ensureLocalRadioData();
+  reloadRadioPresetCache();
   String html;
   html.reserve(22000);
   html += F("<!doctype html><html><head><meta charset='utf-8'>");
@@ -1610,11 +1804,10 @@ static String captivePortalPage()
   }
   html += F("</section>");
 
-  String presetNames[RADIO_PRESET_MAX];
-  String presetUrls[RADIO_PRESET_MAX];
-  int presetCount = loadStationPresets(presetNames, presetUrls, RADIO_PRESET_MAX);
+  int presetCount = radioPresetCacheCount;
   int nextSlot = 1;
-  while (nextSlot <= RADIO_PRESET_MAX && presetUrls[nextSlot - 1].length() > 0) nextSlot++;
+  while (nextSlot <= RADIO_PRESET_MAX && radioPresetCache != nullptr &&
+         radioPresetCache[nextSlot - 1].url[0] != '\0') nextSlot++;
   if (nextSlot > RADIO_PRESET_MAX) nextSlot = RADIO_PRESET_MAX;
 
   html += F("<section id='radio' class='panel'><h2>Add radio</h2>");
@@ -1632,7 +1825,7 @@ static String captivePortalPage()
   html += F("<section class='panel wide'><h2>Current presets</h2>");
   bool hasPreset = false;
   for (int i = 0; i < presetCount; i++) {
-    if (presetUrls[i].length() > 0) {
+    if (radioPresetCache[i].url[0] != '\0') {
       hasPreset = true;
       break;
     }
@@ -1642,13 +1835,13 @@ static String captivePortalPage()
   } else {
     html += F("<table><thead><tr><th class='slot'>#</th><th>Radio</th><th class='actions'></th></tr></thead><tbody>");
     for (int i = 0; i < presetCount; i++) {
-      if (presetUrls[i].length() == 0) continue;
+      if (radioPresetCache[i].url[0] == '\0') continue;
       html += F("<tr><td class='slot'>");
       html += String(i + 1);
       html += F("</td><td><strong>");
-      html += htmlEscape(presetNames[i]);
+      html += htmlEscape(String(radioPresetCache[i].name));
       html += F("</strong><div class='url'>");
-      html += htmlEscape(presetUrls[i]);
+      html += htmlEscape(String(radioPresetCache[i].url));
       html += F("</div></td><td class='actions'><form method='POST' action='/radio/clear'><input type='hidden' name='slot' value='");
       html += String(i + 1);
       html += F("'><button class='small danger' type='submit'>Clear</button></form></td></tr>");
@@ -1702,9 +1895,14 @@ static void captiveHandleSave()
     return;
   }
 
-  saveWifiCredential(finalSsid.c_str(), password.c_str());
+  if (!saveWifiCredential(finalSsid.c_str(), password.c_str())) {
+    captiveServer.send(507, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>WiFi not saved</h1><p>Storage failed or the 10-network limit was reached. Forget one network and retry.</p><a href='/'>Back</a></body>"));
+    return;
+  }
   printf("Portal WiFi saved ssid=%s\n", finalSsid.c_str());
-  portalRedirect("wifi");
+  captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>WiFi saved</h1><p>The radio will restart and connect automatically.</p></body>"));
+  captiveRestartPending = true;
+  captiveRestartAtMs = millis() + 1500;
 }
 
 static void captiveHandleWifiForget()
@@ -1712,7 +1910,10 @@ static void captiveHandleWifiForget()
   int idx = captiveServer.arg("idx").toInt();
   WifiCred list[WIFI_MAX_NETWORKS];
   int count = loadWifiList(list, WIFI_MAX_NETWORKS);
-  if (removeWifiByIndex(list, count, idx)) saveWifiList(list, count);
+  if (!removeWifiByIndex(list, count, idx) || !saveWifiList(list, count)) {
+    captiveServer.send(500, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Network not forgotten</h1><a href='/'>Back</a></body>"));
+    return;
+  }
   portalRedirect("forget");
 }
 
@@ -1751,19 +1952,26 @@ static void captiveHandleRadioPick()
 static void captiveHandleRadioClear()
 {
   int slot = captiveServer.arg("slot").toInt() - 1;
-  clearStationPreset(slot);
+  if (!clearStationPreset(slot)) {
+    captiveServer.send(400, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Cannot clear preset</h1><a href='/'>Back</a></body>"));
+    return;
+  }
   portalRedirect("clear");
 }
 
 static void captiveHandleRadioDefaults()
 {
-  writeDefaultPresets();
+  if (!writeDefaultPresets() || !reloadRadioPresetCache()) {
+    captiveServer.send(500, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Cannot restore presets</h1><a href='/'>Back</a></body>"));
+    return;
+  }
   portalRedirect("defaults");
 }
 
 static void captiveHandleRestart()
 {
   captiveRestartPending = true;
+  captiveRestartAtMs = millis() + 250;
   captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Restarting</h1><p>The radio will reboot now.</p></body>"));
 }
 
@@ -1806,7 +2014,12 @@ static void drawCaptivePortalScreen()
   }
 
   tft.setTextColor(TFT_GREY, TFT_WHITE);
-  tft.drawString("Knob=manual  Phone: 192.168.4.1", 160, 222, 2);
+  if (captiveReturnToRadioEnabled) {
+    tft.drawString("CHECK: back to radio", 160, 207, 2);
+    tft.drawString("Knob: manual | Auto after 60s idle", 160, 226, 1);
+  } else {
+    tft.drawString("Press knob: manual setup", 160, 222, 2);
+  }
 }
 
 static bool captiveManualButtonPressed()
@@ -1841,6 +2054,7 @@ static void startWifiCaptivePortal()
   if (mac.length() < 4) mac = "0000";
   captiveApName = "MuseRadio-" + mac.substring(mac.length() - 4);
   captiveRestartPending = false;
+  captiveRestartAtMs = 0;
   captiveManualFallbackRequested = false;
 
   WiFi.softAPdisconnect(true);
@@ -1906,6 +2120,10 @@ static void startWifiCaptivePortal()
 
   debugPrintf("Captive portal started: SSID=%s PWD=%s URL=%s\n", captiveApName.c_str(), CAPTIVE_AP_PASSWORD, CAPTIVE_PORTAL_URL);
 
+  uint32_t lastPortalClientMs = millis();
+  uint32_t checkReleasedAtMs = 0;
+  uint32_t checkPressedAtMs = 0;
+  bool checkButtonArmed = false;
   while (true) {
     captiveDns.processNextRequest();
     captiveServer.handleClient();
@@ -1913,6 +2131,37 @@ static void startWifiCaptivePortal()
     debugLogService();
     if ((int32_t)(millis() - captivePortalLastDrawMs) > 3000) {
       drawCaptivePortalScreen();
+    }
+    if (captiveReturnToRadioEnabled && !captiveRestartPending) {
+      const uint32_t nowMs = millis();
+      if (WiFi.softAPgetStationNum() > 0) lastPortalClientMs = nowMs;
+
+      const int portalButton = readAdcButtonIndex(nullptr, nullptr);
+      if (!checkButtonArmed) {
+        if (portalButton != sw3) {
+          if (checkReleasedAtMs == 0) checkReleasedAtMs = nowMs;
+          if ((nowMs - checkReleasedAtMs) >= 250) checkButtonArmed = true;
+        } else {
+          checkReleasedAtMs = 0;
+        }
+      } else if (portalButton == sw3) {
+        if (checkPressedAtMs == 0) checkPressedAtMs = nowMs;
+        if ((nowMs - checkPressedAtMs) >= 50) {
+          debugPrintf("Captive portal: CHECK pressed, returning to radio\n");
+          captiveRestartPending = true;
+          captiveRestartAtMs = nowMs + 250;
+        }
+      } else {
+        checkPressedAtMs = 0;
+      }
+
+      if (!captiveRestartPending &&
+          (nowMs - lastPortalClientMs) >= CAPTIVE_IDLE_RETURN_MS) {
+        debugPrintf("Captive portal: no AP client for %u ms, returning to radio\n",
+                    (unsigned)CAPTIVE_IDLE_RETURN_MS);
+        captiveRestartPending = true;
+        captiveRestartAtMs = nowMs + 250;
+      }
     }
     if (captiveManualButtonPressed()) {
       waitCaptiveManualButtonReleased();
@@ -1923,7 +2172,7 @@ static void startWifiCaptivePortal()
       setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, false);
       return;
     }
-    if (captiveRestartPending) {
+    if (captiveRestartPending && (int32_t)(millis() - captiveRestartAtMs) >= 0) {
       tft.fillScreen(TFT_NAVY);
       tft.setTextDatum(TC_DATUM);
       tft.setTextColor(TFT_GREEN);
@@ -1947,6 +2196,7 @@ static void captivePortalTask(void*)
 static void startWifiCaptivePortalBackground()
 {
   if (captivePortalTaskH || captivePortalTaskActive) return;
+  captiveReturnToRadioEnabled = false;
   captivePortalApReady = false;
   captivePortalApFailed = false;
   const BaseType_t rc = xTaskCreatePinnedToCore(captivePortalTask, "wifi_portal", 12288,
@@ -1987,17 +2237,17 @@ void refreshVolume(void)
   }
   ES8388vol_Set(vol);
 #if ENABLE_USB_AUDIO
-  if (!usbAudioVolumeUpdateFromHost)
+  if (audioModeAllows(AudioMode::UsbAudio) && !usbAudioVolumeUpdateFromHost)
   {
     usbAudioSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
     usbAudioSetLocalMute(muteON || vol == 0);
   }
 #endif
-  if (spotifyPlaybackActive || spotifyConnectActive())
+  if (audioModeAllows(AudioMode::Spotify))
   {
     spotifyConnectSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
   }
-  if ((airPlayPlaybackActive || airPlayActive()) && !airPlayVolumeUpdateFromRemote)
+  if (audioModeAllows(AudioMode::AirPlay) && !airPlayVolumeUpdateFromRemote)
   {
     airPlaySetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
   }
@@ -2673,6 +2923,32 @@ static void drawUsbAudioStatus(const char* line)
 }
 #endif
 
+static void refreshAudioModeUi(const char* status = nullptr)
+{
+  const AudioMode current = audioModeCurrent();
+  setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, current == AudioMode::Spotify);
+  setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, current == AudioMode::AirPlay);
+  debugPrintf("Audio mode=%s status=%s\n", audioModeName(current), status ? status : "");
+
+  if (usbDisplayPlaybackActive || usbDisplayActive()) return;
+  switch (current) {
+    case AudioMode::UsbAudio:
+#if !ENABLE_USB_DISPLAY
+      drawUsbAudioStatus(status ? status : usbAudioDeviceName());
+#endif
+      break;
+    case AudioMode::Spotify:
+      drawSpotifyStatus(status ? status : spotifyConnectDeviceName());
+      break;
+    case AudioMode::AirPlay:
+      drawAirPlayStatus(status ? status : airPlayDeviceName());
+      break;
+    case AudioMode::Radio:
+      toDisplay = 2;
+      break;
+  }
+}
+
 static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char* text)
 {
   switch (event)
@@ -2682,31 +2958,23 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
       break;
     case UsbAudioEvent::Active:
       usbAudioPlaybackActive = true;
-      usbAudioRadioResumeAtMs = 0;
-      audio.stopSong();
-      connected = false;
-      refreshVolume();
-#if !ENABLE_USB_DISPLAY
-      if (!(usbDisplayPlaybackActive || usbDisplayActive()))
-      {
-        drawUsbAudioStatus(text ? text : usbAudioDeviceName());
+      if (audioModeActivate(AudioMode::UsbAudio) == AudioMode::UsbAudio) {
+        audio.stopSong();
+        connected = false;
       }
-#endif
+      refreshVolume();
+      refreshAudioModeUi(text ? text : usbAudioDeviceName());
       break;
     case UsbAudioEvent::Inactive:
-      usbAudioRadioResumeAtMs = millis() + 1500;
       usbAudioPlaybackActive = false;
+      audioModeDeactivate(AudioMode::UsbAudio);
       connected = false;
       refreshVolume();
-#if !ENABLE_USB_DISPLAY
-      if (!(usbDisplayPlaybackActive || usbDisplayActive()))
-      {
-        drawUsbAudioStatus(text ? text : "Radio resumes...");
-      }
-#endif
+      refreshAudioModeUi(text ? text : "Radio resumes...");
       break;
     case UsbAudioEvent::Volume:
     {
+      if (!audioModeAllows(AudioMode::UsbAudio)) break;
       int newVol = (int)((value * maxVol + 50UL) / 100UL);
       if (newVol < 0) newVol = 0;
       if (newVol > maxVol) newVol = maxVol;
@@ -2725,11 +2993,13 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
         volEncoder.setCount(V);
         refreshVolume();
         usbAudioVolumeUpdateFromHost = false;
+        scheduleVolumeSave();
         toDisplay = 3;
       }
       break;
     }
     case UsbAudioEvent::Mute:
+      if (!audioModeAllows(AudioMode::UsbAudio)) break;
       if (value && !muteON)
       {
         usbAudioVolumeUpdateFromHost = true;
@@ -2741,6 +3011,7 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
         volEncoder.setCount(V);
         refreshVolume();
         usbAudioVolumeUpdateFromHost = false;
+        scheduleVolumeSave();
         toDisplay = 1;
       }
       else if (!value && muteON)
@@ -2753,6 +3024,7 @@ static void handleUsbAudioEvent(UsbAudioEvent event, uint32_t value, const char*
         volEncoder.setCount(V);
         refreshVolume();
         usbAudioVolumeUpdateFromHost = false;
+        scheduleVolumeSave();
         toDisplay = 2;
       }
       break;
@@ -2770,16 +3042,12 @@ static void handleUsbDisplayEvent(UsbDisplayEvent event, uint32_t value, const c
       break;
     case UsbDisplayEvent::Active:
       usbDisplayPlaybackActive = true;
-      usbDisplayRadioResumeAtMs = 0;
-      audio.stopSong();
-      connected = false;
       displayON();
       break;
     case UsbDisplayEvent::Inactive:
-      usbDisplayPlaybackActive = true;
-      usbDisplayRadioResumeAtMs = 0;
-      connected = false;
+      usbDisplayPlaybackActive = false;
       displayON();
+      refreshAudioModeUi(text);
       break;
     case UsbDisplayEvent::Dropped:
       if ((value % 25) == 1)
@@ -2801,29 +3069,31 @@ static void handleAirPlayEvent(AirPlayEvent event, uint32_t value, const char* t
       break;
     case AirPlayEvent::Active:
       airPlayPlaybackActive = true;
-      airPlayRadioResumeAtMs = 0;
-      setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, true);
-      audio.stopSong();
-      connected = false;
+      if (audioModeActivate(AudioMode::AirPlay) == AudioMode::AirPlay) {
+        audio.stopSong();
+        connected = false;
+      }
       refreshVolume();
-      drawAirPlayStatus(text ? text : airPlayDeviceName());
+      refreshAudioModeUi(text ? text : airPlayDeviceName());
       break;
     case AirPlayEvent::Inactive:
-      airPlayRadioResumeAtMs = millis() + 1500;
       airPlayPlaybackActive = false;
+      audioModeDeactivate(AudioMode::AirPlay);
       connected = false;
       clearAirPlayMetadata();
       refreshVolume();
-      drawAirPlayStatus(text ? text : "Radio resumes...");
-      setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, false);
+      refreshAudioModeUi(text ? text : "Radio resumes...");
       break;
     case AirPlayEvent::Metadata:
-      setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, true);
       updateAirPlayMetadata(text);
-      drawAirPlayStatus(nullptr);
+      if (audioModeAllows(AudioMode::AirPlay)) {
+        setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, true);
+        drawAirPlayStatus(nullptr);
+      }
       break;
     case AirPlayEvent::Volume:
     {
+      if (!audioModeAllows(AudioMode::AirPlay)) break;
       int newVol = (int)((value * maxVol + 32767UL) / 65535UL);
       if (newVol < 0) newVol = 0;
       if (newVol > maxVol) newVol = maxVol;
@@ -2836,6 +3106,7 @@ static void handleAirPlayEvent(AirPlayEvent event, uint32_t value, const char* t
         volEncoder.setCount(V);
         refreshVolume();
         airPlayVolumeUpdateFromRemote = false;
+        scheduleVolumeSave();
         toDisplay = 3;
       }
       break;
@@ -2854,35 +3125,39 @@ static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value,
       break;
     case SpotifyConnectEvent::Active:
       spotifyPlaybackActive = true;
-      spotifyRadioResumeAtMs = 0;
-      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
-      audio.stopSong();
-      connected = false;
+      if (audioModeActivate(AudioMode::Spotify) == AudioMode::Spotify) {
+        audio.stopSong();
+        connected = false;
+      }
       refreshVolume();
-      drawSpotifyStatus(text ? text : spotifyConnectDeviceName());
+      refreshAudioModeUi(text ? text : spotifyConnectDeviceName());
       break;
     case SpotifyConnectEvent::Paused:
       spotifyPlaybackActive = true;
-      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
-      refreshVolume();
-      drawSpotifyStatus(text ? text : "Spotify paused");
+      audioModeActivate(AudioMode::Spotify);
+      if (audioModeAllows(AudioMode::Spotify)) {
+        refreshVolume();
+        refreshAudioModeUi(text ? text : "Spotify paused");
+      }
       break;
     case SpotifyConnectEvent::Inactive:
-      spotifyRadioResumeAtMs = millis() + 1500;
       spotifyPlaybackActive = false;
+      audioModeDeactivate(AudioMode::Spotify);
       connected = false;
       clearSpotifyTrackMetadata();
       refreshVolume();
-      drawSpotifyStatus(text ? text : "Radio resumes...");
-      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, false);
+      refreshAudioModeUi(text ? text : "Radio resumes...");
       break;
     case SpotifyConnectEvent::Track:
-      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
       updateSpotifyTrackMetadata(text);
-      drawSpotifyStatus(nullptr);
+      if (audioModeAllows(AudioMode::Spotify)) {
+        setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
+        drawSpotifyStatus(nullptr);
+      }
       break;
     case SpotifyConnectEvent::Volume:
     {
+      if (!audioModeAllows(AudioMode::Spotify)) break;
       int newVol = (int)((value * maxVol + 32767UL) / 65535UL);
       if (newVol < 0) newVol = 0;
       if (newVol > maxVol) newVol = maxVol;
@@ -2893,6 +3168,7 @@ static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value,
         PV = V;
         volEncoder.setCount(V);
         refreshVolume();
+        scheduleVolumeSave();
         toDisplay = 3;
       }
       break;
@@ -3054,17 +3330,30 @@ static bool consumeAdcButtonEvent(int index)
 static void keyb(void* pdata)
 {
   int adcHeldButton = -1;
+  uint32_t adcPressedAtMs = 0;
+  bool adcLongPressSent = false;
 
   while (1)
   {
     int adcRaw = 0;
     int adcDiff = 0;
     int adcButton = readAdcButtonIndex(&adcRaw, &adcDiff);
-    if (adcButton >= 0 && adcHeldButton < 0) {
-      pushAdcButtonEvent(adcButton);
-      printf("ADC event button=%d raw=%d diff=%d\n", adcButton + 1, adcRaw, adcDiff);
+    if (adcButton != adcHeldButton) {
+      adcHeldButton = adcButton;
+      adcPressedAtMs = millis();
+      adcLongPressSent = false;
+      if (adcButton >= sw0 && adcButton <= sw2) {
+        pushAdcButtonEvent(adcButton);
+        printf("ADC preset event button=%d raw=%d diff=%d\n",
+               adcButton + 1, adcRaw, adcDiff);
+      }
+    } else if (adcButton == sw3 && !adcLongPressSent &&
+               (millis() - adcPressedAtMs) >= ADC_SETTINGS_HOLD_MS) {
+      adcLongPressSent = true;
+      pushAdcButtonEvent(sw3);
+      printf("ADC settings event: check button held %u ms\n",
+             (unsigned)ADC_SETTINGS_HOLD_MS);
     }
-    adcHeldButton = adcButton;
 
     //   printf("CLICK1 = %d   CLICK2 = %d\n", gpio_get_level(CLICK1), gpio_get_level(CLICK2));
     if ((gpio_get_level(CLICK1) == 0) && (CLICK1B == false)) CLICK1E = true;
@@ -3092,78 +3381,74 @@ static void keyb(void* pdata)
 }
 
 
-/////////////////////////////////////////////////////////////////////////////
-// gets station link from LittleFS file "/linkS"
-//
-/////////////////////////////////////////////////////////////////////////////
-char* Rlink(int st)
+static bool reloadRadioPresetCache()
 {
-  static char out[RADIO_URL_MAX];
-  out[0] = 0;
-  if (st < 0 || st >= RADIO_PRESET_MAX) return out;
-  File ln = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
-  if (!ln) return out;
-
-  int slot = 0;
-  while (ln.available() && slot <= st) {
-    String line = ln.readStringUntil('\n');
-    line.trim();
-    if (slot == st && line.length() > 0) {
-      line.toCharArray(out, sizeof(out));
-      break;
+  if (radioPresetCache == nullptr) {
+    radioPresetCache = (CachedRadioPreset *)heap_caps_calloc(
+      RADIO_PRESET_MAX, sizeof(CachedRadioPreset), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    radioPresetCacheInPsram = (radioPresetCache != nullptr);
+    if (radioPresetCache == nullptr) {
+      radioPresetCache = (CachedRadioPreset *)heap_caps_calloc(
+        RADIO_PRESET_MAX, sizeof(CachedRadioPreset), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    slot++;
   }
-  ln.close();
-  return out;
-}
-/////////////////////////////////////////////////////////////////////////////////
-//  gets station name from LittleFS file "/namS"
-//
-/////////////////////////////////////////////////////////////////////////////////
-char* Rname(int st)
-{
-  static char out[RADIO_NAME_MAX];
-  snprintf(out, sizeof(out), "Preset %d", st + 1);
-  if (st < 0 || st >= RADIO_PRESET_MAX) return out;
-  File ln = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
-  if (!ln) return out;
+  if (radioPresetCache == nullptr) return false;
+  memset(radioPresetCache, 0, RADIO_PRESET_MAX * sizeof(CachedRadioPreset));
 
-  int slot = 0;
-  while (ln.available() && slot <= st) {
-    String line = ln.readStringUntil('\n');
-    line.trim();
-    if (slot == st && line.length() > 0) {
-      line.toCharArray(out, sizeof(out));
-      break;
-    }
-    slot++;
+  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
+  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
+  if (!nameFile || !linkFile) {
+    if (nameFile) nameFile.close();
+    if (linkFile) linkFile.close();
+    radioPresetCacheCount = 0;
+    return false;
   }
-  ln.close();
-  return out;
-}
-/////////////////////////////////////////////////////////////////////////
-//  defines how many stations in LittleFS file "/linkS"
-//
-////////////////////////////////////////////////////////////////////////
-int maxStation(void)
-{
-  File ln = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
-  if (!ln) {
-    printf("=========> 0 \n");
-    return 0;
-  }
+
   int slot = 0;
   int highestUsedSlot = 0;
-  while (ln.available() && slot < RADIO_PRESET_MAX) {
-    String line = ln.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) highestUsedSlot = slot + 1;
+  while (slot < RADIO_PRESET_MAX && (nameFile.available() || linkFile.available())) {
+    String name = nameFile.available() ? nameFile.readStringUntil('\n') : "";
+    String url = linkFile.available() ? linkFile.readStringUntil('\n') : "";
+    name.trim();
+    url.trim();
+    if (url.length() > 0 && isValidRadioUrl(url) && url.length() < RADIO_URL_MAX) {
+      if (!name.length()) name = "Preset " + String(slot + 1);
+      if (name.length() >= RADIO_NAME_MAX) name = name.substring(0, RADIO_NAME_MAX - 1);
+      name.toCharArray(radioPresetCache[slot].name, sizeof(radioPresetCache[slot].name));
+      url.toCharArray(radioPresetCache[slot].url, sizeof(radioPresetCache[slot].url));
+      highestUsedSlot = slot + 1;
+    }
     slot++;
   }
-  ln.close();
-  printf("=========> %d \n", highestUsedSlot);
-  return highestUsedSlot;
+  nameFile.close();
+  linkFile.close();
+  radioPresetCacheCount = highestUsedSlot;
+  printf("Radio cache loaded: %d slots (%s)\n", radioPresetCacheCount,
+         radioPresetCacheInPsram ? "PSRAM" : "internal RAM");
+  return radioPresetCacheCount > 0;
+}
+
+char* Rlink(int st)
+{
+  static char empty[1] = {0};
+  if (radioPresetCache == nullptr || st < 0 || st >= RADIO_PRESET_MAX) return empty;
+  return radioPresetCache[st].url;
+}
+
+char* Rname(int st)
+{
+  static char fallback[RADIO_NAME_MAX];
+  if (radioPresetCache != nullptr && st >= 0 && st < RADIO_PRESET_MAX &&
+      radioPresetCache[st].name[0]) {
+    return radioPresetCache[st].name;
+  }
+  snprintf(fallback, sizeof(fallback), "Preset %d", st + 1);
+  return fallback;
+}
+
+int maxStation(void)
+{
+  return radioPresetCacheCount;
 }
 
 static bool stationSlotHasUrl(int slot)
@@ -3214,7 +3499,36 @@ static void enterSettingsFromButton()
   audio.stopSong();
   connected = false;
   stopRuntimeTasksForSettings();
+  captiveReturnToRadioEnabled = true;
   settings();
+}
+
+static void selectRadioPresetDirect(int presetIndex)
+{
+  if (presetIndex < 0 || presetIndex >= 3) return;
+  displayON();
+  if (!stationSlotHasUrl(presetIndex)) {
+    wakeTftBacklight();
+    tft.setRotation(1);
+    tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString(("Preset " + String(presetIndex + 1) + " empty").c_str(), 180, 105, 4);
+    printf("ADC preset %d ignored: empty\n", presetIndex + 1);
+    return;
+  }
+
+  station = presetIndex;
+  S = presetIndex * 2;
+  VS = S;
+  staEncoder.setCount(S);
+  modSta = false;
+  CLICK2B = false;
+  toDisplay = 2;
+  if (!saveStoredInt("/station", station)) {
+    printf("Failed to persist direct preset %d\n", presetIndex + 1);
+  }
+  printf("ADC direct preset=%d name=%s\n", presetIndex + 1, Rname(presetIndex));
 }
 
 static void drawStationSelectScreen()
@@ -3247,14 +3561,7 @@ static void playRadio(void* data)
   while (started == false) delay(100);
   while (1)
   {
-    if (spotifyPlaybackActive || spotifyConnectActive() ||
-        airPlayPlaybackActive || airPlayActive() ||
-        usbAudioPlaybackActive || usbAudioActive() ||
-        usbDisplayPlaybackActive || usbDisplayActive() ||
-        (spotifyRadioResumeAtMs != 0 && (int32_t)(millis() - spotifyRadioResumeAtMs) < 0) ||
-        (airPlayRadioResumeAtMs != 0 && (int32_t)(millis() - airPlayRadioResumeAtMs) < 0) ||
-        (usbAudioRadioResumeAtMs != 0 && (int32_t)(millis() - usbAudioRadioResumeAtMs) < 0) ||
-        (usbDisplayRadioResumeAtMs != 0 && (int32_t)(millis() - usbDisplayRadioResumeAtMs) < 0))
+    if (!audioModeRadioReady())
     {
       vTaskDelay(20 / portTICK_PERIOD_MS);
       continue;
@@ -3279,11 +3586,13 @@ static void playRadio(void* data)
       audio.connecttohost(linkS);
       previousStation = station;
       refreshVolume();
-      tft.setRotation(1);
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
-      tft.setTextColor(TFT_STATION);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(station), 180, 105, 4);
+      if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
+        tft.setRotation(1);
+        tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+        tft.setTextColor(TFT_STATION);
+        tft.setTextDatum(TC_DATUM);
+        tft.drawString(Rname(station), 180, 105, 4);
+      }
 
       //    staEncoder.setCount(station);
       if (connected == false) delay(50);
@@ -3308,12 +3617,14 @@ static void jack(void* data)
       if (jackON == false)
       {
         printf("Jack ON\n");
+        if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
         gpio_set_level(PA, 0);          // amp off
         ES8388_Write_Reg(29, 0x00);     // stereo
         ES8388_Write_Reg(28, 0x08);     // no phase inversion + click free power up/down
         ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2
         jackON = true;
         refreshVolume();
+        if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
       }
     }
     else
@@ -3321,12 +3632,14 @@ static void jack(void* data)
       if (jackON == true)
       {
         printf("Jack OFF\n");
+        if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
         gpio_set_level(PA, 1);          // amp on
         ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
         ES8388_Write_Reg(28, 0x18);     // Right DAC phase inversion + click free power up/down
         ES8388_Write_Reg(4, 0x30);      // Rout1/Lout1
         jackON = false;
         refreshVolume();
+        if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
       }
     }
     delay(1000);
@@ -3645,11 +3958,6 @@ void settings(void)
   }
 
 
-  uint8_t bm = 0x31;
-  File ln = LittleFS.open("/mode", FILE_WRITE);
-  ln.write(&bm, 1);
-  ln.close();
-
   if (pos == 0)
   {
     headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
@@ -3708,11 +4016,6 @@ void settings(void)
       strcpy((char*)ssid, WiFi.SSID(j).c_str());
     }
     printf("ssid = %s\n", ssid);
-    // Keep legacy file for compatibility but main storage is wifi.json
-    ln = LittleFS.open("/ssid", FILE_WRITE);
-    ln.write(ssid, strlen((char*)ssid) + 1);
-    ln.close();
-
     delay(1000);
     headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
     tft.setTextColor(TFT_RED);
@@ -3944,7 +4247,13 @@ void setup() {
               (unsigned)ESP.getPsramSize(),
               (unsigned)ESP.getFreePsram());
 
-  loadUsbDisplayProfilePreference();
+  codecMutex = xSemaphoreCreateRecursiveMutex();
+  if (codecMutex == nullptr) {
+    debugPrintf("Codec mutex allocation failed; restarting.\n");
+    delay(2000);
+    ESP.restart();
+  }
+  audioModeBegin(1500);
 #if ENABLE_USB_AUDIO
   usbAudioStartUsbDebugOnly();
 #endif
@@ -3960,19 +4269,24 @@ void setup() {
   /////////////////////////////////////////////////////
   // Little FS init
   /////////////////////////////////////////////////////
-  littleFsMounted = LittleFS.begin();
+  littleFsMounted = LittleFS.begin(false);
   if (!littleFsMounted) {
-    Serial.println("LittleFS initialisation failed; continuing without data partition");
-  } else {
-    //    LittleFS.format();
-    File root = LittleFS.open("/", "r");
-    File file = root.openNextFile();
-    while (file) {
-      printf("FILE: /%s\n", file.name());
-      file = root.openNextFile();
-      delay(100);
+    debugPrintf("LittleFS initialisation failed; preserving data and restarting.\n");
+    delay(5000);
+    ESP.restart();
+  }
+  debugPrintf("LittleFS: used=%u total=%u bytes\n",
+              (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+  recoverStoredFiles();
+  loadUsbDisplayProfilePreference();
+  ensureLocalRadioData();
+  if (!reloadRadioPresetCache()) {
+    debugPrintf("No valid local radio preset; restoring defaults.\n");
+    if (!writeDefaultPresets() || !reloadRadioPresetCache()) {
+      debugPrintf("Radio preset storage failed; restarting.\n");
+      delay(5000);
+      ESP.restart();
     }
-    ensureLocalRadioData();
   }
 
   //////////////////////////////////////////////////
@@ -4036,20 +4350,8 @@ void setup() {
 
 
 
-  File ln = LittleFS.open("/mode", FILE_READ);
-  // If mode is not defined, default to WiFi and let the captive portal handle credentials.
-  if (!ln) {
-    mode = '1';
-    File modeFile = LittleFS.open("/mode", FILE_WRITE);
-    if (modeFile) {
-      modeFile.write(&mode, 1);
-      modeFile.close();
-    }
-  } else {
-    ln.read(&mode, 1);
-    ln.close();
-  }
-  debugPrintf("mode = %c\n", mode);
+  // Radio & more is Wi-Fi only. The legacy /mode file is intentionally ignored.
+  mode = '1';
   //////////////////////////////////////////////////////
   //Screen init
   //////////////////////////////////////////////////////
@@ -4145,38 +4447,17 @@ void setup() {
   // recovering params (station & vol)
   ///////////////////////////////////////////////////////////////
 
-  // previous station
-  ln = LittleFS.open("/station", "r");
-  station = 0;
-  if (ln) {
-    ln.read((uint8_t*)b, 2);
-    b[2] = 0;
-    station = atoi(b);
-    ln.close();
-  }
-  // previous volume
-  ln = LittleFS.open("/volume", "r");
-  vol = maxVol;
-  if (ln) {
-    ln.read((uint8_t*)b, 2);
-    b[2] = 0;
-    vol = atoi(b);
-    ln.close();
-  }
-  if (vol < 0 || vol > maxVol) vol = maxVol;
+  station = loadStoredInt("/station", 0, 0, RADIO_PRESET_MAX - 1);
+  vol = loadStoredInt("/volume", 15, 0, maxVol);
   MS = maxStation() - 1;
   if (MS < 0) {
     writeDefaultPresets();
+    reloadRadioPresetCache();
     MS = maxStation() - 1;
   }
   if (station < 0 || station > MS || !stationSlotHasUrl(station)) {
     station = normalizeStationSlot(0, 1, MS + 1);
-    File stationFile = LittleFS.open("/station", "w");
-    if (stationFile) {
-      sprintf(b, "%02d", station);
-      stationFile.write((uint8_t*)b, 2);
-      stationFile.close();
-    }
+    saveStoredInt("/station", station);
   }
   previousStation = -1;
   printf("station = %d    vol = %d\n", station, vol);
@@ -4242,7 +4523,15 @@ void loop() {
 
   debugLogService();
 
-  if (consumeAdcButtonEvent(sw0))
+  if (!captivePortalApReady) {
+    for (int presetIndex = 0; presetIndex < 3; presetIndex++) {
+      if (consumeAdcButtonEvent(presetIndex)) {
+        selectRadioPresetDirect(presetIndex);
+      }
+    }
+  }
+
+  if (consumeAdcButtonEvent(sw3))
   {
     if (captivePortalApReady) {
       setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, true);
@@ -4250,7 +4539,7 @@ void loop() {
     } else if (BSettings == false) {
       enterSettingsFromButton();
     } else {
-      printf("ADC action button1 ignored: settings already active\n");
+      printf("ADC settings hold ignored: settings already active\n");
     }
   }
 
@@ -4290,10 +4579,8 @@ void loop() {
     usbAudioSendHostVolumeDelta((int8_t)(vol - previousVol));
 #endif
     printf("============> %d  %d\n", V, vol);
-    sprintf(b, "%02d", vol);
-    File ln = LittleFS.open("/volume", "w");
-    ln.write((uint8_t*)b, 2);
-    ln.close();
+    volumeSavePending = true;
+    volumeChangedAtMs = millis();
     if (!usbDisplayBusy) toDisplay = 3;
   }
   //////////////////////////////////////////////////////////////////////
@@ -4322,10 +4609,8 @@ void loop() {
     usbAudioSendHostVolumeDelta((int8_t)(vol - previousVol));
 #endif
     volEncoder.setCount(vol * pos360 / maxVol);
-    sprintf(b, "%02d", vol);
-    File ln = LittleFS.open("/volume", "w");
-    ln.write((uint8_t*)b, 2);
-    ln.close();
+    volumeSavePending = true;
+    volumeChangedAtMs = millis();
     if (!usbDisplayBusy) toDisplay = 3;
   }
 
@@ -4427,11 +4712,9 @@ void loop() {
         station = selectedStation;
         printf("station = %d\n", station);
         staEncoder.setCount(S);
-        char b[4];
-        sprintf(b, "%02d", station);
-        File ln = LittleFS.open("/station", "w");
-        ln.write((uint8_t*)b, 2);
-        ln.close();
+        if (!saveStoredInt("/station", station)) {
+          printf("Failed to persist station %d\n", station);
+        }
         CLICK2B = false;
         if (muteON == true)
         {
@@ -4463,13 +4746,6 @@ void loop() {
     }
 
   }
-
-  if (consumeAdcButtonEvent(sw1))
-  {
-    printf("ADC action button2: unused\n");
-  }
-
-
 
   /////////////////////////////////////////////////////////////////////////
   // Display refresh
@@ -4544,6 +4820,14 @@ void loop() {
       irrecv.resume();  // Receive the next value
     }
   */
+  if (volumeSavePending && (uint32_t)(millis() - volumeChangedAtMs) >= 750) {
+    if (saveStoredInt("/volume", vol)) {
+      volumeSavePending = false;
+    } else {
+      printf("Failed to persist volume %d; retrying\n", vol);
+      volumeChangedAtMs = millis();
+    }
+  }
   delay(100);
 }
 

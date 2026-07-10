@@ -1,4 +1,5 @@
 #include "SpotifyConnect.h"
+#include "AudioModeController.h"
 
 #if ENABLE_SPOTIFY_CONNECT
 
@@ -209,6 +210,7 @@ size_t writePCM(uint8_t* data, size_t bytes, std::string_view) {
 
   emitActive();
   s_pcmPending = false;
+  if (!audioModeAllows(AudioMode::Spotify)) return bytes;
 
   return s_audio->writeRawPCM16(data, bytes, SAMPLE_RATE, CHANNELS);
 }

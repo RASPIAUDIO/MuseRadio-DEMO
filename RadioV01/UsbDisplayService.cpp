@@ -34,6 +34,7 @@ constexpr uint16_t DISPLAY_WIDTH = 320;
 constexpr uint16_t DISPLAY_HEIGHT = 240;
 constexpr uint32_t MIN_FRAME_INTERVAL_MS = 100;
 constexpr uint32_t DISPLAY_KEEPALIVE_MS = 3000;
+constexpr uint32_t DISPLAY_INACTIVE_MS = 15000;
 constexpr size_t RX_CHUNK_BYTES = 64;
 constexpr size_t FRAME_LIMIT_BYTES = 65536;
 constexpr size_t FRAME_SLOT_COUNT = 3;
@@ -600,7 +601,15 @@ void renderTask(void*)
       drawFrame(slot);
       returnSlot(slot);
     } else {
-      keepDisplayAlive();
+      const uint32_t nowMs = millis();
+      const uint32_t lastFrameMs = s_lastFrameMs.load();
+      if (s_active.load() && lastFrameMs != 0 &&
+          (int32_t)(nowMs - lastFrameMs) >= (int32_t)DISPLAY_INACTIVE_MS) {
+        s_active = false;
+        emit(UsbDisplayEvent::Inactive, 0, "USB display inactive");
+      } else {
+        keepDisplayAlive();
+      }
     }
   }
 }

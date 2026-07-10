@@ -1,4 +1,5 @@
 #include "UsbAudioService.h"
+#include "AudioModeController.h"
 
 #ifndef ENABLE_USB_AUDIO
 #define ENABLE_USB_AUDIO 0
@@ -442,6 +443,8 @@ void pcmOutputTask(void*)
       s_prebufferReady = false;
       continue;
     }
+
+    if (!audioModeAllows(AudioMode::UsbAudio)) continue;
 
     if (s_audio) {
       size_t offset = 0;

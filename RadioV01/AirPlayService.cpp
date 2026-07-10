@@ -1,4 +1,5 @@
 #include "AirPlayService.h"
+#include "AudioModeController.h"
 
 #if ENABLE_AIRPLAY
 
@@ -221,7 +222,9 @@ void pcmOutputTask(void*)
     const size_t len = item.len - (item.len % 4);
     if (s_audio && len > 0 && item.index < PCM_BLOCK_COUNT) {
       const uint8_t* block = s_pcmBlocks + ((size_t)item.index * PCM_BLOCK_BYTES);
-      const size_t written = s_audio->writeRawPCM16(block, len, SAMPLE_RATE, CHANNELS);
+      const size_t written = audioModeAllows(AudioMode::AirPlay)
+        ? s_audio->writeRawPCM16(block, len, SAMPLE_RATE, CHANNELS)
+        : len;
       if (written != len) {
         static uint32_t lastWarnMs = 0;
         const uint32_t nowMs = millis();
