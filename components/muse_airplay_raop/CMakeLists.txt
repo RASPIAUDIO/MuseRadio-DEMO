@@ -1,4 +1,4 @@
-if(NOT CMAKE_BINARY_DIR MATCHES "muse_radio_airplay_poc|muse_radio_usb_display_poc")
+if(NOT CMAKE_BINARY_DIR MATCHES "muse_radio_airplay_poc|muse_radio_usb_display_poc|muse_radio_radio_and_more")
   idf_component_register(SRCS "airplay_dummy.c" INCLUDE_DIRS ".")
   return()
 endif()

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ByteStream.h>  // for ByteStream
+#include "ByteStream.h"  // for ByteStream
 #include <stdint.h>      // for uint8_t
 #include <stdio.h>       // for size_t, FILE
 #include <string>        // for string
