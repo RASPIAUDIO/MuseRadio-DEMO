@@ -16,4 +16,6 @@ using UsbDisplayEventHandler = void (*)(UsbDisplayEvent event, uint32_t value, c
 
 void usbDisplayBegin(TFT_eSPI& tft, UsbDisplayEventHandler handler);
 bool usbDisplayActive();
+void usbDisplaySetLocalUiOverride(bool enabled);
+bool usbDisplayLocalUiOverride();
 const char* usbDisplayDeviceName();

@@ -6,6 +6,7 @@
 
 #include <string.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_check.h"
@@ -13,6 +14,15 @@
 #include "esp_private/usb_phy.h"
 #include "esp_timer.h"
 #include "tusb.h"
+#if CFG_TUD_CDC
+#include "esp_system.h"
+#include "soc/soc.h"
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "soc/rtc_cntl_reg.h"
+#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"
+#include "esp32s3/rom/usb/usb_persist.h"
+#endif
+#endif
 #include "uac_config.h"
 #include "usb_device_uac.h"
 #include "uac_descriptors.h"
@@ -558,7 +568,12 @@ esp_err_t uac_device_init(uac_device_config_t *config)
 {
     ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "config is NULL");
     if (s_uac_device != NULL) {
-        ESP_LOGW(TAG, "uac device already initialized");
+        s_uac_device->user_cfg.output_cb = config->output_cb;
+        s_uac_device->user_cfg.input_cb = config->input_cb;
+        s_uac_device->user_cfg.cb_ctx = config->cb_ctx;
+        s_uac_device->user_cfg.set_mute_cb = config->set_mute_cb;
+        s_uac_device->user_cfg.set_volume_cb = config->set_volume_cb;
+        ESP_LOGW(TAG, "uac device already initialized, callbacks updated");
         return ESP_OK;
     }
     s_uac_device = calloc(1, sizeof(uac_device_t));
@@ -672,3 +687,155 @@ esp_err_t uac_device_send_hid_consumer_control(uint16_t usage)
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
+
+esp_err_t uac_device_debug_cdc_write(const uint8_t *data, size_t len, size_t *written)
+{
+    if (written) {
+        *written = 0;
+    }
+#if CFG_TUD_CDC
+    ESP_RETURN_ON_FALSE(s_uac_device != NULL, ESP_ERR_INVALID_STATE, TAG, "uac device not initialized");
+    ESP_RETURN_ON_FALSE(data != NULL && len > 0, ESP_ERR_INVALID_ARG, TAG, "invalid cdc write");
+    ESP_RETURN_ON_FALSE(tud_mounted() && tud_cdc_connected(), ESP_ERR_INVALID_STATE, TAG, "cdc not connected");
+
+    uint32_t available = tud_cdc_write_available();
+    if (available == 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (len > available) {
+        len = available;
+    }
+
+    const uint32_t count = tud_cdc_write(data, (uint32_t)len);
+    tud_cdc_write_flush();
+    if (written) {
+        *written = count;
+    }
+    return count > 0 ? ESP_OK : ESP_ERR_TIMEOUT;
+#else
+    (void)data;
+    (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool uac_device_debug_cdc_connected(void)
+{
+#if CFG_TUD_CDC
+    return s_uac_device != NULL && tud_mounted() && tud_cdc_connected();
+#else
+    return false;
+#endif
+}
+
+#if CFG_TUD_CDC
+static TaskHandle_t s_cdc_bootloader_restart_task = NULL;
+static char s_cdc_debug_cmd[64];
+static size_t s_cdc_debug_cmd_len = 0;
+
+__attribute__((weak)) void muse_usb_debug_command(const char *command)
+{
+    (void)command;
+}
+
+static void cdc_bootloader_shutdown_handler(void)
+{
+#if CONFIG_IDF_TARGET_ESP32S3
+    chip_usb_set_persist_flags(USBDC_PERSIST_ENA);
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+#endif
+}
+
+static void cdc_bootloader_restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_register_shutdown_handler(cdc_bootloader_shutdown_handler);
+    esp_restart();
+    s_cdc_bootloader_restart_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void schedule_cdc_bootloader_restart(void)
+{
+    if (s_cdc_bootloader_restart_task != NULL) {
+        return;
+    }
+    tud_cdc_write_str("Rebooting to ESP32-S3 bootloader\r\n");
+    tud_cdc_write_flush();
+    xTaskCreate(cdc_bootloader_restart_task, "cdc_bootloader", 2048, NULL,
+                tskIDLE_PRIORITY + 1, &s_cdc_bootloader_restart_task);
+}
+
+static bool cdc_debug_command_is_bootloader(const char *command)
+{
+    char normalized[sizeof(s_cdc_debug_cmd)];
+    size_t start = 0;
+    size_t end = strlen(command);
+    while (start < end && isspace((unsigned char)command[start])) {
+        start++;
+    }
+    while (end > start && isspace((unsigned char)command[end - 1])) {
+        end--;
+    }
+
+    size_t out = 0;
+    for (size_t i = start; i < end && out < sizeof(normalized) - 1; i++) {
+        const char c = command[i];
+        normalized[out++] = (char)(c == '_' || c == '-' ? ' ' : (char)tolower((unsigned char)c));
+    }
+    normalized[out] = '\0';
+
+    return strcmp(normalized, "bootloader") == 0 ||
+           strcmp(normalized, "reboot bootloader") == 0 ||
+           strcmp(normalized, "reset bootloader") == 0 ||
+           strcmp(normalized, "enter bootloader") == 0;
+}
+
+static void cdc_debug_process_byte(uint8_t byte)
+{
+    if (byte == '\r' || byte == '\n') {
+        if (s_cdc_debug_cmd_len > 0) {
+            s_cdc_debug_cmd[s_cdc_debug_cmd_len] = '\0';
+            if (cdc_debug_command_is_bootloader(s_cdc_debug_cmd)) {
+                schedule_cdc_bootloader_restart();
+            } else {
+                muse_usb_debug_command(s_cdc_debug_cmd);
+            }
+            s_cdc_debug_cmd_len = 0;
+        }
+        return;
+    }
+
+    if (byte == 0x08 || byte == 0x7f) {
+        if (s_cdc_debug_cmd_len > 0) {
+            s_cdc_debug_cmd_len--;
+        }
+        return;
+    }
+
+    if (byte >= 0x20 && byte < 0x7f && s_cdc_debug_cmd_len < sizeof(s_cdc_debug_cmd) - 1) {
+        s_cdc_debug_cmd[s_cdc_debug_cmd_len++] = (char)byte;
+    }
+}
+
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *p_line_coding)
+{
+    (void)itf;
+    if (p_line_coding && p_line_coding->bit_rate == 1200) {
+        schedule_cdc_bootloader_restart();
+    }
+}
+
+void tud_cdc_rx_cb(uint8_t itf)
+{
+    (void)itf;
+    uint8_t buf[64];
+    while (tud_cdc_available()) {
+        const uint32_t count = tud_cdc_read(buf, sizeof(buf));
+        for (uint32_t i = 0; i < count; i++) {
+            cdc_debug_process_byte(buf[i]);
+        }
+    }
+}
+#endif

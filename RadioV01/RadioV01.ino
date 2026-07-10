@@ -34,10 +34,10 @@
 #include "AirPlayService.h"
 #include "UsbAudioService.h"
 #include "UsbDisplayService.h"
+#include "DebugLog.h"
 #include "esp32s3/rom/tjpgd.h"
-#if ENABLE_SPOTIFY_CONNECT || ENABLE_AIRPLAY
 #include "esp_heap_caps.h"
-#endif
+#include "esp_system.h"
 #if ENABLE_SPOTIFY_CONNECT
 #include "freertos/queue.h"
 #endif
@@ -52,6 +52,10 @@
 
 #ifndef ENABLE_USB_DISPLAY
 #define ENABLE_USB_DISPLAY 0
+#endif
+
+#ifndef ENABLE_USB_DEBUG_CDC
+#define ENABLE_USB_DEBUG_CDC 0
 #endif
 
 // Provide a portable console alias: use USB CDC when available, else UART Serial
@@ -125,6 +129,8 @@ static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPI
 TaskHandle_t radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiInitH;
 static TaskHandle_t captivePortalTaskH = nullptr;
 static volatile bool captivePortalTaskActive = false;
+static volatile bool captivePortalApReady = false;
+static volatile bool captivePortalApFailed = false;
 
 
 Arduino_ESP32_OTA ota;
@@ -155,6 +161,7 @@ uint8_t pwd[80];
 
 // ---- Multi WiFi credentials support ----
 #define WIFI_JSON_PATH "/wifi.json"
+#define USB_DISPLAY_PROFILE_PATH "/usb_display"
 #define WIFI_MAX_NETWORKS 10
 #define RADIO_PRESET_MAX 99
 #define RADIO_NAME_MAX 48
@@ -320,17 +327,403 @@ bool ES8388_Read_Reg(uint8_t reg, uint8_t *val)
 void ES8388_Dump_ADC_Regs()
 {
 #if ENABLE_USB_MIC
-  printf("ES8388 ADC regs:");
-  for (uint8_t reg = 0x09; reg <= 0x16; reg++) {
+  debugPrintf("ES8388 codec/ADC regs:");
+  for (uint8_t reg = 0x00; reg <= 0x16; reg++) {
     uint8_t val = 0;
     if (ES8388_Read_Reg(reg, &val)) {
-      printf(" %02X=%02X", reg, val);
+      debugPrintf(" %02X=%02X", reg, val);
     } else {
-      printf(" %02X=??", reg);
+      debugPrintf(" %02X=??", reg);
     }
   }
-  printf("\n");
+  debugPrintf("\n");
+  uint8_t adcPower = 0;
+  uint8_t adcControl6 = 0;
+  if (ES8388_Read_Reg(0x03, &adcPower) && ES8388_Read_Reg(0x0e, &adcControl6)) {
+    debugPrintf("ES8388 mic bias=%s phaseL=%s phaseR=%s hpfL=%s hpfR=%s\n",
+                (adcPower & 0x08) ? "off" : "on",
+                (adcControl6 & 0x80) ? "inverted" : "normal",
+                (adcControl6 & 0x40) ? "inverted" : "normal",
+                (adcControl6 & 0x20) ? "on" : "off",
+                (adcControl6 & 0x10) ? "on" : "off");
+  }
 #endif
+}
+
+static const uint8_t MIC_PROFILE_NATURAL = 0;
+static const uint8_t MIC_PROFILE_VOICE = 1;
+static const uint8_t MIC_PROFILE_GATE = 2;
+static const uint8_t MIC_PROFILE_MUSE_VOICE = 3;
+static const uint8_t MIC_PROFILE_SOFT_GATE = 4;
+static const uint8_t MIC_PROFILE_AUTO_LEVEL = 5;
+
+static uint8_t currentMicProfile = MIC_PROFILE_NATURAL;
+static uint8_t currentMicPgaGain = 7; // ES8388 ADC PGA index: 7 = +21 dB, 8 = +24 dB.
+static uint8_t currentMicAdcPower = 0x00; // Bias on, ADC/input/bias generators on.
+static uint8_t currentMicAdcControl2 = 0xfc;
+static uint8_t currentMicAdcControl3 = 0x02;
+static uint8_t currentMicAdcFormat = 0x0c; // Muse_library: I2S, 16-bit ADC word length.
+static uint8_t currentMicAdcControl6 = 0x30; // HPF L/R on, no phase inversion.
+
+const char* ES8388_MicProfileName(uint8_t profile)
+{
+  switch (profile) {
+    case MIC_PROFILE_NATURAL: return "natural";
+    case MIC_PROFILE_VOICE: return "voice";
+    case MIC_PROFILE_GATE: return "gate";
+    case MIC_PROFILE_MUSE_VOICE: return "muse-voice";
+    case MIC_PROFILE_SOFT_GATE: return "softgate";
+    case MIC_PROFILE_AUTO_LEVEL: return "auto";
+    default: return "unknown";
+  }
+}
+
+void ES8388_SetMicPgaGain(uint8_t gainIndex)
+{
+#if ENABLE_USB_MIC
+  if (gainIndex > 8) gainIndex = 8;
+  currentMicPgaGain = gainIndex;
+  ES8388_Write_Reg(0x09, (uint8_t)((gainIndex << 4) | gainIndex));
+  debugPrintf("ES8388 mic PGA gain index=%u (~+%u dB)\n",
+              (unsigned)gainIndex,
+              (unsigned)(gainIndex * 3));
+#else
+  (void)gainIndex;
+#endif
+}
+
+void ES8388_SetMicAdcPower(uint8_t value)
+{
+#if ENABLE_USB_MIC
+  currentMicAdcPower = value;
+  ES8388_Write_Reg(0x03, value);
+  debugPrintf("ES8388 ADCPOWER=0x%02X mic_bias=%s adcL=%s adcR=%s ainL=%s ainR=%s\n",
+              value,
+              (value & 0x08) ? "off" : "on",
+              (value & 0x20) ? "off" : "on",
+              (value & 0x10) ? "off" : "on",
+              (value & 0x80) ? "off" : "on",
+              (value & 0x40) ? "off" : "on");
+#else
+  (void)value;
+#endif
+}
+
+void ES8388_SetMicRoute(uint8_t adcControl2, uint8_t adcControl3, const char* name)
+{
+#if ENABLE_USB_MIC
+  currentMicAdcControl2 = adcControl2;
+  currentMicAdcControl3 = adcControl3;
+  ES8388_Write_Reg(0x0a, adcControl2);
+  ES8388_Write_Reg(0x0b, adcControl3);
+  debugPrintf("ES8388 mic route=%s ADCCONTROL2=0x%02X ADCCONTROL3=0x%02X\n",
+              name ? name : "custom",
+              adcControl2,
+              adcControl3);
+#else
+  (void)adcControl2;
+  (void)adcControl3;
+  (void)name;
+#endif
+}
+
+void ES8388_SetMicAdcFormat(uint8_t value, const char* name)
+{
+#if ENABLE_USB_MIC
+  currentMicAdcFormat = value;
+  ES8388_Write_Reg(0x0c, value);
+  debugPrintf("ES8388 ADC format=%s ADCCONTROL4=0x%02X\n", name ? name : "custom", value);
+#else
+  (void)value;
+  (void)name;
+#endif
+}
+
+void ES8388_SetMicPhaseHpf(uint8_t value, const char* name)
+{
+#if ENABLE_USB_MIC
+  currentMicAdcControl6 = value;
+  ES8388_Write_Reg(0x0e, value);
+  debugPrintf("ES8388 ADC phase/HPF=%s ADCCONTROL6=0x%02X\n", name ? name : "custom", value);
+#else
+  (void)value;
+  (void)name;
+#endif
+}
+
+void ES8388_ApplyMicHardwareClean()
+{
+#if ENABLE_USB_MIC
+  ES8388_SetMicAdcPower(0x00); // Bias on. Use `mic bias off` to try 0x09.
+  ES8388_SetMicPgaGain(currentMicPgaGain);
+  ES8388_SetMicRoute(0xfc, 0x02, "muse differential stereo");
+  ES8388_SetMicAdcFormat(0x0c, "muse 16-bit i2s");
+  ES8388_Write_Reg(0x0d, 0x02); // MCLK/LRCK = 256.
+  ES8388_SetMicPhaseHpf(0x30, "normal phase, hpf on");
+  ES8388_Write_Reg(0x10, 0x00);
+  ES8388_Write_Reg(0x11, 0x00);
+  debugPrintf("ES8388 mic hardware=clean muse-radio baseline\n");
+#endif
+}
+
+void ES8388_ApplyMicHardwareMuseLibrary()
+{
+#if ENABLE_USB_MIC
+  currentMicPgaGain = 8;
+  ES8388_ApplyMicHardwareClean();
+  ES8388_SetMicPgaGain(8);
+  ES8388_ApplyMicProcessingProfile(MIC_PROFILE_MUSE_VOICE);
+  debugPrintf("ES8388 mic hardware=exact Muse_library S3 baseline\n");
+#endif
+}
+
+void ES8388_ApplyMicHardwarePrevious()
+{
+#if ENABLE_USB_MIC
+  ES8388_SetMicAdcPower(0x00);
+  ES8388_SetMicPgaGain(currentMicPgaGain);
+  ES8388_SetMicRoute(0xfc, 0x02, "previous differential stereo");
+  ES8388_SetMicAdcFormat(0x10, "previous 32-bit slot");
+  ES8388_Write_Reg(0x0d, 0x02);
+  ES8388_SetMicPhaseHpf(0x70, "previous right inverted, hpf on");
+  ES8388_Write_Reg(0x10, 0x00);
+  ES8388_Write_Reg(0x11, 0x00);
+  debugPrintf("ES8388 mic hardware=previous baseline\n");
+#endif
+}
+
+void ES8388_ApplyMicProcessingProfile(uint8_t profile)
+{
+#if ENABLE_USB_MIC
+  currentMicProfile = profile;
+  ES8388_SetMicPgaGain(currentMicPgaGain);
+
+  switch (profile) {
+    case MIC_PROFILE_NATURAL:
+      // Natural capture: fixed analog gain, high-pass filters on, no ALC pumping
+      // and no noise gate muting. This is the default USB microphone profile.
+      ES8388_Write_Reg(0x12, 0x38); // ALC off, ALC gain bounds left at datasheet default.
+      ES8388_Write_Reg(0x13, 0xb0); // Datasheet default; ignored while ALC is off.
+      ES8388_Write_Reg(0x14, 0x32); // Datasheet default; ignored while ALC is off.
+      ES8388_Write_Reg(0x15, 0x06); // Default ALC mode/window; ignored while ALC is off.
+      ES8388_Write_Reg(0x16, 0x00); // Noise gate disabled.
+      break;
+
+    case MIC_PROFILE_VOICE:
+      // Gentle voice control: stereo ALC, lower target, slower ramps, no noise gate.
+      ES8388_Write_Reg(0x12, 0xe2); // ALC stereo, max PGA +17.5 dB, min 0 dB.
+      ES8388_Write_Reg(0x13, 0x54); // Target about -9 dBFS, hold around tens of ms.
+      ES8388_Write_Reg(0x14, 0x66); // Slower decay/attack than the previous fast profile.
+      ES8388_Write_Reg(0x15, 0x0f); // Larger peak detector window, zero-cross off.
+      ES8388_Write_Reg(0x16, 0x00); // Noise gate disabled.
+      break;
+
+    case MIC_PROFILE_GATE:
+      // Diagnostic only: close to the old aggressive profile, useful for A/B testing.
+      ES8388_Write_Reg(0x12, 0xe2);
+      ES8388_Write_Reg(0x13, 0xa0);
+      ES8388_Write_Reg(0x14, 0x12);
+      ES8388_Write_Reg(0x15, 0x06);
+      ES8388_Write_Reg(0x16, 0xc3);
+      break;
+
+    case MIC_PROFILE_MUSE_VOICE:
+      // Profile used by Muse_library for Muse Radio S3 voice examples.
+      ES8388_Write_Reg(0x12, 0xf8);
+      ES8388_Write_Reg(0x13, 0x30);
+      ES8388_Write_Reg(0x14, 0x57);
+      ES8388_Write_Reg(0x15, 0x06);
+      ES8388_Write_Reg(0x16, 0x89);
+      break;
+
+    case MIC_PROFILE_SOFT_GATE:
+      // Light codec gate: low threshold and hold-gain behavior, not the old
+      // aggressive mute gate. Keep USB soft gate enabled for the final cleanup.
+      ES8388_Write_Reg(0x12, 0xe2);
+      ES8388_Write_Reg(0x13, 0x54);
+      ES8388_Write_Reg(0x14, 0x66);
+      ES8388_Write_Reg(0x15, 0x06);
+      ES8388_Write_Reg(0x16, 0x5b);
+      break;
+
+    case MIC_PROFILE_AUTO_LEVEL:
+      // Default capture profile: light ALC to lift quiet speech and tame loud
+      // speech, with slow ramps and no codec noise gate.
+      ES8388_Write_Reg(0x12, 0xe2);
+      ES8388_Write_Reg(0x13, 0x64);
+      ES8388_Write_Reg(0x14, 0x77);
+      ES8388_Write_Reg(0x15, 0x0f);
+      ES8388_Write_Reg(0x16, 0x00);
+      break;
+  }
+
+  debugPrintf("ES8388 mic profile=%s\n", ES8388_MicProfileName(profile));
+  ES8388_Dump_ADC_Regs();
+#else
+  (void)profile;
+#endif
+}
+
+bool parseDebugByte(String text, uint8_t *out)
+{
+  if (!out) return false;
+  text.trim();
+  if (!text.length()) return false;
+  char *endPtr = nullptr;
+  const long value = strtol(text.c_str(), &endPtr, 0);
+  if (endPtr == text.c_str() || value < 0 || value > 255) return false;
+  *out = (uint8_t)value;
+  return true;
+}
+
+void printMicDebugHelp()
+{
+  debugPrintf("USB debug commands:\n");
+  debugPrintf("  mic clean     -> Muse Radio differential baseline, ALC off, gate off\n");
+  debugPrintf("  mic muse      -> exact Muse_library S3 codec profile\n");
+  debugPrintf("  mic previous  -> previous 32-bit/right-inverted baseline\n");
+  debugPrintf("  mic natural   -> fixed gain, ALC off, noise gate off\n");
+  debugPrintf("  mic auto      -> light auto-level control, no codec gate\n");
+  debugPrintf("  mic voice     -> gentle ALC, no noise gate\n");
+  debugPrintf("  mic musevoice -> Muse_library ALC profile\n");
+  debugPrintf("  mic softgate  -> gentle ALC + light codec gate\n");
+  debugPrintf("  mic gate      -> old aggressive gate profile for comparison\n");
+  debugPrintf("  mic usbgate on|off|<open> <close> -> light USB idle gate\n");
+  debugPrintf("  mic gain 0..8 -> set ES8388 ADC PGA index, current default 7\n");
+  debugPrintf("  mic bias on|off -> set ADCPOWER 0x00 or 0x09\n");
+  debugPrintf("  mic route diff|line1|line2 -> input mux test\n");
+  debugPrintf("  mic fmt 16|32 -> ADC serial word length test\n");
+  debugPrintf("  mic phase normal|invr|invl|invboth -> ADC polarity test\n");
+  debugPrintf("  mic hpf on|off -> ADC high-pass filter test\n");
+  debugPrintf("  mic reg <reg> <value> -> raw ES8388 write, decimal or 0xNN\n");
+  debugPrintf("  mic regs      -> dump ES8388 registers 00..16\n");
+  debugPrintf("  bootloader    -> reboot to ESP32-S3 bootloader\n");
+}
+
+extern "C" void muse_usb_debug_command(const char *command)
+{
+  if (!command) return;
+  String cmd(command);
+  cmd.trim();
+  cmd.toLowerCase();
+  if (!cmd.length()) return;
+
+  if (cmd == "help" || cmd == "mic help") {
+    printMicDebugHelp();
+  } else if (cmd == "mic clean" || cmd == "mic hw clean" || cmd == "mic radio clean") {
+    currentMicPgaGain = 7;
+    ES8388_ApplyMicHardwareClean();
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_NATURAL);
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic muse" || cmd == "mic radio" || cmd == "mic hw muse") {
+    ES8388_ApplyMicHardwareMuseLibrary();
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic previous" || cmd == "mic old" || cmd == "mic hw previous") {
+    ES8388_ApplyMicHardwarePrevious();
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic natural" || cmd == "mic profile natural" || cmd == "mic alc off") {
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_NATURAL);
+  } else if (cmd == "mic auto" || cmd == "mic autolevel" || cmd == "mic alc auto") {
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_AUTO_LEVEL);
+  } else if (cmd == "mic voice" || cmd == "mic profile voice" || cmd == "mic alc gentle") {
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_VOICE);
+  } else if (cmd == "mic musevoice" || cmd == "mic muse voice" || cmd == "mic profile muse") {
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_MUSE_VOICE);
+  } else if (cmd == "mic softgate" || cmd == "mic soft gate" || cmd == "mic profile softgate") {
+    usbAudioSetMicNoiseGate(true);
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_SOFT_GATE);
+  } else if (cmd == "mic gate" || cmd == "mic profile gate") {
+    ES8388_ApplyMicProcessingProfile(MIC_PROFILE_GATE);
+  } else if (cmd == "mic usbgate on" || cmd == "mic usb gate on") {
+    usbAudioSetMicNoiseGate(true);
+  } else if (cmd == "mic usbgate off" || cmd == "mic usb gate off") {
+    usbAudioSetMicNoiseGate(false);
+  } else if (cmd.startsWith("mic usbgate ")) {
+    String args = cmd.substring(12);
+    args.trim();
+    const int split = args.indexOf(' ');
+    if (split > 0) {
+      const int openThreshold = args.substring(0, split).toInt();
+      const int closeThreshold = args.substring(split + 1).toInt();
+      usbAudioSetMicNoiseGateThresholds((uint16_t)openThreshold, (uint16_t)closeThreshold);
+      usbAudioSetMicNoiseGate(true);
+    } else {
+      debugPrintf("Usage: mic usbgate <open> <close>, example: mic usbgate 500 220\n");
+    }
+  } else if (cmd == "mic bias on") {
+    ES8388_SetMicAdcPower(0x00);
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic bias off") {
+    ES8388_SetMicAdcPower(0x09);
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic route diff" || cmd == "mic route differential") {
+    ES8388_SetMicRoute(0xfc, 0x02, "muse differential stereo");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic route line1" || cmd == "mic route lin1") {
+    ES8388_SetMicRoute(0x00, 0x02, "single-ended line1");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic route line2" || cmd == "mic route lin2") {
+    ES8388_SetMicRoute(0x50, 0x02, "single-ended line2");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic fmt 16" || cmd == "mic format 16") {
+    ES8388_SetMicAdcFormat(0x0c, "muse 16-bit i2s");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic fmt 32" || cmd == "mic format 32") {
+    ES8388_SetMicAdcFormat(0x10, "32-bit slot");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic phase normal") {
+    ES8388_SetMicPhaseHpf(0x30, "normal phase, hpf on");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic phase invr" || cmd == "mic phase invert-r" || cmd == "mic phase right") {
+    ES8388_SetMicPhaseHpf(0x70, "right inverted, hpf on");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic phase invl" || cmd == "mic phase invert-l" || cmd == "mic phase left") {
+    ES8388_SetMicPhaseHpf(0xb0, "left inverted, hpf on");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic phase invboth" || cmd == "mic phase invert-both") {
+    ES8388_SetMicPhaseHpf(0xf0, "both inverted, hpf on");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic hpf on") {
+    ES8388_SetMicPhaseHpf((uint8_t)((currentMicAdcControl6 & 0xc0) | 0x30), "hpf on");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic hpf off") {
+    ES8388_SetMicPhaseHpf((uint8_t)(currentMicAdcControl6 & 0xc0), "hpf off");
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd == "mic regs" || cmd == "mic status") {
+    debugPrintf("ES8388 mic profile=%s pga_index=%u adc_power=0x%02X route=0x%02X/0x%02X fmt=0x%02X phase_hpf=0x%02X\n",
+                ES8388_MicProfileName(currentMicProfile),
+                (unsigned)currentMicPgaGain,
+                currentMicAdcPower,
+                currentMicAdcControl2,
+                currentMicAdcControl3,
+                currentMicAdcFormat,
+                currentMicAdcControl6);
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd.startsWith("mic gain ")) {
+    int gain = cmd.substring(9).toInt();
+    if (gain < 0) gain = 0;
+    if (gain > 8) gain = 8;
+    ES8388_SetMicPgaGain((uint8_t)gain);
+    ES8388_Dump_ADC_Regs();
+  } else if (cmd.startsWith("mic reg ")) {
+    const int split = cmd.indexOf(' ', 8);
+    if (split > 0) {
+      uint8_t reg = 0;
+      uint8_t val = 0;
+      if (parseDebugByte(cmd.substring(8, split), &reg) && parseDebugByte(cmd.substring(split + 1), &val)) {
+        ES8388_Write_Reg(reg, val);
+        debugPrintf("ES8388 raw write reg 0x%02X = 0x%02X\n", reg, val);
+        ES8388_Dump_ADC_Regs();
+      } else {
+        debugPrintf("Usage: mic reg <reg> <value>, example: mic reg 0x03 0x09\n");
+      }
+    } else {
+      debugPrintf("Usage: mic reg <reg> <value>, example: mic reg 0x03 0x09\n");
+    }
+  } else {
+    debugPrintf("Unknown USB debug command: %s\n", command);
+    printMicDebugHelp();
+  }
 }
 
 //////////////////////////////////////////////////////////////////
@@ -394,25 +787,9 @@ int ES8388_Init(void)
   ES8388_Write_Reg(3, 0xFF);
 
 
-  // ADC PGA +21 dB. The +24 dB setting worked but raised the mic noise floor.
-  ES8388_Write_Reg(9, 0x77);
-
-
-  // Two differential microphone pairs: LADC = LIN1-RIN1, RADC = LIN2-RIN2.
-  ES8388_Write_Reg(10, 0xFC);
-  ES8388_Write_Reg(11, 0x02);
-
-
-  //Select LIN2and RIN2 as differential input pairs
-  //ES8388_Write_Reg(11,0x82);
-
-  // ADC I2S, 32-bit serial slot. USB still exports the top 16 bits as PCM16.
-  ES8388_Write_Reg(12, 0x10);
-  //MCLK 256
-  ES8388_Write_Reg(13, 0x02);
-  // Keep ADC high-pass filters enabled and invert RADC polarity. The Muse Radio
-  // differential mic pairs are opposite in phase when captured as stereo.
-  ES8388_Write_Reg(14, 0x70);
+  // Muse Radio S3 baseline from Muse_library: two differential microphone pairs,
+  // 16-bit I2S ADC serial format, HPF enabled, no polarity inversion.
+  ES8388_ApplyMicHardwareClean();
 
   // ADC Volume LADC volume = 0dB
   ES8388_Write_Reg(16, 0x00);
@@ -420,14 +797,8 @@ int ES8388_Init(void)
   // ADC Volume RADC volume = 0dB
   ES8388_Write_Reg(17, 0x00);
 
-  // Lower-noise ALC profile from the ES8388 guide: stereo, max gain +23.5 dB,
-  // min gain 0 dB, voice target, fast attack/decay, noise gate enabled.
-  ES8388_Write_Reg(0x12, 0xe2);
-  ES8388_Write_Reg(0x13, 0xa0);
-  ES8388_Write_Reg(0x14, 0x12);
-  ES8388_Write_Reg(0x15, 0x06);
-  ES8388_Write_Reg(0x16, 0xc3);
-  ES8388_Write_Reg( 0x02, 0x55); // Reg 0x16 = 0x55 (Start up DLL, STM and Digital block for recording);
+  ES8388_ApplyMicProcessingProfile(MIC_PROFILE_NATURAL);
+  ES8388_Write_Reg( 0x02, 0x55); // Start up DLL, STM and digital block for recording.
 
   // ES8388_Write_Reg(3, 0x09);
   ES8388_Write_Reg(3, 0x00);
@@ -473,7 +844,100 @@ static volatile uint32_t usbAudioRadioResumeAtMs = 0;
 static volatile bool usbAudioVolumeUpdateFromHost = false;
 static volatile bool usbDisplayPlaybackActive = false;
 static volatile uint32_t usbDisplayRadioResumeAtMs = 0;
+static volatile uint8_t localUiDisplayOverrideMask = 0;
 static bool littleFsMounted = false;
+static bool usbDisplayProfileEnabled = true;
+static RTC_NOINIT_ATTR uint32_t usbDisplayProfileRtcMagic;
+static RTC_NOINIT_ATTR uint8_t usbDisplayProfileRtcValue;
+
+static const uint8_t LOCAL_UI_CAPTIVE_PORTAL = 0x01;
+static const uint8_t LOCAL_UI_SPOTIFY = 0x02;
+static const uint8_t LOCAL_UI_AIRPLAY = 0x04;
+static const uint32_t USB_DISPLAY_PROFILE_RTC_MAGIC = 0x4d555344;
+
+extern TFT_eSPI tft;
+
+static void setLocalUiDisplayOverride(uint8_t owner, bool enabled);
+static void wakeTftBacklight();
+
+extern "C" bool muse_usb_display_profile_enabled(void)
+{
+  return usbDisplayProfileEnabled;
+}
+
+static void loadUsbDisplayProfilePreference()
+{
+  usbDisplayProfileEnabled = true;
+#if ENABLE_USB_DISPLAY
+  if (usbDisplayProfileRtcMagic == USB_DISPLAY_PROFILE_RTC_MAGIC) {
+    usbDisplayProfileEnabled = usbDisplayProfileRtcValue != 0;
+    return;
+  }
+  if (!littleFsMounted) return;
+  File f = LittleFS.open(USB_DISPLAY_PROFILE_PATH, FILE_READ);
+  if (!f) return;
+  const int value = f.read();
+  f.close();
+  usbDisplayProfileEnabled = value != '0';
+#endif
+}
+
+static void saveUsbDisplayProfilePreference(bool enabled)
+{
+  usbDisplayProfileEnabled = enabled;
+#if ENABLE_USB_DISPLAY
+  usbDisplayProfileRtcMagic = USB_DISPLAY_PROFILE_RTC_MAGIC;
+  usbDisplayProfileRtcValue = enabled ? 1 : 0;
+  if (littleFsMounted) {
+    File f = LittleFS.open(USB_DISPLAY_PROFILE_PATH, FILE_WRITE);
+    if (f) {
+      f.write((const uint8_t*)(enabled ? "1" : "0"), 1);
+      f.close();
+    }
+  }
+#endif
+}
+
+static void drawUsbDisplayProfileToggleScreen(bool enabled)
+{
+  wakeTftBacklight();
+  setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, true);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("USB display", 160, 70, 4);
+  tft.setTextColor(enabled ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+  tft.drawString(enabled ? "enabled" : "disabled", 160, 112, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Restarting USB profile...", 160, 158, 2);
+}
+
+static void toggleUsbDisplayProfileAndRestart()
+{
+#if ENABLE_USB_DISPLAY
+  const bool nextEnabled = !usbDisplayProfileEnabled;
+  saveUsbDisplayProfilePreference(nextEnabled);
+  debugPrintf("[usb-display] profile toggle: %s\n", nextEnabled ? "enabled" : "disabled");
+  drawUsbDisplayProfileToggleScreen(nextEnabled);
+  delay(900);
+  esp_restart();
+#endif
+}
+
+static void setLocalUiDisplayOverride(uint8_t owner, bool enabled)
+{
+  uint8_t mask = localUiDisplayOverrideMask;
+  if (enabled) mask |= owner;
+  else mask &= (uint8_t)~owner;
+  localUiDisplayOverrideMask = mask;
+  usbDisplaySetLocalUiOverride(mask != 0);
+}
+
+static bool localUiDisplayOverrideActive()
+{
+  return localUiDisplayOverrideMask != 0;
+}
 #if ENABLE_SPOTIFY_CONNECT
 static const int SPOTIFY_COVER_X = 12;
 static const int SPOTIFY_COVER_Y = 92;
@@ -675,6 +1139,7 @@ static String captiveApName;
 static int captiveScanCount = 0;
 static bool captiveRestartPending = false;
 static bool captiveManualFallbackRequested = false;
+static uint32_t captivePortalLastDrawMs = 0;
 
 static String htmlEscape(const String &value)
 {
@@ -1106,7 +1571,7 @@ static String captivePortalPage()
   html += F("<section id='wifi' class='panel'><h2>Wi-Fi networks</h2>");
   html += F("<form method='POST' action='/wifi/save'><label for='ssid'>Scanned network</label><select id='ssid' name='ssid'>");
   if (captiveScanCount <= 0) {
-    html += F("<option value=''>No network found</option>");
+    html += F("<option value=''>No scanned network - type SSID below</option>");
   } else {
     for (int i = 0; i < captiveScanCount; i++) {
       String ssidName = WiFi.SSID(i);
@@ -1123,7 +1588,7 @@ static String captivePortalPage()
       html += F(")</option>");
     }
   }
-  html += F("</select><label for='ssid_manual'>SSID manual optionnel</label><input id='ssid_manual' name='ssid_manual' maxlength='32' placeholder='Use this if the network is not listed'>");
+  html += F("</select><label for='ssid_manual'>Manual SSID / hidden network</label><input id='ssid_manual' name='ssid_manual' maxlength='32' placeholder='Type SSID here if scan is empty or incomplete'>");
   html += F("<label for='pwd'>Password</label><input id='pwd' name='pwd' maxlength='64' type='password' autocomplete='current-password'>");
   html += F("<div class='row'><button type='submit'>Save network</button><a href='/rescan'><button class='ghost' type='button'>Scan again</button></a></div></form>");
 
@@ -1310,6 +1775,8 @@ static void captiveHandleNotFound()
 
 static void drawCaptivePortalScreen()
 {
+  captivePortalLastDrawMs = millis();
+  wakeTftBacklight();
   tft.setRotation(1);
   tft.fillScreen(TFT_WHITE);
   tft.setTextSize(1);
@@ -1339,7 +1806,7 @@ static void drawCaptivePortalScreen()
   }
 
   tft.setTextColor(TFT_GREY, TFT_WHITE);
-  tft.drawString("Press knob: manual setup", 160, 222, 2);
+  tft.drawString("Knob=manual  Phone: 192.168.4.1", 160, 222, 2);
 }
 
 static bool captiveManualButtonPressed()
@@ -1354,16 +1821,20 @@ static void waitCaptiveManualButtonReleased()
 
 static void startWifiCaptivePortal()
 {
-  const bool displayOwnedByUsbAtStart = usbDisplayPlaybackActive || usbDisplayActive();
-  if (!displayOwnedByUsbAtStart) {
-    gpio_set_level(backLight, 1);
-    forceTftPowerOn();
-    tft.init();
-  }
+  captivePortalApReady = false;
+  captivePortalApFailed = false;
+  setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, true);
+  gpio_set_level(backLight, 1);
+  forceTftPowerOn();
+  tft.init();
   ensureLocalRadioData();
-  WiFi.disconnect(false);
+  WiFi.persistent(false);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(250);
   WiFi.mode(WIFI_AP_STA);
-  delay(200);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  delay(400);
 
   String mac = WiFi.macAddress();
   mac.replace(":", "");
@@ -1372,24 +1843,47 @@ static void startWifiCaptivePortal()
   captiveRestartPending = false;
   captiveManualFallbackRequested = false;
 
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
   WiFi.softAPConfig(captivePortalIP, captivePortalIP, IPAddress(255, 255, 255, 0));
-  bool apStarted = WiFi.softAP(captiveApName.c_str(), CAPTIVE_AP_PASSWORD);
+  bool apStarted = WiFi.softAP(captiveApName.c_str(), CAPTIVE_AP_PASSWORD, 6, false, 4);
   if (!apStarted) {
-    if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
-      tft.fillScreen(TFT_BLACK);
-      tft.setTextDatum(TC_DATUM);
-      tft.setTextColor(TFT_RED);
-      tft.drawString("WiFi setup AP failed", 160, 105, 4);
+    debugPrintf("Captive portal AP_STA start failed, retrying AP-only heap=%u internal=%u psram=%u\n",
+                ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    WiFi.mode(WIFI_OFF);
+    delay(300);
+    WiFi.mode(WIFI_AP);
+    delay(300);
+    WiFi.softAPdisconnect(true);
+    delay(100);
+    WiFi.softAPConfig(captivePortalIP, captivePortalIP, IPAddress(255, 255, 255, 0));
+    apStarted = WiFi.softAP(captiveApName.c_str(), CAPTIVE_AP_PASSWORD, 6, false, 4);
+    if (apStarted) {
+      WiFi.mode(WIFI_AP_STA);
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      delay(200);
     }
+  }
+  if (!apStarted) {
+    captivePortalApFailed = true;
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("WiFi setup AP failed", 160, 105, 4);
     delay(2000);
     captiveManualFallbackRequested = true;
+    setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, false);
     return;
   }
 
-  if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
-    drawCaptivePortalScreen();
-  }
+  drawCaptivePortalScreen();
+  captivePortalApReady = true;
   captiveScanCount = WiFi.scanNetworks(false, true);
+  drawCaptivePortalScreen();
 
   captiveDns.start(CAPTIVE_DNS_PORT, "*", captivePortalIP);
   captiveServer.on("/", HTTP_GET, captiveHandleRoot);
@@ -1410,27 +1904,30 @@ static void startWifiCaptivePortal()
   captiveServer.onNotFound(captiveHandleNotFound);
   captiveServer.begin();
 
-  printf("Captive portal started: SSID=%s PWD=%s URL=%s\n", captiveApName.c_str(), CAPTIVE_AP_PASSWORD, CAPTIVE_PORTAL_URL);
+  debugPrintf("Captive portal started: SSID=%s PWD=%s URL=%s\n", captiveApName.c_str(), CAPTIVE_AP_PASSWORD, CAPTIVE_PORTAL_URL);
 
   while (true) {
     captiveDns.processNextRequest();
     captiveServer.handleClient();
     debugAdcButtonsTick();
+    debugLogService();
+    if ((int32_t)(millis() - captivePortalLastDrawMs) > 3000) {
+      drawCaptivePortalScreen();
+    }
     if (captiveManualButtonPressed()) {
       waitCaptiveManualButtonReleased();
       captiveServer.stop();
       captiveDns.stop();
       WiFi.softAPdisconnect(true);
       captiveManualFallbackRequested = true;
+      setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, false);
       return;
     }
     if (captiveRestartPending) {
-      if (!(usbDisplayPlaybackActive || usbDisplayActive())) {
-        tft.fillScreen(TFT_NAVY);
-        tft.setTextDatum(TC_DATUM);
-        tft.setTextColor(TFT_GREEN);
-        tft.drawString("Restarting...", 160, 105, 4);
-      }
+      tft.fillScreen(TFT_NAVY);
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString("Restarting...", 160, 105, 4);
       delay(1000);
       esp_restart();
     }
@@ -1450,11 +1947,30 @@ static void captivePortalTask(void*)
 static void startWifiCaptivePortalBackground()
 {
   if (captivePortalTaskH || captivePortalTaskActive) return;
-  const BaseType_t rc = xTaskCreatePinnedToCore(captivePortalTask, "wifi_portal", 8192,
+  captivePortalApReady = false;
+  captivePortalApFailed = false;
+  const BaseType_t rc = xTaskCreatePinnedToCore(captivePortalTask, "wifi_portal", 12288,
                                                 nullptr, 2, &captivePortalTaskH, 1);
   if (rc != pdPASS) {
     captivePortalTaskH = nullptr;
-    Serial.printf("Captive portal task create failed rc=%ld\n", (long)rc);
+    debugPrintf("Captive portal task create failed rc=%ld\n", (long)rc);
+  }
+}
+
+static void waitCaptivePortalStartup(uint32_t timeoutMs)
+{
+  const uint32_t startMs = millis();
+  while (!captivePortalApReady && !captivePortalApFailed &&
+         (int32_t)(millis() - startMs) < (int32_t)timeoutMs) {
+    debugLogService();
+    delay(20);
+  }
+  if (captivePortalApReady) {
+    debugPrintf("Captive portal AP ready; continuing remaining services\n");
+  } else if (captivePortalApFailed) {
+    debugPrintf("Captive portal AP failed before remaining services\n");
+  } else {
+    debugPrintf("Captive portal AP startup wait timed out; continuing remaining services\n");
   }
 }
 
@@ -2286,6 +2802,7 @@ static void handleAirPlayEvent(AirPlayEvent event, uint32_t value, const char* t
     case AirPlayEvent::Active:
       airPlayPlaybackActive = true;
       airPlayRadioResumeAtMs = 0;
+      setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, true);
       audio.stopSong();
       connected = false;
       refreshVolume();
@@ -2298,8 +2815,10 @@ static void handleAirPlayEvent(AirPlayEvent event, uint32_t value, const char* t
       clearAirPlayMetadata();
       refreshVolume();
       drawAirPlayStatus(text ? text : "Radio resumes...");
+      setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, false);
       break;
     case AirPlayEvent::Metadata:
+      setLocalUiDisplayOverride(LOCAL_UI_AIRPLAY, true);
       updateAirPlayMetadata(text);
       drawAirPlayStatus(nullptr);
       break;
@@ -2336,6 +2855,7 @@ static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value,
     case SpotifyConnectEvent::Active:
       spotifyPlaybackActive = true;
       spotifyRadioResumeAtMs = 0;
+      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
       audio.stopSong();
       connected = false;
       refreshVolume();
@@ -2343,6 +2863,7 @@ static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value,
       break;
     case SpotifyConnectEvent::Paused:
       spotifyPlaybackActive = true;
+      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
       refreshVolume();
       drawSpotifyStatus(text ? text : "Spotify paused");
       break;
@@ -2353,8 +2874,10 @@ static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value,
       clearSpotifyTrackMetadata();
       refreshVolume();
       drawSpotifyStatus(text ? text : "Radio resumes...");
+      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, false);
       break;
     case SpotifyConnectEvent::Track:
+      setLocalUiDisplayOverride(LOCAL_UI_SPOTIFY, true);
       updateSpotifyTrackMetadata(text);
       drawSpotifyStatus(nullptr);
       break;
@@ -2974,6 +3497,101 @@ void settingsDisplay(int pos)
   if (pos == 1)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
   tft.drawString("- Dismiss", 10, 140, 4);
 }
+
+static bool editWifiSsidOnDevice(char* out, size_t outSize)
+{
+  if (!out || outSize == 0) return false;
+  out[0] = 0;
+
+  const char charSet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
+  const int charSetLength = strlen(charSet);
+  const int okIndex = charSetLength - 1;
+  char selectedChar[2] = {0};
+  int pl = 0;
+  int previousPl = -1;
+
+  headerL("SETTINGS", "Manual WiFi SSID", TFT_NAVY);
+  tft.setTextColor(TFT_RED);
+  tft.setTextDatum(TC_DATUM);
+  tft.setFreeFont(FSB9);
+  tft.drawString("Click=add  2=delete  3=done", 160, 60, GFXFF);
+  staEncoder.setCount(0);
+
+  while (true)
+  {
+    tft.fillRect(0, 80, 320, 82, TFT_NAVY);
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(FSB12);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("ssid:", 20, 86, GFXFF);
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString(out, 82, 86, GFXFF);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_GREY);
+    tft.drawString("Use exact case for hidden networks", 160, 136, 2);
+
+    while ((gpio_get_level(CLICK2) == 1) && (button_get_level(sw1) == 1) && (button_get_level(sw3) == 1))
+    {
+      pl = staEncoder.getCount() / 2;
+      if (pl < 0) {
+        pl = 0;
+        staEncoder.setCount(0);
+      }
+      if (pl > okIndex) {
+        pl = okIndex;
+        staEncoder.setCount(pl * 2);
+      }
+
+      selectedChar[0] = (pl != okIndex) ? charSet[pl] : 'X';
+      if (pl != previousPl)
+      {
+        previousPl = pl;
+        tft.fillRect(100, 170, 120, 40, TFT_NAVY);
+        for (int i = -2; i <= 2; i++) {
+          int index = (pl + i + charSetLength) % charSetLength;
+          int xPos = 160 + i * 25;
+          int yPos = 180;
+          int textSize = (i == 0) ? 4 : 2;
+          if (index == okIndex) {
+            tft.setTextColor(TFT_GREEN);
+            tft.drawString("ok", xPos - 10, yPos, textSize);
+          } else {
+            tft.setTextColor((i == 0) ? TFT_YELLOW : TFT_WHITE);
+            tft.drawChar(charSet[index], xPos, yPos, textSize);
+          }
+        }
+      }
+      delay(80);
+    }
+
+    if (gpio_get_level(CLICK2) == 0)
+    {
+      if (pl == okIndex) {
+        while (gpio_get_level(CLICK2) == 0) delay(10);
+        return strlen(out) > 0;
+      }
+      size_t len = strlen(out);
+      if (len + 1 < outSize) {
+        out[len] = selectedChar[0];
+        out[len + 1] = 0;
+      }
+      while (gpio_get_level(CLICK2) == 0) delay(10);
+    }
+
+    if (button_get_level(sw1) == 0)
+    {
+      size_t len = strlen(out);
+      if (len > 0) out[len - 1] = 0;
+      while (button_get_level(sw1) == 0) delay(10);
+    }
+
+    if (button_get_level(sw3) == 0)
+    {
+      while (button_get_level(sw3) == 0) delay(10);
+      return strlen(out) > 0;
+    }
+  }
+}
 ///////////////////////////////////////////////////////////////////////
 // settings init
 ///////////////////////////////////////////////////////////////////////
@@ -3043,46 +3661,52 @@ void settings(void)
     WiFi.disconnect();
     delay(500);
 
+    WiFi.scanDelete();
     int nSsid = WiFi.scanNetworks();
     printf("ssid# %d\n", nSsid);
-    if (nSsid <= 0) {
-      tft.fillRect(0, 70, 320, 140, TFT_NAVY);
-      tft.setTextColor(TFT_RED);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString("No WiFi network found", 160, 105, 4);
-      tft.setTextColor(TFT_YELLOW);
-      tft.drawString("Use the web portal manual SSID", 160, 145, 2);
-      delay(2500);
-      captiveManualFallbackRequested = false;
-      startWifiCaptivePortal();
-      return;
-    }
-    if (nSsid > 6) nSsid = 6;
+    if (nSsid < 0) nSsid = 0;
+    if (nSsid > 5) nSsid = 5;
+    const int manualIndex = nSsid;
     j = 0;
     staEncoder.setCount(0);
     while (gpio_get_level(CLICK2) == 1)
     {
-      for (int i = 0; i < nSsid; i++)
+      j = staEncoder.getCount() / 2;
+      if (j > manualIndex) {
+        j = manualIndex;
+        staEncoder.setCount(j * 2);
+      }
+      if (j < 0) {
+        j = 0;
+        staEncoder.setCount(0);
+      }
+
+      tft.fillRect(0, 78, 320, 150, TFT_NAVY);
+      for (int i = 0; i <= manualIndex; i++)
       {
-        j = staEncoder.getCount() / 2;
-        if (j > (nSsid - 1)) {
-          j = nSsid - 1;
-          staEncoder.setCount(j);
-        }
-        if (j < 0) {
-          j = 0;
-          staEncoder.setCount(j);
-        }
         printf("j = %d\n", j);
         tft.setTextDatum(TL_DATUM);
         if (i == j)tft.setTextColor(TFT_GREEN); else tft.setTextColor(TFT_WHITE);
         tft.setFreeFont(FSB12);
-        snprintf(s, sizeof(s), "%d- %s", i + 1, WiFi.SSID(i).c_str());
+        if (i == manualIndex) {
+          snprintf(s, sizeof(s), "%d- Manual SSID", i + 1);
+        } else {
+          snprintf(s, sizeof(s), "%d- %s", i + 1, WiFi.SSID(i).c_str());
+        }
         tft.drawString(s, 20, 80 + i * 25, GFXFF);
       }
       delay(100);
     }
-    strcpy((char*)ssid, WiFi.SSID(j).c_str());
+    while (gpio_get_level(CLICK2) == 0) delay(10);
+    if (j == manualIndex) {
+      if (!editWifiSsidOnDevice((char*)ssid, sizeof(ssid))) {
+        captiveManualFallbackRequested = false;
+        startWifiCaptivePortal();
+        return;
+      }
+    } else {
+      strcpy((char*)ssid, WiFi.SSID(j).c_str());
+    }
     printf("ssid = %s\n", ssid);
     // Keep legacy file for compatibility but main storage is wifi.json
     ln = LittleFS.open("/ssid", FILE_WRITE);
@@ -3310,10 +3934,20 @@ void setup() {
 #if !ENABLE_USB_AUDIO
   USBSerial.begin(115200);
 #endif
-  printf("PSRAM: %s, size=%u, free=%u\n",
-         psramFound() ? "yes" : "no",
-         (unsigned)ESP.getPsramSize(),
-         (unsigned)ESP.getFreePsram());
+  debugPrintf("Boot reset_reason=%d heap=%u internal=%u psram=%u\n",
+              (int)esp_reset_reason(),
+              (unsigned)ESP.getFreeHeap(),
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+              (unsigned)ESP.getFreePsram());
+  debugPrintf("PSRAM: %s, size=%u, free=%u\n",
+              psramFound() ? "yes" : "no",
+              (unsigned)ESP.getPsramSize(),
+              (unsigned)ESP.getFreePsram());
+
+  loadUsbDisplayProfilePreference();
+#if ENABLE_USB_AUDIO
+  usbAudioStartUsbDebugOnly();
+#endif
 
 #if !ENABLE_USB_AUDIO
   // Start the Improv Wi-Fi over Serial task immediately
@@ -3415,11 +4049,11 @@ void setup() {
     ln.read(&mode, 1);
     ln.close();
   }
-  printf("mode = %c\n", mode);
+  debugPrintf("mode = %c\n", mode);
   //////////////////////////////////////////////////////
   //Screen init
   //////////////////////////////////////////////////////
-  printf("screen init...\n");
+  debugPrintf("screen init...\n");
   //  tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_WHITE);
@@ -3428,13 +4062,19 @@ void setup() {
   tft.drawString(version, 280, 220, 2);
   delay(2000);
 
-  // Initialize USB Audio before Wi-Fi so Windows sees the sound card even if setup enters the captive portal.
+  bool usbAudioStartedEarly = false;
+#if ENABLE_USB_AUDIO
+  debugPrintf("Starting USB audio/debug before WiFi portal\n");
   initAudioHardware();
+#if ENABLE_USB_DISPLAY
   usbDisplayBegin(tft, handleUsbDisplayEvent);
+#endif
   usbAudioBegin(audio, handleUsbAudioEvent);
+  usbAudioStartedEarly = true;
+#endif
 
   {
-    printf("WiFi\n");
+    debugPrintf("WiFi\n");
     gpio_set_level(EN_4G, 0);
   }
   ////////////////////////////////////////////////
@@ -3442,13 +4082,14 @@ void setup() {
   ////////////////////////////////////////////////
   started = false;
   bool wifiSetupPortalNeeded = false;
+  WiFi.useStaticBuffers(true);
+  WiFi.persistent(false);
   WifiCred wifiList[WIFI_MAX_NETWORKS];
   int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
   if (wifiCount == 0) {
-    printf("No WiFi credentials; starting background portal and continuing USB services\n");
+    debugPrintf("No WiFi credentials; starting background portal and continuing USB services\n");
     wifiSetupPortalNeeded = true;
   } else {
-    WiFi.useStaticBuffers(true);
     WiFi.mode(WIFI_STA);
     wifiMultiFromList(wifiMulti, wifiList, wifiCount);
     //   wifiMulti.run();
@@ -3461,7 +4102,7 @@ void setup() {
     USBSerial.print(" ");
     USBSerial.println(WiFi.RSSI());
 #else
-    printf("WiFi connected: %s %d\n", WiFi.SSID().c_str(), WiFi.RSSI());
+    debugPrintf("WiFi connected: %s %d\n", WiFi.SSID().c_str(), WiFi.RSSI());
 #endif
     started = true;
 
@@ -3476,17 +4117,29 @@ void setup() {
   }
   else {
     if (!wifiSetupPortalNeeded) {
-      Serial.println("WiFi not connected; starting background portal and continuing USB services");
+      debugPrintf("WiFi not connected; starting background portal and continuing USB services\n");
       wifiSetupPortalNeeded = true;
     }
   }
 
+  if (wifiSetupPortalNeeded) {
+    startWifiCaptivePortalBackground();
+    waitCaptivePortalStartup(6000);
+  }
 
   //  delay(2000);
   ///////////////////////////////////////////////////////////////
   // Audio init
   //////////////////////////////////////////////////////////////
   initAudioHardware();
+  usbDisplayBegin(tft, handleUsbDisplayEvent);
+#if ENABLE_USB_AUDIO
+  if (!usbAudioStartedEarly) {
+    usbAudioBegin(audio, handleUsbAudioEvent);
+  }
+#else
+  (void)usbAudioStartedEarly;
+#endif
 
   ///////////////////////////////////////////////////////////////
   // recovering params (station & vol)
@@ -3532,8 +4185,12 @@ void setup() {
   volEncoder.setCount(V);
   PV = V;
   refreshVolume();
-  spotifyConnectBegin(audio, handleSpotifyConnectEvent);
-  airPlayBegin(audio, handleAirPlayEvent);
+  if (started && WiFi.status() == WL_CONNECTED) {
+    spotifyConnectBegin(audio, handleSpotifyConnectEvent);
+    airPlayBegin(audio, handleAirPlayEvent);
+  } else {
+    debugPrintf("WiFi offline; delaying Spotify/AirPlay until credentials are configured\n");
+  }
   // station encoder init
   staEncoder.setCount(station * 2);
   S = VS = station * 2;
@@ -3541,23 +4198,25 @@ void setup() {
   ////////////////////////////////////////////////////////////////
   // draw "wallpaper screen" and internet
   ////////////////////////////////////////////////////////////////
-  tft.setRotation(2);
-  tft.fillScreen(TFT_BLACK);
-  drawImage("/screenV.png", 0, 5);
-  tft.setRotation(1);
-  tft.fillCircle(50, 50, 40, TFT_BLACK);
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextDatum(TC_DATUM);
-  // tft.fillCircle(50, 35, 18, TFT_WHITE);
-  //tft.fillCircle(50, 35, 16, TFT_BLACK);
-  tft.drawCircle(50, 35, 18, TFT_WHITE);
-  if (mode == '0')  tft.drawString("4G", 50, 27, 2);
-  else tft.drawString("WiFi", 50, 27, 2);
+  if (!(wifiSetupPortalNeeded && captivePortalApReady)) {
+    tft.setRotation(2);
+    tft.fillScreen(TFT_BLACK);
+    drawImage("/screenV.png", 0, 5);
+    tft.setRotation(1);
+    tft.fillCircle(50, 50, 40, TFT_BLACK);
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextDatum(TC_DATUM);
+    // tft.fillCircle(50, 35, 18, TFT_WHITE);
+    //tft.fillCircle(50, 35, 16, TFT_BLACK);
+    tft.drawCircle(50, 35, 18, TFT_WHITE);
+    if (mode == '0')  tft.drawString("4G", 50, 27, 2);
+    else tft.drawString("WiFi", 50, 27, 2);
 
-  tft.setTextColor(TFT_GREY, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
-  tft.drawString("1-Settings portal", 20, 220, 2);
-  tft.drawString(version, 280, 220, 2);
+    tft.setTextColor(TFT_GREY, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
+    tft.drawString("1-Settings portal", 20, 220, 2);
+    tft.drawString(version, 280, 220, 2);
+  }
   toDisplay = 0;
   displayON();
   Bdonate = false;
@@ -3576,24 +4235,36 @@ void setup() {
   xTaskCreatePinnedToCore(remote, "remote", 5000, NULL, 5, &remoteH, 1);
   // Task managing display turn on:turn off
   xTaskCreatePinnedToCore(displayONOFF, "displayONOFF", 5000, NULL, 5, &displayONOFFH, 1);
-  if (wifiSetupPortalNeeded) {
-    startWifiCaptivePortalBackground();
-  }
 }
 
 
 void loop() {
 
+  debugLogService();
 
   if (consumeAdcButtonEvent(sw0))
   {
-    if (BSettings == false) enterSettingsFromButton();
-    else printf("ADC action button1 ignored: settings already active\n");
+    if (captivePortalApReady) {
+      setLocalUiDisplayOverride(LOCAL_UI_CAPTIVE_PORTAL, true);
+      drawCaptivePortalScreen();
+    } else if (BSettings == false) {
+      enterSettingsFromButton();
+    } else {
+      printf("ADC action button1 ignored: settings already active\n");
+    }
   }
 
   serviceSpotifyCoverDisplay();
   debugAdcButtonsTick();
   const bool usbDisplayBusy = usbDisplayPlaybackActive || usbDisplayActive();
+
+#if ENABLE_USB_DISPLAY
+  if (CLICK2B && !BSettings && !modSta && (usbDisplayBusy || !usbDisplayProfileEnabled))
+  {
+    CLICK2B = false;
+    toggleUsbDisplayProfileAndRestart();
+  }
+#endif
 
   //////////////////////////////////////////////////////////////////////
   // Volume via encoder

@@ -31,6 +31,8 @@
 - Increased USB speaker buffering for display jitter and kept PCM unattenuated so USB audio quality depends on ES8388 codec gain, not software volume.
 - Fixed first boot with no saved Wi-Fi credentials in the USB display POC by starting the captive portal in the background, so USB display/audio can enumerate without the setup path blocking or reboot-looping.
 - Renamed the USB product, UAC control interface, speaker stream, and microphone stream to `Muse Radio`, and bumped the USB descriptor serial suffix to `A441M4` so Windows re-enumerates the updated names.
+- Merged Spotify Connect and experimental AirPlay 1/RAOP into the USB display POC environment so one firmware can expose USB display, USB speaker, USB microphone, Spotify, AirPlay, and internet radio together.
+- Restored captive-portal QR display priority in the USB display POC: the portal now always draws the real Wi-Fi QR code on the TFT, and USB display frames are suppressed while the portal, Spotify, or AirPlay local screens are active.
 
 ## 1.7 - 2026-05-07
 

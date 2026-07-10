@@ -44,6 +44,7 @@ For installation or usage issues, open an issue on [GitHub](https://github.com/R
 - USB IDs for this POC: VID `0x303A`, PID `0x2986`.
 - Vendor interface string: `esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536`.
 - Windows speaker and microphone endpoints are both advertised as `Muse Radio`.
+- Spotify Connect and experimental AirPlay 1/RAOP are enabled in this merged POC alongside USB display, USB speaker, and USB microphone.
 - Audio remains PCM stereo, 16-bit, 44.1 kHz, through the ES8388 codec path.
 - USB microphone input is enabled as a stereo 16-bit / 44.1 kHz UAC source. The two Muse Radio differential microphone channels are captured from the ES8388 ADC over I2S `DIN GPIO4`.
 - The ES8388 microphone path keeps two-pair differential routing, inverts the right ADC channel to align stereo phase, uses 32-bit ADC serial slots on the shared I2S clock, and logs ADC registers at boot for validation.
@@ -55,6 +56,7 @@ For installation or usage issues, open an issue on [GitHub](https://github.com/R
 - The firmware does not draw local USB status text over the Windows-rendered frame in this POC.
 - Backlight sleep is disabled in all modes on this experimental branch.
 - First boot without saved Wi-Fi credentials keeps the USB display/audio runtime alive and starts the captive portal in the background instead of blocking setup.
+- The captive Wi-Fi portal, Spotify, and AirPlay screens temporarily own the TFT; USB display frames are dropped while those local screens are active so the QR code and playback metadata remain visible.
 - The previous USB audio distortion was caused mainly by UAC cadence drift: 44.1 kHz was consumed as integer `44100 / 1000 = 44` frames/ms, effectively 44.0 kHz. The local UAC component now uses fractional frame accumulation so 10 ms consumes exactly 441 frames, keeps the default 10 ms UAC interval, and only lets display rendering proceed while the audio buffer is healthy.
 - The microphone wiring and ES8388 ADC setup are based on [RASPIAUDIO/Muse_library](https://github.com/RASPIAUDIO/Muse_library), especially the Muse Radio `museS3` and recorder examples.
 

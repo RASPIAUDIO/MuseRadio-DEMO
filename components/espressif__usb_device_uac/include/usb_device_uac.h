@@ -76,6 +76,24 @@ esp_err_t uac_device_set_mute_state(bool mute);
  */
 esp_err_t uac_device_send_hid_consumer_control(uint16_t usage);
 
+/**
+ * @brief Write diagnostic bytes to the optional USB CDC debug interface.
+ *
+ * This is non-blocking: it writes only what TinyUSB can currently accept.
+ *
+ * @param data Bytes to write.
+ * @param len Number of bytes to write.
+ * @param written Optional number of bytes accepted by TinyUSB.
+ * @return ESP_OK when at least one byte was queued, ESP_ERR_INVALID_STATE if
+ *         CDC is unavailable/not connected, ESP_ERR_TIMEOUT if no TX space.
+ */
+esp_err_t uac_device_debug_cdc_write(const uint8_t *data, size_t len, size_t *written);
+
+/**
+ * @brief Return true when the optional CDC debug interface is connected.
+ */
+bool uac_device_debug_cdc_connected(void);
+
 #ifdef __cplusplus
 }
 #endif

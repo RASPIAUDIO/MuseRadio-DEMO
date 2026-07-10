@@ -5,7 +5,7 @@ idf_component_register(
   INCLUDE_DIRS "." "generated"
 )
 
-if(NOT CMAKE_BINARY_DIR MATCHES "muse_radio_spotify_poc")
+if(NOT CMAKE_BINARY_DIR MATCHES "muse_radio_spotify_poc|muse_radio_usb_display_poc")
   return()
 endif()
 

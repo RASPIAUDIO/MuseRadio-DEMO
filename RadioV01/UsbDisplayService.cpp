@@ -109,6 +109,7 @@ uint32_t s_decodeNonBlackPixels = 0;
 String s_deviceName;
 std::atomic<bool> s_started(false);
 std::atomic<bool> s_active(false);
+std::atomic<bool> s_localUiOverride(false);
 std::atomic<uint32_t> s_lastFrameMs(0);
 std::atomic<uint32_t> s_lastDrawMs(0);
 std::atomic<uint32_t> s_lastKeepaliveMs(0);
@@ -222,6 +223,11 @@ bool audioAllowsDisplayFrame()
 #endif
 }
 
+bool localUiOwnsDisplay()
+{
+  return s_localUiOverride.load();
+}
+
 void returnSlot(FrameSlot* slot)
 {
   if (!slot || !s_freeQueue) return;
@@ -292,7 +298,7 @@ void startFrame(const UsbDisplayFrameHeader& header, const uint8_t* payload, uin
   const uint32_t expected = header.payload_total;
 
   if (!supportedType || !supportedGeometry || expected == 0 ||
-      expected > FRAME_LIMIT_BYTES || !audioAllowsDisplayFrame()) {
+      expected > FRAME_LIMIT_BYTES || localUiOwnsDisplay() || !audioAllowsDisplayFrame()) {
     s_skipFrame = true;
     s_skipExpected = expected;
     s_skipReceived = payloadLen;
@@ -466,6 +472,7 @@ bool replayLastFrame(const char* reason)
 
 void keepDisplayAlive()
 {
+  if (localUiOwnsDisplay()) return;
   if (!s_active.load() || !s_lastFrameValid) return;
   const uint32_t now = millis();
   const uint32_t lastDraw = s_lastDrawMs.load();
@@ -481,6 +488,7 @@ void keepDisplayAlive()
 void drawFrame(const FrameSlot* slot)
 {
   if (!s_tft || !slot) return;
+  if (localUiOwnsDisplay()) return;
   wakePanel(false);
   s_tft->setRotation(1);
   emitActive();
@@ -670,6 +678,16 @@ bool usbDisplayActive()
   return s_active.load();
 }
 
+void usbDisplaySetLocalUiOverride(bool enabled)
+{
+  s_localUiOverride = enabled;
+}
+
+bool usbDisplayLocalUiOverride()
+{
+  return s_localUiOverride.load();
+}
+
 const char* usbDisplayDeviceName()
 {
   buildDeviceName();
@@ -694,6 +712,13 @@ String s_deviceName;
 void usbDisplayBegin(TFT_eSPI&, UsbDisplayEventHandler) {}
 
 bool usbDisplayActive()
+{
+  return false;
+}
+
+void usbDisplaySetLocalUiOverride(bool) {}
+
+bool usbDisplayLocalUiOverride()
 {
   return false;
 }

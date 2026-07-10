@@ -26,15 +26,26 @@
 
 #include "tusb.h"
 #include "uac_descriptors.h"
+#include <stdbool.h>
 
 #ifndef ENABLE_USB_DISPLAY
 #define ENABLE_USB_DISPLAY 0
 #endif
 
+#ifndef ENABLE_USB_DEBUG_CDC
+#define ENABLE_USB_DEBUG_CDC 0
+#endif
+
 #if ENABLE_USB_DISPLAY
 #define USB_DISPLAY_PID              0x2986
 #define USB_DISPLAY_VENDOR_STR       "esp32s3udisp0_R320x240_Ejpg4_Fps10_Bl65536"
+#define USB_DISPLAY_DISABLED_STR     "Muse Radio display disabled"
 #define USB_DISPLAY_PRODUCT_STR      "Muse Radio"
+
+__attribute__((weak)) bool muse_usb_display_profile_enabled(void)
+{
+    return true;
+}
 #endif
 
 #define REPORT_ID_CONSUMER_CONTROL   1
@@ -73,7 +84,14 @@ tusb_desc_device_t const desc_device = {
 // Application return pointer to descriptor
 uint8_t const *tud_descriptor_device_cb(void)
 {
+#if ENABLE_USB_DISPLAY
+    static tusb_desc_device_t runtime_desc;
+    runtime_desc = desc_device;
+    runtime_desc.idProduct = muse_usb_display_profile_enabled() ? USB_DISPLAY_PID : CONFIG_UAC_TUSB_PID;
+    return (uint8_t const *)&runtime_desc;
+#else
     return (uint8_t const *)&desc_device;
+#endif
 }
 
 //--------------------------------------------------------------------+
@@ -82,6 +100,7 @@ uint8_t const *tud_descriptor_device_cb(void)
 #define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + \
                                   CFG_TUD_VENDOR * TUD_VENDOR_DESC_LEN + \
                                   CFG_TUD_HID * TUD_HID_DESC_LEN + \
+                                  CFG_TUD_CDC * TUD_CDC_DESC_LEN + \
                                   CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN)
 #if ENABLE_USB_DISPLAY
 #define EPNUM_VENDOR      0x01
@@ -89,16 +108,24 @@ uint8_t const *tud_descriptor_device_cb(void)
 #define EPNUM_AUDIO_FB    0x82
 #define EPNUM_AUDIO_IN    0x83
 #define EPNUM_HID         0x84
+#define EPNUM_CDC_NOTIF   0x85
+#define EPNUM_CDC_OUT     0x03
+#define EPNUM_CDC_IN      0x86
 #define STR_INDEX_VENDOR  4
 #define STR_INDEX_HID     5
-#define STR_INDEX_AUDIO   6
+#define STR_INDEX_CDC     6
+#define STR_INDEX_AUDIO   (ENABLE_USB_DEBUG_CDC ? 7 : 6)
 #else
 #define EPNUM_AUDIO_OUT   0x01
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
 #define EPNUM_HID         0x83
+#define EPNUM_CDC_NOTIF   0x84
+#define EPNUM_CDC_OUT     0x02
+#define EPNUM_CDC_IN      0x85
 #define STR_INDEX_HID     4
-#define STR_INDEX_AUDIO   5
+#define STR_INDEX_CDC     5
+#define STR_INDEX_AUDIO   (ENABLE_USB_DEBUG_CDC ? 6 : 5)
 #endif
 
 uint8_t const desc_hid_report[] = {
@@ -120,6 +147,10 @@ uint8_t const desc_configuration[] = {
 #endif
     // Interface number, string index, protocol, report descriptor length, EP In address, EP size, interval
     TUD_HID_DESCRIPTOR(ITF_NUM_HID, STR_INDEX_HID, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 5),
+#if ENABLE_USB_DEBUG_CDC
+    // Interface number, string index, EP notification address and size, EP data out, EP data in, EP size
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STR_INDEX_CDC, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+#endif
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STR_INDEX_AUDIO, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
 };
@@ -150,10 +181,20 @@ char const *string_desc_arr [] = {
 #if ENABLE_USB_DISPLAY
     USB_DISPLAY_VENDOR_STR,             // 4: USB display vendor Interface
     "media keys",                       // 5: HID consumer controls
+#if ENABLE_USB_DEBUG_CDC
+    "Muse Radio Debug",                 // 6: CDC debug console
+    "Muse Radio",                       // 7: UAC control Interface
+#else
     "Muse Radio",                       // 6: UAC control Interface
+#endif
 #else
     "media keys",                   // 4: HID consumer controls
+#if ENABLE_USB_DEBUG_CDC
+    "Muse Radio Debug",             // 5: CDC debug console
+    "Muse Radio",                   // 6: UAC control Interface
+#else
     "Muse Radio",                   // 5: UAC control Interface
+#endif
 #endif
 #if SPEAK_CHANNEL_NUM
     "Muse Radio",                  // Speaker streaming interface
@@ -206,6 +247,11 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
         }
 
         const char *str = string_desc_arr[index];
+#if ENABLE_USB_DISPLAY
+        if (index == STR_INDEX_VENDOR && !muse_usb_display_profile_enabled()) {
+            str = USB_DISPLAY_DISABLED_STR;
+        }
+#endif
 
         // Cap at max char
         chr_count = (uint8_t) strlen(str);

@@ -39,6 +39,10 @@ extern "C" {
 #define ENABLE_USB_DISPLAY 0
 #endif
 
+#ifndef ENABLE_USB_DEBUG_CDC
+#define ENABLE_USB_DEBUG_CDC 0
+#endif
+
 //--------------------------------------------------------------------+
 // Board Specific Configuration
 //--------------------------------------------------------------------+
@@ -114,6 +118,14 @@ extern "C" {
 
 #define CFG_TUD_HID               1
 #define CFG_TUD_HID_EP_BUFSIZE    16
+
+#if ENABLE_USB_DEBUG_CDC
+#define CFG_TUD_CDC               1
+#define CFG_TUD_CDC_RX_BUFSIZE    512
+#define CFG_TUD_CDC_TX_BUFSIZE    1024
+#else
+#define CFG_TUD_CDC               0
+#endif
 
 #ifdef __cplusplus
 }

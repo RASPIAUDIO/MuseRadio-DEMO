@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "DebugLog.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -70,8 +71,12 @@ std::atomic<uint32_t> s_underrunCount(0);
 std::atomic<uint32_t> s_uacBytesRead(0);
 std::atomic<uint32_t> s_micBytesSent(0);
 std::atomic<uint32_t> s_micShortReads(0);
+std::atomic<uint32_t> s_micGateFrames(0);
 std::atomic<uint32_t> s_i2sWriteMaxUs(0);
 std::atomic<uint32_t> s_hostVolume(100);
+std::atomic<bool> s_micNoiseGateEnabled(true);
+std::atomic<uint32_t> s_micNoiseGateOpenThreshold(500);
+std::atomic<uint32_t> s_micNoiseGateCloseThreshold(220);
 uint8_t* s_pcmBlocks = nullptr;
 uint8_t* s_pcmWriteBuffer = nullptr;
 QueueHandle_t s_pcmFreeQueue = nullptr;
@@ -114,7 +119,7 @@ bool startEventTask()
   if (!s_eventQueue) {
     s_eventQueue = xQueueCreate(16, sizeof(QueuedEvent));
     if (!s_eventQueue) {
-      Serial.println("[usb-audio] event queue create failed");
+      debugPrintf("[usb-audio] event queue create failed\n");
       return false;
     }
   }
@@ -123,7 +128,7 @@ bool startEventTask()
                                                 nullptr, EVENT_TASK_PRIORITY,
                                                 &s_eventTask, EVENT_TASK_CORE);
   if (rc != pdPASS) {
-    Serial.printf("[usb-audio] event task create failed rc=%ld\n", (long)rc);
+    debugPrintf("[usb-audio] event task create failed rc=%ld\n", (long)rc);
     s_eventTask = nullptr;
     return false;
   }
@@ -143,7 +148,7 @@ void emit(UsbAudioEvent event, uint32_t value = 0, const char* text = nullptr)
     if (xQueueSend(s_eventQueue, &item, 0) == pdTRUE) {
       return;
     }
-    Serial.println("[usb-audio] event queue full");
+    debugPrintf("[usb-audio] event queue full\n");
   }
 
   dispatchEvent(item);
@@ -227,7 +232,7 @@ bool ensurePcmQueue()
 
   if (!s_pcmBlocks || !s_pcmWriteBuffer || !s_pcmFreeQueueStruct || !s_pcmFillQueueStruct ||
       !s_pcmFreeQueueStorage || !s_pcmFillQueueStorage) {
-    Serial.println("[usb-audio] PCM queue allocation failed");
+    debugPrintf("[usb-audio] PCM queue allocation failed\n");
     return false;
   }
 
@@ -236,7 +241,7 @@ bool ensurePcmQueue()
   s_pcmFillQueue = xQueueCreateStatic(PCM_BLOCK_COUNT, sizeof(PcmBlockRef),
                                       s_pcmFillQueueStorage, s_pcmFillQueueStruct);
   if (!s_pcmFreeQueue || !s_pcmFillQueue) {
-    Serial.println("[usb-audio] PCM queue create failed");
+    debugPrintf("[usb-audio] PCM queue create failed\n");
     return false;
   }
 
@@ -244,11 +249,78 @@ bool ensurePcmQueue()
     xQueueSend(s_pcmFreeQueue, &i, 0);
   }
 
-  Serial.printf("[usb-audio] PCM queue ready blocks=%u bytes=%u storage=%p\n",
-                (unsigned)PCM_BLOCK_COUNT,
-                (unsigned)(PCM_BLOCK_BYTES * PCM_BLOCK_COUNT),
-                (void*)s_pcmBlocks);
+  debugPrintf("[usb-audio] PCM queue ready blocks=%u bytes=%u storage=%p\n",
+              (unsigned)PCM_BLOCK_COUNT,
+              (unsigned)(PCM_BLOCK_BYTES * PCM_BLOCK_COUNT),
+              (void*)s_pcmBlocks);
   return true;
+}
+
+void applyMicNoiseGate(uint8_t* buf, size_t len)
+{
+#if ENABLE_USB_MIC
+  static int32_t gateGainQ15 = 32768;
+  static uint32_t holdFrames = 0;
+  constexpr int32_t GATE_FULL_Q15 = 32768;
+  constexpr int32_t GATE_FLOOR_Q15 = 4096; // -18 dB floor: reduce idle hiss without hard muting.
+  constexpr uint32_t GATE_HOLD_MS = 120;
+
+  if (!s_micNoiseGateEnabled.load() || !buf || len < sizeof(int16_t)) {
+    gateGainQ15 = GATE_FULL_Q15;
+    holdFrames = 0;
+    return;
+  }
+
+  const size_t sampleCount = len / sizeof(int16_t);
+  const size_t frameCount = sampleCount / CHANNELS;
+  if (sampleCount == 0 || frameCount == 0) return;
+
+  int16_t* samples = reinterpret_cast<int16_t*>(buf);
+  uint32_t peak = 0;
+  uint64_t sumAbs = 0;
+  for (size_t i = 0; i < sampleCount; i++) {
+    const int32_t value = samples[i];
+    const uint32_t absValue = (uint32_t)(value < 0 ? -value : value);
+    if (absValue > peak) peak = absValue;
+    sumAbs += absValue;
+  }
+
+  const uint32_t avgAbs = (uint32_t)(sumAbs / sampleCount);
+  uint32_t openThreshold = s_micNoiseGateOpenThreshold.load();
+  uint32_t closeThreshold = s_micNoiseGateCloseThreshold.load();
+  if (openThreshold < 50) openThreshold = 50;
+  if (closeThreshold >= openThreshold) closeThreshold = openThreshold / 2;
+
+  int32_t targetQ15 = gateGainQ15;
+  if (peak >= openThreshold || avgAbs >= (openThreshold / 3)) {
+    holdFrames = (SAMPLE_RATE * GATE_HOLD_MS) / 1000;
+    targetQ15 = GATE_FULL_Q15;
+  } else if (holdFrames > 0) {
+    holdFrames = holdFrames > frameCount ? holdFrames - frameCount : 0;
+    targetQ15 = GATE_FULL_Q15;
+  } else if (peak <= closeThreshold && avgAbs <= (closeThreshold / 3)) {
+    targetQ15 = GATE_FLOOR_Q15;
+  }
+
+  if (targetQ15 > gateGainQ15) {
+    const int32_t step = (targetQ15 - gateGainQ15 + 1) / 2;
+    gateGainQ15 += step > 0 ? step : 1;
+  } else if (targetQ15 < gateGainQ15) {
+    const int32_t step = (gateGainQ15 - targetQ15 + 23) / 24;
+    gateGainQ15 -= step > 0 ? step : 1;
+  }
+
+  if (gateGainQ15 >= 32700) return;
+
+  for (size_t i = 0; i < sampleCount; i++) {
+    const int32_t scaled = ((int32_t)samples[i] * gateGainQ15) >> 15;
+    samples[i] = (int16_t)scaled;
+  }
+  s_micGateFrames.fetch_add((uint32_t)frameCount);
+#else
+  (void)buf;
+  (void)len;
+#endif
 }
 
 void releasePendingBlock()
@@ -320,7 +392,7 @@ void emitInactive(const char* text = "Radio resumes")
 
 void pcmOutputTask(void*)
 {
-  Serial.println("[usb-audio] PCM output task started");
+  debugPrintf("[usb-audio] PCM output task started\n");
 
   while (true) {
     if (!s_pcmOutputEnabled.load()) {
@@ -386,9 +458,9 @@ void pcmOutputTask(void*)
           const uint32_t nowMs = millis();
           if ((int32_t)(nowMs - lastWarnMs) > 1000) {
             lastWarnMs = nowMs;
-            Serial.printf("[usb-audio] pcm write stalled at %u/%u buffered=%u\n",
-                          (unsigned)offset, (unsigned)writeLen,
-                          (unsigned)s_bufferedBytes.load());
+            debugPrintf("[usb-audio] pcm write stalled at %u/%u buffered=%u\n",
+                        (unsigned)offset, (unsigned)writeLen,
+                        (unsigned)s_bufferedBytes.load());
           }
           break;
         }
@@ -407,7 +479,7 @@ bool startPcmOutputTask()
                                                 nullptr, PCM_OUTPUT_TASK_PRIORITY,
                                                 &s_pcmTask, PCM_OUTPUT_TASK_CORE);
   if (rc != pdPASS) {
-    Serial.printf("[usb-audio] PCM task create failed rc=%ld\n", (long)rc);
+    debugPrintf("[usb-audio] PCM task create failed rc=%ld\n", (long)rc);
     s_pcmTask = nullptr;
     return false;
   }
@@ -428,11 +500,11 @@ void queuePcmBlock(const uint8_t* data, size_t len)
         const uint32_t nowMs = millis();
         if ((int32_t)(nowMs - lastWarnMs) > 1000) {
           lastWarnMs = nowMs;
-          Serial.printf("[usb-audio] pcm queue full fill=%u free=%u buffered=%u dropped=%u\n",
-                        (unsigned)uxQueueMessagesWaiting(s_pcmFillQueue),
-                        (unsigned)uxQueueMessagesWaiting(s_pcmFreeQueue),
-                        (unsigned)s_bufferedBytes.load(),
-                        (unsigned)s_droppedBytes.load());
+          debugPrintf("[usb-audio] pcm queue full fill=%u free=%u buffered=%u dropped=%u\n",
+                      (unsigned)uxQueueMessagesWaiting(s_pcmFillQueue),
+                      (unsigned)uxQueueMessagesWaiting(s_pcmFreeQueue),
+                      (unsigned)s_bufferedBytes.load(),
+                      (unsigned)s_droppedBytes.load());
         }
         return;
       }
@@ -463,6 +535,11 @@ esp_err_t uacOutputCb(uint8_t* buf, size_t len, void*)
 {
   if (!buf || len == 0) return ESP_OK;
   s_uacBytesRead.fetch_add((uint32_t)len);
+  static bool firstOutputLogged = false;
+  if (!firstOutputLogged) {
+    firstOutputLogged = true;
+    debugPrintf("[usb-audio] first speaker packet len=%u\n", (unsigned)len);
+  }
   emitActive();
   queuePcmBlock(buf, len);
   return ESP_OK;
@@ -475,6 +552,9 @@ esp_err_t uacInputCb(uint8_t* buf, size_t len, size_t* bytesRead, void*)
 #if ENABLE_USB_MIC
   if (s_audio && len > 0) {
     readLen = s_audio->readRawPCM16(buf, len, SAMPLE_RATE, CHANNELS);
+    if (readLen > 0) {
+      applyMicNoiseGate(buf, readLen);
+    }
   }
 #endif
   if (readLen < len) {
@@ -488,7 +568,7 @@ esp_err_t uacInputCb(uint8_t* buf, size_t len, size_t* bytesRead, void*)
 
 void uacSetMuteCb(uint32_t mute, void*)
 {
-  Serial.printf("[usb-audio] mute=%lu\n", (unsigned long)mute);
+  debugPrintf("[usb-audio] mute=%lu\n", (unsigned long)mute);
   emit(UsbAudioEvent::Mute, mute ? 1 : 0, nullptr);
 }
 
@@ -496,7 +576,7 @@ void uacSetVolumeCb(uint32_t volume, void*)
 {
   if (volume > 100) volume = 100;
   s_hostVolume = volume;
-  Serial.printf("[usb-audio] volume=%lu\n", (unsigned long)volume);
+  debugPrintf("[usb-audio] volume=%lu\n", (unsigned long)volume);
   emit(UsbAudioEvent::Volume, volume, nullptr);
 }
 
@@ -514,6 +594,7 @@ void monitorTask(void*)
     static uint32_t lastLogMs = 0;
     static uint32_t lastUacBytes = 0;
     static uint32_t lastMicBytes = 0;
+    static uint32_t lastMicGateFrames = 0;
     static uint32_t lastDropped = 0;
     static uint32_t lastUnderruns = 0;
     const uint32_t micBytes = s_micBytesSent.load();
@@ -523,24 +604,28 @@ void monitorTask(void*)
       const uint32_t underruns = s_underrunCount.load();
       const uint32_t bufferedBytes = s_bufferedBytes.load();
       const uint32_t i2sMaxUs = s_i2sWriteMaxUs.exchange(0);
+      const uint32_t micGateFrames = s_micGateFrames.load();
       lastLogMs = nowMs;
-      Serial.printf("[usb-audio] stats uac=%u +%u mic=%u +%u mic_short=%u buffer=%ums dropped=%u +%u underruns=%u +%u i2s_max_us=%u volume=%u fill=%u free=%u\n",
-                    (unsigned)uacBytes,
-                    (unsigned)(uacBytes - lastUacBytes),
-                    (unsigned)micBytes,
-                    (unsigned)(micBytes - lastMicBytes),
-                    (unsigned)s_micShortReads.load(),
-                    (unsigned)bufferedMsFromBytes(bufferedBytes),
-                    (unsigned)dropped,
-                    (unsigned)(dropped - lastDropped),
-                    (unsigned)underruns,
-                    (unsigned)(underruns - lastUnderruns),
-                    (unsigned)i2sMaxUs,
-                    (unsigned)s_hostVolume.load(),
-                    s_pcmFillQueue ? (unsigned)uxQueueMessagesWaiting(s_pcmFillQueue) : 0,
-                    s_pcmFreeQueue ? (unsigned)uxQueueMessagesWaiting(s_pcmFreeQueue) : 0);
+      debugPrintf("[usb-audio] stats uac=%u +%u mic=%u +%u mic_short=%u mic_gate_frames=%u +%u buffer=%ums dropped=%u +%u underruns=%u +%u i2s_max_us=%u volume=%u fill=%u free=%u\n",
+                  (unsigned)uacBytes,
+                  (unsigned)(uacBytes - lastUacBytes),
+                  (unsigned)micBytes,
+                  (unsigned)(micBytes - lastMicBytes),
+                  (unsigned)s_micShortReads.load(),
+                  (unsigned)micGateFrames,
+                  (unsigned)(micGateFrames - lastMicGateFrames),
+                  (unsigned)bufferedMsFromBytes(bufferedBytes),
+                  (unsigned)dropped,
+                  (unsigned)(dropped - lastDropped),
+                  (unsigned)underruns,
+                  (unsigned)(underruns - lastUnderruns),
+                  (unsigned)i2sMaxUs,
+                  (unsigned)s_hostVolume.load(),
+                  s_pcmFillQueue ? (unsigned)uxQueueMessagesWaiting(s_pcmFillQueue) : 0,
+                  s_pcmFreeQueue ? (unsigned)uxQueueMessagesWaiting(s_pcmFreeQueue) : 0);
       lastUacBytes = uacBytes;
       lastMicBytes = micBytes;
+      lastMicGateFrames = micGateFrames;
       lastDropped = dropped;
       lastUnderruns = underruns;
     }
@@ -549,10 +634,23 @@ void monitorTask(void*)
 }
 } // namespace
 
+void usbAudioStartUsbDebugOnly()
+{
+#if ENABLE_USB_DEBUG_CDC
+  uac_device_config_t config = {};
+  const esp_err_t err = uac_device_init(&config);
+  if (err != ESP_OK) {
+    debugPrintf("[usb-audio] early usb debug init failed err=%d\n", (int)err);
+  } else {
+    debugPrintf("[usb-audio] early usb debug stack ready\n");
+  }
+#endif
+}
+
 void usbAudioBegin(Audio& audio, UsbAudioEventHandler handler)
 {
   if (s_started.exchange(true)) {
-    Serial.println("[usb-audio] begin ignored: already started");
+    debugPrintf("[usb-audio] begin ignored: already started\n");
     return;
   }
 
@@ -575,7 +673,7 @@ void usbAudioBegin(Audio& audio, UsbAudioEventHandler handler)
                                                   nullptr, MONITOR_TASK_PRIORITY,
                                                   &s_monitorTask, MONITOR_TASK_CORE);
     if (rc != pdPASS) {
-      Serial.printf("[usb-audio] monitor task create failed rc=%ld\n", (long)rc);
+      debugPrintf("[usb-audio] monitor task create failed rc=%ld\n", (long)rc);
       s_monitorTask = nullptr;
       s_started = false;
       return;
@@ -591,14 +689,14 @@ void usbAudioBegin(Audio& audio, UsbAudioEventHandler handler)
 
   const esp_err_t err = uac_device_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("[usb-audio] uac_device_init failed err=%d\n", (int)err);
+    debugPrintf("[usb-audio] uac_device_init failed err=%d\n", (int)err);
     s_started = false;
     return;
   }
 
-  Serial.printf("[usb-audio] ready device=%s rate=%u speaker_channels=%u mic_channels=%u\n",
-                s_deviceName.c_str(), (unsigned)SAMPLE_RATE, (unsigned)CHANNELS,
-                ENABLE_USB_MIC ? (unsigned)CHANNELS : 0U);
+  debugPrintf("[usb-audio] ready device=%s rate=%u speaker_channels=%u mic_channels=%u\n",
+              s_deviceName.c_str(), (unsigned)SAMPLE_RATE, (unsigned)CHANNELS,
+              ENABLE_USB_MIC ? (unsigned)CHANNELS : 0U);
   emit(UsbAudioEvent::Ready, 0, s_deviceName.c_str());
 }
 
@@ -631,7 +729,7 @@ void usbAudioSetLocalVolume(uint8_t volume, uint8_t maxVolume)
   s_hostVolume = percent;
   const esp_err_t err = uac_device_set_volume_percent(percent);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-    Serial.printf("[usb-audio] local volume sync failed err=%d\n", (int)err);
+    debugPrintf("[usb-audio] local volume sync failed err=%d\n", (int)err);
   }
 }
 
@@ -639,7 +737,7 @@ void usbAudioSetLocalMute(bool muted)
 {
   const esp_err_t err = uac_device_set_mute_state(muted);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-    Serial.printf("[usb-audio] local mute sync failed err=%d\n", (int)err);
+    debugPrintf("[usb-audio] local mute sync failed err=%d\n", (int)err);
   }
 }
 
@@ -653,7 +751,7 @@ void usbAudioSendHostVolumeDelta(int8_t steps)
   while (count--) {
     const esp_err_t err = uac_device_send_hid_consumer_control(usage);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT) {
-      Serial.printf("[usb-audio] HID volume sync failed err=%d\n", (int)err);
+      debugPrintf("[usb-audio] HID volume sync failed err=%d\n", (int)err);
       break;
     }
     vTaskDelay(8 / portTICK_PERIOD_MS);
@@ -664,8 +762,34 @@ void usbAudioSendHostMuteToggle()
 {
   const esp_err_t err = uac_device_send_hid_consumer_control(HID_USAGE_CONSUMER_MUTE);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT) {
-    Serial.printf("[usb-audio] HID mute sync failed err=%d\n", (int)err);
+    debugPrintf("[usb-audio] HID mute sync failed err=%d\n", (int)err);
   }
+}
+
+void usbAudioSetMicNoiseGate(bool enabled)
+{
+  s_micNoiseGateEnabled = enabled;
+  debugPrintf("[usb-audio] mic noise gate=%s open=%u close=%u\n",
+              enabled ? "on" : "off",
+              (unsigned)s_micNoiseGateOpenThreshold.load(),
+              (unsigned)s_micNoiseGateCloseThreshold.load());
+}
+
+void usbAudioSetMicNoiseGateThresholds(uint16_t openThreshold, uint16_t closeThreshold)
+{
+  if (openThreshold < 50) openThreshold = 50;
+  if (closeThreshold >= openThreshold) closeThreshold = openThreshold / 2;
+  s_micNoiseGateOpenThreshold = openThreshold;
+  s_micNoiseGateCloseThreshold = closeThreshold;
+  debugPrintf("[usb-audio] mic noise gate thresholds open=%u close=%u enabled=%s\n",
+              (unsigned)openThreshold,
+              (unsigned)closeThreshold,
+              s_micNoiseGateEnabled.load() ? "yes" : "no");
+}
+
+bool usbAudioMicNoiseGateEnabled()
+{
+  return s_micNoiseGateEnabled.load();
 }
 
 #else
@@ -675,6 +799,8 @@ String s_deviceName;
 }
 
 void usbAudioBegin(Audio&, UsbAudioEventHandler) {}
+
+void usbAudioStartUsbDebugOnly() {}
 
 bool usbAudioActive()
 {
@@ -709,5 +835,14 @@ void usbAudioSetLocalMute(bool) {}
 void usbAudioSendHostVolumeDelta(int8_t) {}
 
 void usbAudioSendHostMuteToggle() {}
+
+void usbAudioSetMicNoiseGate(bool) {}
+
+void usbAudioSetMicNoiseGateThresholds(uint16_t, uint16_t) {}
+
+bool usbAudioMicNoiseGateEnabled()
+{
+  return false;
+}
 
 #endif
