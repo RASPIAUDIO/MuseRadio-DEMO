@@ -178,7 +178,7 @@ Version 1.3 is the captive-portal Wi-Fi release for Muse Radio. It keeps the Ard
 - Optional experimental AirPlay 1/RAOP POC is available in `muse_radio_airplay_poc`.
 - When no saved Wi-Fi network connects, the radio starts a captive setup portal at `http://192.168.4.1` and displays a Wi-Fi QR code on the TFT.
 - The captive portal screen also offers the OK/encoder button as a shortcut to manual credential entry.
-- The displayed firmware version is now `V1.7`.
+- The integrated firmware displays `V2.0-rc1`.
 - Long Wi-Fi passwords wrap onto two lines for readability.
 - `USBSerial` falls back to `Serial` when native USB CDC is not enabled.
 

@@ -73,7 +73,7 @@ PNG png;
 
 
 #ifndef MUSE_FIRMWARE_VERSION
-#define MUSE_FIRMWARE_VERSION "V1.7"
+#define MUSE_FIRMWARE_VERSION "V2.0-rc1"
 #endif
 
 #ifndef MUSE_IMPROV_VERSION
