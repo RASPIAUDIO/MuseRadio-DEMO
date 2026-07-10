@@ -1,6 +1,6 @@
 France Inter|General|FR|http://direct.franceinter.fr/live/franceinter-hifi.aac
 France Info|News|FR|http://direct.franceinfo.fr/live/franceinfo-hifi.aac
-France Culture|Culture|FR|http://direct.franceculture.fr/live/franceculture-hifi.aac
+France Culture|Culture|FR|https://stream.radiofrance.fr/franceculture/franceculture_hifi.m3u8
 France Musique|Classical|FR|http://direct.franceinter.fr/live/francemusique-hifi.aac
 FIP|Music|FR|http://direct.fipradio.fr/live/fip-hifi.aac
 FIP Jazz|Jazz|FR|http://direct.fipradio.fr/live/fip-webradio2.mp3
@@ -8,8 +8,8 @@ FIP Groove|Funk|FR|http://direct.fipradio.fr/live/fip-webradio3.mp3
 FIP Rock|Rock|FR|http://direct.fipradio.fr/live/fip-webradio1.mp3
 Mouv|Hip-hop|FR|http://direct.mouv.fr/live/mouv-midfi.mp3
 RFI Monde|News|FR|http://live02.rfi.fr/rfimonde-96k.mp3
-RTL|Talk|FR|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg
-Europe 1|Talk|FR|http://ais-live.cloud-services.paris:8000/europe1.mp3
+RTL|Talk|FR|http://icecast.rtl.fr/rtl-1-44-128
+Europe 1|Talk|FR|https://europe1.lmn.fm/europe1.mp3
 RMC|Talk|FR|https://audio.bfmtv.com/rmcradio_128.mp3
 Sud Radio|Talk|FR|http://start-sud.ice.infomaniak.ch/start-sud-high.mp3
 BFM Business|News|FR|https://audio.bfmtv.com/bfmbusiness_128.mp3
@@ -19,12 +19,12 @@ TSF Jazz|Jazz|FR|http://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3
 Radio Nova|Eclectic|FR|http://novazz.ice.infomaniak.ch/novazz-128.mp3
 Radio Meuh|Eclectic|FR|http://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3
 Radio Crooner|Jazz|FR|http://croonerradio.ice.infomaniak.ch/croonerradio-hifi.mp3
-Rires et Chansons|Comedy|FR|http://cdn.nrjaudio.fm/audio1/fr/30401/aac_64.mp3?origine=fluxradios
-Nostalgie|Oldies|FR|http://cdn.nrjaudio.fm/audio1/fr/30601/aac_64.mp3?origine=fluxradios
-Cherie FM|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30201/aac_64.mp3?origine=fluxradios
+Rires et Chansons|Comedy|FR|https://streaming.nrjaudio.fm/ou8o8xgk7oiu?origine=fluxradios
+Nostalgie|Oldies|FR|https://streaming.nrjaudio.fm/oug7girb92oc?origine=tingfm
+Cherie FM|Pop|FR|https://streaming.nrjaudio.fm/ou2n2epw5hs7
 NRJ|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30001/aac_64.mp3?origine=fluxradios
-RTL2|Rock|FR|http://streaming.radio.rtl2.fr/rtl2-1-44-128
-Fun Radio|Dance|FR|http://streaming.radio.funradio.fr/fun-1-44-128
+RTL2|Rock|FR|http://icecast.rtl2.fr/rtl2-1-44-128
+Fun Radio|Dance|FR|http://icecast.funradio.fr/fun-1-44-128
 Oui FM|Rock|FR|http://ouifm.ice.infomaniak.ch/ouifm-high.mp3
 Skyrock|Hip-hop|FR|http://icecast.skyrock.net/s/natio_mp3_128k
 Latina|Latin|FR|http://start-latina.ice.infomaniak.ch/start-latina-high.mp3
@@ -38,11 +38,11 @@ RTBF La Premiere|General|BE|http://radios.rtbf.be/laprem1ere-128.mp3
 RTBF Classic 21|Rock|BE|http://radios.rtbf.be/classic21-128.mp3
 RTBF Musiq3|Classical|BE|http://radios.rtbf.be/musiq3-128.mp3
 BBC World Service|News|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_world_service
-BBC Radio 4|Talk|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm
-BBC Radio 6 Music|Alternative|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_6music
+BBC Radio 4|Talk|UK|http://as-hls-ww-live.akamaized.net/pool_55057080/live/ww/bbc_radio_fourfm/bbc_radio_fourfm.isml/bbc_radio_fourfm-audio%3d128000.norewind.m3u8
+BBC Radio 6 Music|Alternative|UK|http://as-hls-ww-live.akamaized.net/pool_81827798/live/ww/bbc_6music/bbc_6music.isml/bbc_6music-audio%3d128000.norewind.m3u8
 NPR News|News|US|https://npr-ice.streamguys1.com/live.mp3
 KEXP|Alternative|US|https://kexp-mp3-128.streamguys1.com/kexp128.mp3
-KCRW|Eclectic|US|https://kcrw.streamguys1.com/kcrw_192k_mp3_on_air
+KCRW|Eclectic|US|https://streams.kcrw.com/kcrw_mp3
 WNYC FM|Talk|US|https://fm939.wnyc.org/wnycfm
 SomaFM Groove Salad|Ambient|US|https://ice2.somafm.com/groovesalad-128-mp3
 SomaFM Drone Zone|Ambient|US|https://ice2.somafm.com/dronezone-128-mp3

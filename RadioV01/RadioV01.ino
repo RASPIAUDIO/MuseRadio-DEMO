@@ -1,5 +1,4 @@
 #include "Arduino.h"
-#include <PubSubClient.h>
 #include <Audio.h>
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -12,41 +11,15 @@
 #include "Free_Fonts.h"
 #include <ESP32Encoder.h>
 #include <PNGdec.h>
-#include <ImprovWiFiLibrary.h>
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "qrcodeR.h"
-#include <Arduino_ESP32_OTA.h>
-#include "root_ca.h"
 //#include "USB.h"
 //#include <IRremoteESP8266.h>
 #include <IRrecv.h>
 //#include <IRutils.h>
 #include <FS.h>
-#include <SD_MMC.h>
-#include "lwip/apps/sntp.h"
-#if ENABLE_SPOTIFY_CONNECT
-#include "MuseHTTPClient.h"
-#else
-#include <HTTPClient.h>
-#endif
 #include <ArduinoJson.h>
-#include "SpotifyConnect.h"
-#if ENABLE_SPOTIFY_CONNECT
-#include "esp_heap_caps.h"
-#include "esp32s3/rom/tjpgd.h"
-#include "freertos/queue.h"
-#endif
-
-#ifndef ENABLE_LEGACY_FACTORY_I2S
-#define ENABLE_LEGACY_FACTORY_I2S 0
-#endif
-
-// Provide a portable console alias: use USB CDC when available, else UART Serial
-// On ESP32-S2/S3 with "USB CDC On Boot" enabled, the core exposes `USBSerial`.
-// For other boards/configs, fall back to `Serial`.
-#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
-#define USBSerial Serial
-#endif
 
 PNG png;
 #define MAX_IMAGE_WDITH 320 // Adjust for your images
@@ -54,14 +27,12 @@ PNG png;
 
 
 
-#define version "V1.5"
+#define version "V1.0-radio"
 
 #define I2S_DOUT        17
 #define I2S_BCLK        5
 #define I2S_LRC         16
-#define I2S_DIN         4
 #define I2S_MCLK        0
-#define I2CN (i2c_port_t)0
 #define SDA 18
 #define SCL 11
 #define JACK_DETECT     GPIO_NUM_10
@@ -96,37 +67,24 @@ PNG png;
 #define sw3             3
 #define ADC_BUTTON_DEBUG 0
 #define ADC_BUTTON_THRESHOLD 250
+#define ADC_SETTINGS_HOLD_MS 5000
+#define CAPTIVE_IDLE_RETURN_MS 60000
 static const int ADC_BUTTON_REFERENCE[] = {1863, 2355, 486, 930};
 static const int ADC_BUTTON_COUNT = sizeof(ADC_BUTTON_REFERENCE) / sizeof(ADC_BUTTON_REFERENCE[0]);
 
-static char const OTA_FILE_LOCATION[] = "https://raw.githubusercontent.com/RASPIAUDIO/ota/main/RadioLast.ota";
-
-TaskHandle_t radioH, keybH, batteryH, jackH, remoteH, displayONOFFH, improvWiFiInitH;
-
-
-Arduino_ESP32_OTA ota;
-Arduino_ESP32_OTA::Error ota_err = Arduino_ESP32_OTA::Error::None;
-
-
-
-
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-time_t now;
-struct tm timeinfo;
-char timeStr[60];
+TaskHandle_t radioH, keybH, batteryH, jackH, remoteH, displayONOFFH;
+SemaphoreHandle_t codecMutex = nullptr;
 Audio audio;
 static void audioEvent(Audio::msg_t msg);
 void settings(void);
 int button_get_level(int nb);
 static void debugAdcButtonsTick();
+static int readAdcButtonIndex(int *rawOut, int *diffOut);
 WiFiMulti wifiMulti;              //////////////////////////////////////
 #define maxVol 31
 #define pos360 31
 int vol = maxVol;
 int Pvol;
-uint8_t mode;
 uint8_t ssid[80];
 uint8_t pwd[80];
 
@@ -140,6 +98,165 @@ uint8_t pwd[80];
 #define RADIO_NAME_PATH "/nameS"
 #define RADIO_LINK_PATH "/linkS"
 struct WifiCred { char ssid[33]; char pwd[65]; };
+struct CachedRadioPreset {
+  char name[RADIO_NAME_MAX];
+  char url[RADIO_URL_MAX];
+};
+static CachedRadioPreset *radioPresetCache = nullptr;
+static int radioPresetCacheCount = 0;
+static bool radioPresetCacheInPsram = false;
+static bool reloadRadioPresetCache();
+
+static bool commitTempFile(const String &tempPath, const char *targetPath)
+{
+  String backupPath = String(targetPath) + ".bak";
+  LittleFS.remove(backupPath);
+  const bool hadTarget = LittleFS.exists(targetPath);
+  if (hadTarget && !LittleFS.rename(targetPath, backupPath)) {
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  if (!LittleFS.rename(tempPath, targetPath)) {
+    if (hadTarget) LittleFS.rename(backupPath, targetPath);
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  if (hadTarget) LittleFS.remove(backupPath);
+  return true;
+}
+static bool writeTextAtomically(const char *path, const String &content)
+{
+  String tempPath = String(path) + ".tmp";
+  LittleFS.remove(tempPath);
+  File f = LittleFS.open(tempPath, FILE_WRITE);
+  if (!f) return false;
+  const size_t written = f.write((const uint8_t *)content.c_str(), content.length());
+  f.flush();
+  f.close();
+  if (written != content.length()) {
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  return commitTempFile(tempPath, path);
+}
+
+static bool stageTextFile(const String &tempPath, const String &content)
+{
+  LittleFS.remove(tempPath);
+  File f = LittleFS.open(tempPath, FILE_WRITE);
+  if (!f) return false;
+  const size_t written = f.write((const uint8_t *)content.c_str(), content.length());
+  f.flush();
+  f.close();
+  if (written == content.length()) return true;
+  LittleFS.remove(tempPath);
+  return false;
+}
+
+static bool writeTextPairAtomically(const char *firstPath, const String &firstContent,
+                                    const char *secondPath, const String &secondContent)
+{
+  String firstTemp = String(firstPath) + ".tmp";
+  String secondTemp = String(secondPath) + ".tmp";
+  String firstBackup = String(firstPath) + ".bak";
+  String secondBackup = String(secondPath) + ".bak";
+  if (!stageTextFile(firstTemp, firstContent) || !stageTextFile(secondTemp, secondContent)) {
+    LittleFS.remove(firstTemp);
+    LittleFS.remove(secondTemp);
+    return false;
+  }
+
+  LittleFS.remove(firstBackup);
+  LittleFS.remove(secondBackup);
+  const bool hadFirst = LittleFS.exists(firstPath);
+  const bool hadSecond = LittleFS.exists(secondPath);
+  if (hadFirst && !LittleFS.rename(firstPath, firstBackup)) goto rollback_staged;
+  if (hadSecond && !LittleFS.rename(secondPath, secondBackup)) {
+    if (hadFirst) LittleFS.rename(firstBackup, firstPath);
+    goto rollback_staged;
+  }
+  if (!LittleFS.rename(firstTemp, firstPath)) goto rollback_backups;
+  if (!LittleFS.rename(secondTemp, secondPath)) {
+    LittleFS.remove(firstPath);
+    goto rollback_backups;
+  }
+
+  if (hadFirst) LittleFS.remove(firstBackup);
+  if (hadSecond) LittleFS.remove(secondBackup);
+  return true;
+
+rollback_backups:
+  LittleFS.remove(firstPath);
+  LittleFS.remove(secondPath);
+  if (hadFirst) LittleFS.rename(firstBackup, firstPath);
+  if (hadSecond) LittleFS.rename(secondBackup, secondPath);
+rollback_staged:
+  LittleFS.remove(firstTemp);
+  LittleFS.remove(secondTemp);
+  return false;
+}
+
+static void recoverAtomicFile(const char *path)
+{
+  const String tempPath = String(path) + ".tmp";
+  const String backupPath = String(path) + ".bak";
+  LittleFS.remove(tempPath);
+  if (!LittleFS.exists(path) && LittleFS.exists(backupPath)) {
+    LittleFS.rename(backupPath, path);
+  } else if (LittleFS.exists(path)) {
+    LittleFS.remove(backupPath);
+  }
+}
+
+static void recoverAtomicPair(const char *firstPath, const char *secondPath)
+{
+  const String firstTemp = String(firstPath) + ".tmp";
+  const String secondTemp = String(secondPath) + ".tmp";
+  const String firstBackup = String(firstPath) + ".bak";
+  const String secondBackup = String(secondPath) + ".bak";
+  LittleFS.remove(firstTemp);
+  LittleFS.remove(secondTemp);
+
+  const bool pairIncomplete = !LittleFS.exists(firstPath) || !LittleFS.exists(secondPath);
+  const bool hasBackup = LittleFS.exists(firstBackup) || LittleFS.exists(secondBackup);
+  if (pairIncomplete && hasBackup) {
+    LittleFS.remove(firstPath);
+    LittleFS.remove(secondPath);
+    if (LittleFS.exists(firstBackup)) LittleFS.rename(firstBackup, firstPath);
+    if (LittleFS.exists(secondBackup)) LittleFS.rename(secondBackup, secondPath);
+  } else {
+    LittleFS.remove(firstBackup);
+    LittleFS.remove(secondBackup);
+  }
+}
+
+static void recoverStoredFiles()
+{
+  recoverAtomicFile(WIFI_JSON_PATH);
+  recoverAtomicFile(RADIO_CATALOG_PATH);
+  recoverAtomicFile("/station");
+  recoverAtomicFile("/volume");
+  recoverAtomicPair(RADIO_NAME_PATH, RADIO_LINK_PATH);
+}
+
+static int loadStoredInt(const char *path, int fallback, int minimum, int maximum)
+{
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) return fallback;
+  String value = f.readString();
+  f.close();
+  value.trim();
+  if (!value.length()) return fallback;
+  char *end = nullptr;
+  long parsed = strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || *end != 0 || parsed < minimum || parsed > maximum) return fallback;
+  return (int)parsed;
+}
+
+static bool saveStoredInt(const char *path, int value)
+{
+  return writeTextAtomically(path, String(value));
+}
 
 // Load stored WiFi credentials from LittleFS JSON into an array.
 // Returns count loaded. Backward-compatible: if only /ssid and /pwd exist,
@@ -149,14 +266,26 @@ int loadWifiList(WifiCred list[], int maxItems)
   int count = 0;
   File f = LittleFS.open(WIFI_JSON_PATH, FILE_READ);
   if (f) {
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
-    if (!err && doc.containsKey("networks") && doc["networks"].is<JsonArray>()) {
-      for (JsonObject obj : doc["networks"].as<JsonArray>()) {
+    JsonArray networks = doc["networks"].as<JsonArray>();
+    if (!err && !networks.isNull()) {
+      for (JsonObject obj : networks) {
         if (count >= maxItems) break;
         const char* s = obj["ssid"] | "";
         const char* p = obj["pwd"] | "";
+        const size_t ssidLength = strlen(s);
+        const size_t passwordLength = strlen(p);
+        if (ssidLength == 0 || ssidLength > 32 || passwordLength > 64) continue;
+        bool duplicate = false;
+        for (int i = 0; i < count; i++) {
+          if (strcmp(list[i].ssid, s) == 0) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (duplicate) continue;
         strncpy(list[count].ssid, s, sizeof(list[count].ssid));
         list[count].ssid[sizeof(list[count].ssid)-1] = 0;
         strncpy(list[count].pwd, p, sizeof(list[count].pwd));
@@ -174,7 +303,7 @@ int loadWifiList(WifiCred list[], int maxItems)
     size_t sn = sFile.readBytes((char*)ssid, sizeof(ssid)-1); ((char*)ssid)[sn] = 0;
     size_t pn = pFile.readBytes((char*)pwd, sizeof(pwd)-1); ((char*)pwd)[pn] = 0;
     sFile.close(); pFile.close();
-    if (sn > 0 && pn >= 0) {
+    if (sn > 0 && sn <= 32 && pn <= 64) {
       strncpy(list[0].ssid, (char*)ssid, sizeof(list[0].ssid)); list[0].ssid[sizeof(list[0].ssid)-1]=0;
       strncpy(list[0].pwd, (char*)pwd, sizeof(list[0].pwd)); list[0].pwd[sizeof(list[0].pwd)-1]=0;
       count = 1;
@@ -183,20 +312,19 @@ int loadWifiList(WifiCred list[], int maxItems)
   return count;
 }
 
-void saveWifiList(const WifiCred list[], int count)
+bool saveWifiList(const WifiCred list[], int count)
 {
-  DynamicJsonDocument doc(3072);
-  JsonArray arr = doc.createNestedArray("networks");
+  JsonDocument doc;
+  JsonArray arr = doc["networks"].to<JsonArray>();
   for (int i = 0; i < count; i++) {
-    JsonObject o = arr.createNestedObject();
+    JsonObject o = arr.add<JsonObject>();
     o["ssid"] = list[i].ssid;
     o["pwd"]  = list[i].pwd;
   }
-  File f = LittleFS.open(WIFI_JSON_PATH, FILE_WRITE);
-  if (f) {
-    serializeJson(doc, f);
-    f.close();
-  }
+  String json;
+  json.reserve(2048);
+  if (serializeJson(doc, json) == 0) return false;
+  return writeTextAtomically(WIFI_JSON_PATH, json);
 }
 
 int indexOfSsid(const WifiCred list[], int count, const char* target)
@@ -242,7 +370,6 @@ char qrData[120];
 char c[2];
 int PL;
 int PPL = -1;
-File ln;
 char b[8];
 char s[80];
 bool started = false;
@@ -250,7 +377,6 @@ uint32_t lastModTime;
 bool modSta = false;
 bool jackON = false;
 bool Bvalid = false;
-bool BOTA = false;
 bool BSettings = false;
 int toDisplay = 0;
 int toDisplayP;
@@ -273,12 +399,14 @@ void displayON(void)
 ///////////////////////////////////////////////////////////////////////
 uint8_t ES8388_Write_Reg(uint8_t reg, uint8_t val)
 {
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
   uint8_t buf[2], res;
   buf[0] = reg;
   buf[1] = val;
   Wire.beginTransmission(ES8388_ADDR);
   Wire.write(buf, 2);
   res = Wire.endTransmission();
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
   return res;
 }
 
@@ -290,6 +418,7 @@ uint8_t ES8388_Write_Reg(uint8_t reg, uint8_t val)
 //
 int ES8388_Init(void)
 {
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
   // provides MCLK
   //    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);
   //    WRITE_PERI_REG(PIN_CTRL, READ_PERI_REG(PIN_CTRL)& 0xFFFFFFF0);
@@ -392,6 +521,7 @@ int ES8388_Init(void)
   st += ES8388_Write_Reg(47, 15);
   st += ES8388_Write_Reg(48, 33);
   st += ES8388_Write_Reg(49, 33);
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
   return st;
 
 }
@@ -400,35 +530,13 @@ int ES8388_Init(void)
 int delay1 = 10;
 int delay2 = 500;
 
-int station = 0;
+volatile int station = 0;
 int previousStation;
 int MS;
-bool connected = true;
-static volatile bool spotifyPlaybackActive = false;
-static volatile uint32_t spotifyRadioResumeAtMs = 0;
-static String spotifyTrackTitle;
-static String spotifyTrackArtist;
-static String spotifyTrackCoverUrl;
-#if ENABLE_SPOTIFY_CONNECT
-static const int SPOTIFY_COVER_X = 12;
-static const int SPOTIFY_COVER_Y = 92;
-static const int SPOTIFY_COVER_SIZE = 88;
-static const size_t SPOTIFY_COVER_JPEG_MAX = 64 * 1024;
-static const uint32_t SPOTIFY_COVER_DELAY_MS = 8000;
-struct SpotifyCoverRequest {
-  char url[128];
-  uint32_t generation;
-};
-static String spotifyCoverPendingUrl;
-static volatile uint32_t spotifyCoverRequestDueMs = 0;
-static QueueHandle_t spotifyCoverQueue = nullptr;
-static TaskHandle_t spotifyCoverTaskH = nullptr;
-static uint16_t* spotifyCoverPixels = nullptr;
-static volatile uint32_t spotifyCoverGeneration = 0;
-static volatile bool spotifyCoverPixelsReady = false;
-static volatile bool spotifyCoverNeedsDraw = false;
-#endif
-char* linkS;
+volatile bool connected = false;
+volatile bool stationDisplayPending = false;
+bool volumeSavePending = false;
+uint32_t volumeChangedAtMs = 0;
 char mes[200];
 uint32_t sampleRate;
 int iMes ;
@@ -520,55 +628,34 @@ static void wakeTftBacklight()
 
 void ES8388vol_Set(uint8_t volx)
 {
-
-  // mute
-  ES8388_Write_Reg(25, 0x04);
-#define lowVol   16
+  if (codecMutex) xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
   if (volx > maxVol) volx = maxVol;
-  if (volx == 0)ES8388_Write_Reg(25, 0x04); else ES8388_Write_Reg(25, 0x00);
-  bool spotifyCodecVolume = spotifyPlaybackActive || spotifyConnectActive();
+  const bool muted = (volx == 0);
+  const uint8_t codecVol = muted ? 0 : (uint8_t)(volx + 2);
 
-  //    if (volx > lowVol)audio.setVolume(volx); else audio.setVolume(lowVol);
-  //    printf("VOLX = %d  %d\n",volx, jackON);
+  ES8388_Write_Reg(25, muted ? 0x04 : 0x00);
+  audio.setVolume(maxVol);
   if (jackON == true)
   {
     // LOUT2/ROUT2
-    audio.setVolume(maxVol);
     ES8388_Write_Reg(46, 0);
     ES8388_Write_Reg(47, 0);
-    ES8388_Write_Reg(48, volx + 2);
-    ES8388_Write_Reg(49, volx + 2);
+    ES8388_Write_Reg(48, codecVol);
+    ES8388_Write_Reg(49, codecVol);
   }
   else
   {
     // ROUT1/LOUT1
     ES8388_Write_Reg(48, 0);
     ES8388_Write_Reg(49, 0);
-    if (spotifyCodecVolume)
-    {
-      audio.setVolume(maxVol);
-      ES8388_Write_Reg(46, volx + 2);
-      ES8388_Write_Reg(47, volx + 2);
-    }
-    else if (volx > lowVol)
-    {
-      audio.setVolume(maxVol);
-      ES8388_Write_Reg(46, volx + 2);
-      ES8388_Write_Reg(47, volx + 2);
-    }
-    else
-    {
-      audio.setVolume(maxVol * volx / lowVol);
-      ES8388_Write_Reg(46, lowVol);
-      ES8388_Write_Reg(47, lowVol);
-    }
+    ES8388_Write_Reg(46, codecVol);
+    ES8388_Write_Reg(47, codecVol);
   }
   // RDAC/LDAC (digital)
   ES8388_Write_Reg(26, 0x00);
   ES8388_Write_Reg(27, 0x00);
-  // unmute
-  ES8388_Write_Reg(25, 0x00);
-
+  ES8388_Write_Reg(25, muted ? 0x04 : 0x00);
+  if (codecMutex) xSemaphoreGiveRecursive(codecMutex);
 }
 //////////////////////////////////////////////////////////////////////////
 // Print the header for a display screen
@@ -631,7 +718,11 @@ static IPAddress captivePortalIP(192, 168, 4, 1);
 static String captiveApName;
 static int captiveScanCount = 0;
 static bool captiveRestartPending = false;
+static uint32_t captiveRestartAtMs = 0;
+static bool captiveRestartToRadio = false;
+static bool captiveReturnToRadioEnabled = false;
 static bool captiveManualFallbackRequested = false;
+static WifiCred captiveWifiList[WIFI_MAX_NETWORKS];
 
 static String htmlEscape(const String &value)
 {
@@ -675,15 +766,15 @@ static String captiveWifiQrPayload()
 
 static const char DEFAULT_RADIO_PRESETS[] =
   "RFI|http://live02.rfi.fr/rfimonde-96k.mp3\n"
-  "France Culture|http://direct.franceculture.fr/live/franceculture-hifi.aac\n"
+  "France Culture|https://stream.radiofrance.fr/franceculture/franceculture_hifi.m3u8\n"
   "FIP|http://direct.fipradio.fr/live/fip-hifi.aac\n"
-  "RTL|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg\n"
+  "RTL|http://icecast.rtl.fr/rtl-1-44-128\n"
   "RMC|https://audio.bfmtv.com/rmcradio_128.mp3\n"
   "France Info|http://direct.franceinfo.fr/live/franceinfo-hifi.aac\n"
   "Radio Classique|http://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3\n"
   "France Musique|http://direct.franceinter.fr/live/francemusique-hifi.aac\n"
   "Radio Crooner|http://croonerradio.ice.infomaniak.ch/croonerradio-hifi.mp3\n"
-  "Europe 1|http://ais-live.cloud-services.paris:8000/europe1.mp3\n"
+  "Europe 1|https://europe1.lmn.fm/europe1.mp3\n"
   "Sud Radio|http://start-sud.ice.infomaniak.ch/start-sud-high.mp3\n"
   "France Inter|http://direct.franceinter.fr/live/franceinter-hifi.aac\n"
   "Frequence Jazz|http://broadcast.infomaniak.ch/frequencejazz-high.mp3\n"
@@ -691,12 +782,12 @@ static const char DEFAULT_RADIO_PRESETS[] =
   "Suisse Premiere|http://stream.srg-ssr.ch/m/la-1ere/mp3_128\n"
   "RTBF|http://broadcast.infomaniak.ch/belrtl-mp3-128.mp3\n"
   "BFM Business|https://audio.bfmtv.com/bfmbusiness_128.mp3\n"
-  "Rires et Chansons|http://cdn.nrjaudio.fm/audio1/fr/30401/aac_64.mp3?origine=fluxradios\n";
+  "Rires et Chansons|https://streaming.nrjaudio.fm/ou8o8xgk7oiu?origine=fluxradios\n";
 
 static const char DEFAULT_RADIO_CATALOG[] =
   "France Inter|General|FR|http://direct.franceinter.fr/live/franceinter-hifi.aac\n"
   "France Info|News|FR|http://direct.franceinfo.fr/live/franceinfo-hifi.aac\n"
-  "France Culture|Culture|FR|http://direct.franceculture.fr/live/franceculture-hifi.aac\n"
+  "France Culture|Culture|FR|https://stream.radiofrance.fr/franceculture/franceculture_hifi.m3u8\n"
   "France Musique|Classical|FR|http://direct.franceinter.fr/live/francemusique-hifi.aac\n"
   "FIP|Music|FR|http://direct.fipradio.fr/live/fip-hifi.aac\n"
   "FIP Jazz|Jazz|FR|http://direct.fipradio.fr/live/fip-webradio2.mp3\n"
@@ -704,8 +795,8 @@ static const char DEFAULT_RADIO_CATALOG[] =
   "FIP Rock|Rock|FR|http://direct.fipradio.fr/live/fip-webradio1.mp3\n"
   "Mouv|Hip-hop|FR|http://direct.mouv.fr/live/mouv-midfi.mp3\n"
   "RFI Monde|News|FR|http://live02.rfi.fr/rfimonde-96k.mp3\n"
-  "RTL|Talk|FR|http://streaming.radio.rtl.fr/rtl-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg\n"
-  "Europe 1|Talk|FR|http://ais-live.cloud-services.paris:8000/europe1.mp3\n"
+  "RTL|Talk|FR|http://icecast.rtl.fr/rtl-1-44-128\n"
+  "Europe 1|Talk|FR|https://europe1.lmn.fm/europe1.mp3\n"
   "RMC|Talk|FR|https://audio.bfmtv.com/rmcradio_128.mp3\n"
   "Sud Radio|Talk|FR|http://start-sud.ice.infomaniak.ch/start-sud-high.mp3\n"
   "BFM Business|News|FR|https://audio.bfmtv.com/bfmbusiness_128.mp3\n"
@@ -715,12 +806,12 @@ static const char DEFAULT_RADIO_CATALOG[] =
   "Radio Nova|Eclectic|FR|http://novazz.ice.infomaniak.ch/novazz-128.mp3\n"
   "Radio Meuh|Eclectic|FR|http://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3\n"
   "Radio Crooner|Jazz|FR|http://croonerradio.ice.infomaniak.ch/croonerradio-hifi.mp3\n"
-  "Rires et Chansons|Comedy|FR|http://cdn.nrjaudio.fm/audio1/fr/30401/aac_64.mp3?origine=fluxradios\n"
-  "Nostalgie|Oldies|FR|http://cdn.nrjaudio.fm/audio1/fr/30601/aac_64.mp3?origine=fluxradios\n"
-  "Cherie FM|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30201/aac_64.mp3?origine=fluxradios\n"
+  "Rires et Chansons|Comedy|FR|https://streaming.nrjaudio.fm/ou8o8xgk7oiu?origine=fluxradios\n"
+  "Nostalgie|Oldies|FR|https://streaming.nrjaudio.fm/oug7girb92oc?origine=tingfm\n"
+  "Cherie FM|Pop|FR|https://streaming.nrjaudio.fm/ou2n2epw5hs7\n"
   "NRJ|Pop|FR|http://cdn.nrjaudio.fm/audio1/fr/30001/aac_64.mp3?origine=fluxradios\n"
-  "RTL2|Rock|FR|http://streaming.radio.rtl2.fr/rtl2-1-44-128\n"
-  "Fun Radio|Dance|FR|http://streaming.radio.funradio.fr/fun-1-44-128\n"
+  "RTL2|Rock|FR|http://icecast.rtl2.fr/rtl2-1-44-128\n"
+  "Fun Radio|Dance|FR|http://icecast.funradio.fr/fun-1-44-128\n"
   "Oui FM|Rock|FR|http://ouifm.ice.infomaniak.ch/ouifm-high.mp3\n"
   "Skyrock|Hip-hop|FR|http://icecast.skyrock.net/s/natio_mp3_128k\n"
   "Latina|Latin|FR|http://start-latina.ice.infomaniak.ch/start-latina-high.mp3\n"
@@ -734,11 +825,11 @@ static const char DEFAULT_RADIO_CATALOG[] =
   "RTBF Classic 21|Rock|BE|http://radios.rtbf.be/classic21-128.mp3\n"
   "RTBF Musiq3|Classical|BE|http://radios.rtbf.be/musiq3-128.mp3\n"
   "BBC World Service|News|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_world_service\n"
-  "BBC Radio 4|Talk|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm\n"
-  "BBC Radio 6 Music|Alternative|UK|http://stream.live.vc.bbcmedia.co.uk/bbc_6music\n"
+  "BBC Radio 4|Talk|UK|http://as-hls-ww-live.akamaized.net/pool_55057080/live/ww/bbc_radio_fourfm/bbc_radio_fourfm.isml/bbc_radio_fourfm-audio%3d128000.norewind.m3u8\n"
+  "BBC Radio 6 Music|Alternative|UK|http://as-hls-ww-live.akamaized.net/pool_81827798/live/ww/bbc_6music/bbc_6music.isml/bbc_6music-audio%3d128000.norewind.m3u8\n"
   "NPR News|News|US|https://npr-ice.streamguys1.com/live.mp3\n"
   "KEXP|Alternative|US|https://kexp-mp3-128.streamguys1.com/kexp128.mp3\n"
-  "KCRW|Eclectic|US|https://kcrw.streamguys1.com/kcrw_192k_mp3_on_air\n"
+  "KCRW|Eclectic|US|https://streams.kcrw.com/kcrw_mp3\n"
   "WNYC FM|Talk|US|https://fm939.wnyc.org/wnycfm\n"
   "SomaFM Groove Salad|Ambient|US|https://ice2.somafm.com/groovesalad-128-mp3\n"
   "SomaFM Drone Zone|Ambient|US|https://ice2.somafm.com/dronezone-128-mp3\n"
@@ -758,15 +849,11 @@ static bool fileMissingOrEmpty(const char *path)
 
 static bool writeDefaultPresets()
 {
-  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_WRITE);
-  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
-  if (!nameFile || !linkFile) {
-    if (nameFile) nameFile.close();
-    if (linkFile) linkFile.close();
-    return false;
-  }
-
   String data = DEFAULT_RADIO_PRESETS;
+  String nameContent;
+  String linkContent;
+  nameContent.reserve(512);
+  linkContent.reserve(1024);
   int start = 0;
   int written = 0;
   while (start < (int)data.length() && written < RADIO_PRESET_MAX) {
@@ -781,26 +868,22 @@ static bool writeDefaultPresets()
       name.trim();
       url.trim();
       if (url.length()) {
-        nameFile.println(name);
-        linkFile.println(url);
+        nameContent += name;
+        nameContent += '\n';
+        linkContent += url;
+        linkContent += '\n';
         written++;
       }
     }
     start = end + 1;
   }
 
-  nameFile.close();
-  linkFile.close();
-  return written > 0;
+  return written > 0 && writeTextPairAtomically(RADIO_NAME_PATH, nameContent, RADIO_LINK_PATH, linkContent);
 }
 
 static bool writeDefaultCatalog()
 {
-  File f = LittleFS.open(RADIO_CATALOG_PATH, FILE_WRITE);
-  if (!f) return false;
-  f.write((const uint8_t*)DEFAULT_RADIO_CATALOG, sizeof(DEFAULT_RADIO_CATALOG) - 1);
-  f.close();
-  return true;
+  return writeTextAtomically(RADIO_CATALOG_PATH, String(DEFAULT_RADIO_CATALOG));
 }
 
 static void repairStationUrlPrefixes()
@@ -824,11 +907,36 @@ static void repairStationUrlPrefixes()
   in.close();
 
   if (changed) {
-    File out = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
-    if (out) {
-      out.print(content);
-      out.close();
-    }
+    writeTextAtomically(RADIO_LINK_PATH, content);
+  }
+}
+
+static void migrateFranceCultureStream()
+{
+  static const char *legacyUrl =
+    "http://direct.franceculture.fr/live/franceculture-hifi.aac";
+  static const char *officialUrl =
+    "https://stream.radiofrance.fr/franceculture/franceculture_hifi.m3u8";
+  const char *paths[] = {RADIO_LINK_PATH, RADIO_CATALOG_PATH};
+
+  for (const char *path : paths) {
+    File in = LittleFS.open(path, FILE_READ);
+    if (!in) continue;
+    String content = in.readString();
+    in.close();
+    if (content.indexOf(legacyUrl) < 0) continue;
+    content.replace(legacyUrl, officialUrl);
+    const bool saved = writeTextAtomically(path, content);
+    printf("France Culture stream migration path=%s ok=%d\n", path, saved ? 1 : 0);
+  }
+
+  File names = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
+  if (!names) return;
+  String nameContent = names.readString();
+  names.close();
+  if (nameContent.indexOf("France-Culture") >= 0) {
+    nameContent.replace("France-Culture", "France Culture");
+    writeTextAtomically(RADIO_NAME_PATH, nameContent);
   }
 }
 
@@ -841,6 +949,7 @@ static void ensureLocalRadioData()
   if (fileMissingOrEmpty(RADIO_CATALOG_PATH)) {
     writeDefaultCatalog();
   }
+  migrateFranceCultureStream();
 }
 
 static bool isValidRadioUrl(const String &url)
@@ -877,43 +986,38 @@ static int loadStationPresets(String names[], String urls[], int maxItems)
   return highestUsedSlot;
 }
 
-static bool saveStationPresets(String names[], String urls[], int count)
+static bool saveRadioPresetCache(int count)
 {
+  if (radioPresetCache == nullptr) return false;
   if (count < 0) count = 0;
   if (count > RADIO_PRESET_MAX) count = RADIO_PRESET_MAX;
-  while (count > 0) {
-    urls[count - 1].trim();
-    if (urls[count - 1].length() > 0) break;
-    count--;
-  }
+  while (count > 0 && radioPresetCache[count - 1].url[0] == '\0') count--;
   if (count <= 0) return false;
 
-  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_WRITE);
-  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_WRITE);
-  if (!nameFile || !linkFile) {
-    if (nameFile) nameFile.close();
-    if (linkFile) linkFile.close();
-    return false;
-  }
+  String nameContent;
+  String linkContent;
+  nameContent.reserve(count * 24);
+  linkContent.reserve(count * 96);
 
   for (int i = 0; i < count; i++) {
-    names[i].trim();
-    urls[i].trim();
-    if (!urls[i].length()) {
-      nameFile.println();
-      linkFile.println();
+    CachedRadioPreset &preset = radioPresetCache[i];
+    if (preset.url[0] == '\0') {
+      nameContent += '\n';
+      linkContent += '\n';
     } else {
-      if (names[i].length() == 0) names[i] = "Preset " + String(i + 1);
-      if (names[i].length() >= RADIO_NAME_MAX) names[i] = names[i].substring(0, RADIO_NAME_MAX - 1);
-      if (urls[i].length() >= RADIO_URL_MAX) urls[i] = urls[i].substring(0, RADIO_URL_MAX - 1);
-      nameFile.println(names[i]);
-      linkFile.println(urls[i]);
+      if (preset.name[0] == '\0') {
+        snprintf(preset.name, sizeof(preset.name), "Preset %d", i + 1);
+      }
+      nameContent += preset.name;
+      nameContent += '\n';
+      linkContent += preset.url;
+      linkContent += '\n';
     }
   }
-
-  nameFile.close();
-  linkFile.close();
-  return true;
+  const bool saved = writeTextPairAtomically(
+    RADIO_NAME_PATH, nameContent, RADIO_LINK_PATH, linkContent);
+  if (saved) radioPresetCacheCount = count;
+  return saved;
 }
 
 static bool setStationPreset(int slotIndex, String name, String url)
@@ -926,13 +1030,15 @@ static bool setStationPreset(int slotIndex, String name, String url)
   if (name.length() >= RADIO_NAME_MAX) name = name.substring(0, RADIO_NAME_MAX - 1);
   if (url.length() >= RADIO_URL_MAX) return false;
 
-  String names[RADIO_PRESET_MAX];
-  String urls[RADIO_PRESET_MAX];
-  int count = loadStationPresets(names, urls, RADIO_PRESET_MAX);
+  if (!reloadRadioPresetCache() && radioPresetCache == nullptr) return false;
+  int count = radioPresetCacheCount;
   if (slotIndex >= count) count = slotIndex + 1;
-  names[slotIndex] = name;
-  urls[slotIndex] = url;
-  bool saved = saveStationPresets(names, urls, count);
+  name.toCharArray(radioPresetCache[slotIndex].name,
+                   sizeof(radioPresetCache[slotIndex].name));
+  url.toCharArray(radioPresetCache[slotIndex].url,
+                  sizeof(radioPresetCache[slotIndex].url));
+  bool saved = saveRadioPresetCache(count);
+  if (!saved) reloadRadioPresetCache();
   printf("Radio preset save slot=%d count=%d ok=%d name=%s url=%s\n",
          slotIndex + 1, count, saved ? 1 : 0, name.c_str(), url.c_str());
   return saved;
@@ -940,16 +1046,19 @@ static bool setStationPreset(int slotIndex, String name, String url)
 
 static bool clearStationPreset(int slotIndex)
 {
-  String names[RADIO_PRESET_MAX];
-  String urls[RADIO_PRESET_MAX];
-  int count = loadStationPresets(names, urls, RADIO_PRESET_MAX);
   if (slotIndex < 0 || slotIndex >= RADIO_PRESET_MAX) return false;
+  if (!reloadRadioPresetCache() && radioPresetCache == nullptr) return false;
+  int count = radioPresetCacheCount;
   if (slotIndex >= count) return false;
-  names[slotIndex] = "";
-  urls[slotIndex] = "";
-  if (count <= 0) return writeDefaultPresets();
-  bool saved = saveStationPresets(names, urls, count);
-  if (!saved) return writeDefaultPresets();
+  memset(&radioPresetCache[slotIndex], 0, sizeof(radioPresetCache[slotIndex]));
+  bool saved = saveRadioPresetCache(count);
+  if (!saved) {
+    if (!writeDefaultPresets()) {
+      reloadRadioPresetCache();
+      return false;
+    }
+    saved = reloadRadioPresetCache();
+  }
   printf("Radio preset clear slot=%d count=%d ok=%d\n", slotIndex + 1, count, saved ? 1 : 0);
   return saved;
 }
@@ -971,34 +1080,19 @@ static bool splitCatalogLine(const String &line, String &name, String &category,
   return name.length() && url.length();
 }
 
-static void saveWifiCredential(const char *newSsid, const char *newPassword)
+static bool saveWifiCredential(const char *newSsid, const char *newPassword)
 {
-  if (newSsid == nullptr || newSsid[0] == 0) return;
+  if (newSsid == nullptr || newSsid[0] == 0 || strlen(newSsid) > 32) return false;
   if (newPassword == nullptr) newPassword = "";
-
-  uint8_t bm = '1';
-  File f = LittleFS.open("/mode", FILE_WRITE);
-  if (f) {
-    f.write(&bm, 1);
-    f.close();
-  }
-
-  f = LittleFS.open("/pwd", "w");
-  if (f) {
-    f.write((const uint8_t*)newPassword, strlen(newPassword) + 1);
-    f.close();
-  }
-
-  f = LittleFS.open("/ssid", FILE_WRITE);
-  if (f) {
-    f.write((const uint8_t*)newSsid, strlen(newSsid) + 1);
-    f.close();
-  }
+  if (strlen(newPassword) > 64) return false;
 
   WifiCred list[WIFI_MAX_NETWORKS];
   int count = loadWifiList(list, WIFI_MAX_NETWORKS);
+  const bool isNewNetwork = indexOfSsid(list, count, newSsid) < 0;
+  const int previousCount = count;
   count = addOrUpdateWifi(list, count, newSsid, newPassword);
-  saveWifiList(list, count);
+  if (isNewNetwork && count == previousCount) return false;
+  return saveWifiList(list, count);
 }
 
 static void appendPortalMessage(String &html)
@@ -1047,6 +1141,7 @@ static void appendCatalogOptions(String &html)
 static String captivePortalPage()
 {
   ensureLocalRadioData();
+  reloadRadioPresetCache();
   String html;
   html.reserve(42000);
   html += F("<!doctype html><html><head><meta charset='utf-8'>");
@@ -1084,8 +1179,7 @@ static String captivePortalPage()
   html += F("<label for='pwd'>Password</label><input id='pwd' name='pwd' maxlength='64' type='password' autocomplete='current-password'>");
   html += F("<div class='row'><button type='submit'>Save network</button><a href='/rescan'><button class='ghost' type='button'>Scan again</button></a></div></form>");
 
-  WifiCred wifiList[WIFI_MAX_NETWORKS];
-  int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
+  int wifiCount = loadWifiList(captiveWifiList, WIFI_MAX_NETWORKS);
   html += F("<h2 style='margin-top:18px'>Saved networks</h2>");
   if (wifiCount == 0) {
     html += F("<p class='muted'>No saved network yet.</p>");
@@ -1093,7 +1187,7 @@ static String captivePortalPage()
     html += F("<table><tbody>");
     for (int i = 0; i < wifiCount; i++) {
       html += F("<tr><td>");
-      html += htmlEscape(String(wifiList[i].ssid));
+      html += htmlEscape(String(captiveWifiList[i].ssid));
       html += F("</td><td class='actions'><form method='POST' action='/wifi/forget'><input type='hidden' name='idx' value='");
       html += String(i);
       html += F("'><button class='small danger' type='submit'>Forget</button></form></td></tr>");
@@ -1102,11 +1196,10 @@ static String captivePortalPage()
   }
   html += F("</section>");
 
-  String presetNames[RADIO_PRESET_MAX];
-  String presetUrls[RADIO_PRESET_MAX];
-  int presetCount = loadStationPresets(presetNames, presetUrls, RADIO_PRESET_MAX);
+  int presetCount = radioPresetCacheCount;
   int nextSlot = 1;
-  while (nextSlot <= RADIO_PRESET_MAX && presetUrls[nextSlot - 1].length() > 0) nextSlot++;
+  while (nextSlot <= RADIO_PRESET_MAX && radioPresetCache != nullptr &&
+         radioPresetCache[nextSlot - 1].url[0] != '\0') nextSlot++;
   if (nextSlot > RADIO_PRESET_MAX) nextSlot = RADIO_PRESET_MAX;
 
   html += F("<section id='radio' class='panel'><h2>Add radio</h2>");
@@ -1124,7 +1217,7 @@ static String captivePortalPage()
   html += F("<section class='panel wide'><h2>Current presets</h2>");
   bool hasPreset = false;
   for (int i = 0; i < presetCount; i++) {
-    if (presetUrls[i].length() > 0) {
+    if (radioPresetCache[i].url[0] != '\0') {
       hasPreset = true;
       break;
     }
@@ -1134,13 +1227,13 @@ static String captivePortalPage()
   } else {
     html += F("<table><thead><tr><th class='slot'>#</th><th>Radio</th><th class='actions'></th></tr></thead><tbody>");
     for (int i = 0; i < presetCount; i++) {
-      if (presetUrls[i].length() == 0) continue;
+      if (radioPresetCache[i].url[0] == '\0') continue;
       html += F("<tr><td class='slot'>");
       html += String(i + 1);
       html += F("</td><td><strong>");
-      html += htmlEscape(presetNames[i]);
+      html += htmlEscape(String(radioPresetCache[i].name));
       html += F("</strong><div class='url'>");
-      html += htmlEscape(presetUrls[i]);
+      html += htmlEscape(String(radioPresetCache[i].url));
       html += F("</div></td><td class='actions'><form method='POST' action='/radio/clear'><input type='hidden' name='slot' value='");
       html += String(i + 1);
       html += F("'><button class='small danger' type='submit'>Clear</button></form></td></tr>");
@@ -1194,16 +1287,25 @@ static void captiveHandleSave()
     return;
   }
 
-  saveWifiCredential(finalSsid.c_str(), password.c_str());
-  portalRedirect("wifi");
+  if (!saveWifiCredential(finalSsid.c_str(), password.c_str())) {
+    captiveServer.send(507, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>WiFi not saved</h1><p>Storage failed or the 10-network limit was reached. Forget one network and retry.</p><a href='/'>Back</a></body>"));
+    return;
+  }
+  captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>WiFi saved</h1><p>The radio will restart and connect automatically.</p></body>"));
+  captiveRestartToRadio = false;
+  captiveRestartPending = true;
+  captiveRestartAtMs = millis() + 1500;
 }
 
 static void captiveHandleWifiForget()
 {
   int idx = captiveServer.arg("idx").toInt();
-  WifiCred list[WIFI_MAX_NETWORKS];
-  int count = loadWifiList(list, WIFI_MAX_NETWORKS);
-  if (removeWifiByIndex(list, count, idx)) saveWifiList(list, count);
+  int count = loadWifiList(captiveWifiList, WIFI_MAX_NETWORKS);
+  if (!removeWifiByIndex(captiveWifiList, count, idx) ||
+      !saveWifiList(captiveWifiList, count)) {
+    captiveServer.send(500, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Network not forgotten</h1><a href='/'>Back</a></body>"));
+    return;
+  }
   portalRedirect("forget");
 }
 
@@ -1242,19 +1344,27 @@ static void captiveHandleRadioPick()
 static void captiveHandleRadioClear()
 {
   int slot = captiveServer.arg("slot").toInt() - 1;
-  clearStationPreset(slot);
+  if (!clearStationPreset(slot)) {
+    captiveServer.send(400, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Cannot clear preset</h1><a href='/'>Back</a></body>"));
+    return;
+  }
   portalRedirect("clear");
 }
 
 static void captiveHandleRadioDefaults()
 {
-  writeDefaultPresets();
+  if (!writeDefaultPresets() || !reloadRadioPresetCache()) {
+    captiveServer.send(500, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Cannot restore presets</h1><a href='/'>Back</a></body>"));
+    return;
+  }
   portalRedirect("defaults");
 }
 
 static void captiveHandleRestart()
 {
+  captiveRestartToRadio = false;
   captiveRestartPending = true;
+  captiveRestartAtMs = millis() + 250;
   captiveServer.send(200, "text/html", F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body><h1>Restarting</h1><p>The radio will reboot now.</p></body>"));
 }
 
@@ -1295,7 +1405,12 @@ static void drawCaptivePortalScreen()
   }
 
   tft.setTextColor(TFT_GREY, TFT_WHITE);
-  tft.drawString("Press knob: manual setup", 160, 222, 2);
+  if (captiveReturnToRadioEnabled) {
+    tft.drawString("CHECK: back to radio", 160, 207, 2);
+    tft.drawString("Knob: manual | Auto after 60s idle", 160, 226, 1);
+  } else {
+    tft.drawString("Press knob: manual setup", 160, 222, 2);
+  }
 }
 
 static bool captiveManualButtonPressed()
@@ -1323,6 +1438,8 @@ static void startWifiCaptivePortal()
   if (mac.length() < 4) mac = "0000";
   captiveApName = "MuseRadio-" + mac.substring(mac.length() - 4);
   captiveRestartPending = false;
+  captiveRestartAtMs = 0;
+  captiveRestartToRadio = false;
   captiveManualFallbackRequested = false;
 
   WiFi.softAPConfig(captivePortalIP, captivePortalIP, IPAddress(255, 255, 255, 0));
@@ -1361,10 +1478,49 @@ static void startWifiCaptivePortal()
 
   printf("Captive portal started: SSID=%s PWD=%s URL=%s\n", captiveApName.c_str(), CAPTIVE_AP_PASSWORD, CAPTIVE_PORTAL_URL);
 
+  uint32_t lastPortalClientMs = millis();
+  uint32_t checkReleasedAtMs = 0;
+  uint32_t checkPressedAtMs = 0;
+  bool checkButtonArmed = false;
   while (true) {
     captiveDns.processNextRequest();
     captiveServer.handleClient();
     debugAdcButtonsTick();
+
+    if (captiveReturnToRadioEnabled && !captiveRestartPending) {
+      const uint32_t now = millis();
+      if (WiFi.softAPgetStationNum() > 0) lastPortalClientMs = now;
+
+      const int portalButton = readAdcButtonIndex(nullptr, nullptr);
+      if (!checkButtonArmed) {
+        if (portalButton != sw3) {
+          if (checkReleasedAtMs == 0) checkReleasedAtMs = now;
+          if ((now - checkReleasedAtMs) >= 250) checkButtonArmed = true;
+        } else {
+          checkReleasedAtMs = 0;
+        }
+      } else if (portalButton == sw3) {
+        if (checkPressedAtMs == 0) checkPressedAtMs = now;
+        if ((now - checkPressedAtMs) >= 50) {
+          printf("Captive portal: CHECK pressed, returning to radio\n");
+          captiveRestartToRadio = true;
+          captiveRestartPending = true;
+          captiveRestartAtMs = now + 250;
+        }
+      } else {
+        checkPressedAtMs = 0;
+      }
+
+      if (!captiveRestartPending &&
+          (now - lastPortalClientMs) >= CAPTIVE_IDLE_RETURN_MS) {
+        printf("Captive portal: no AP client for %u ms, returning to radio\n",
+               (unsigned)CAPTIVE_IDLE_RETURN_MS);
+        captiveRestartToRadio = true;
+        captiveRestartPending = true;
+        captiveRestartAtMs = now + 250;
+      }
+    }
+
     if (captiveManualButtonPressed()) {
       waitCaptiveManualButtonReleased();
       captiveServer.stop();
@@ -1373,11 +1529,13 @@ static void startWifiCaptivePortal()
       captiveManualFallbackRequested = true;
       return;
     }
-    if (captiveRestartPending) {
+    if (captiveRestartPending &&
+        (int32_t)(millis() - captiveRestartAtMs) >= 0) {
       tft.fillScreen(TFT_NAVY);
       tft.setTextDatum(TC_DATUM);
       tft.setTextColor(TFT_GREEN);
-      tft.drawString("Restarting...", 160, 105, 4);
+      tft.drawString(captiveRestartToRadio ? "Back to radio..." : "Restarting...",
+                     160, 105, 4);
       delay(1000);
       esp_restart();
     }
@@ -1396,632 +1554,7 @@ void refreshVolume(void)
     if (vol == 0) gpio_set_level(PA, 0);
     else gpio_set_level(PA, 1);
   }
-  audio.setVolume(maxVol / 2, 0);
   ES8388vol_Set(vol);
-  if (spotifyPlaybackActive || spotifyConnectActive())
-  {
-    spotifyConnectSetLocalVolume((uint8_t)vol, (uint8_t)maxVol);
-  }
-}
-
-static String spotifyMetadataLine(const char* text, uint8_t wantedLine)
-{
-  if (!text) return "";
-
-  const char* lineStart = text;
-  uint8_t currentLine = 0;
-  for (const char* p = text; ; ++p)
-  {
-    if (*p == '\n' || *p == '\0')
-    {
-      if (currentLine == wantedLine)
-      {
-        String out;
-        out.reserve((uint16_t)(p - lineStart + 1));
-        for (const char* q = lineStart; q < p; ++q)
-        {
-          out += *q;
-        }
-        out.trim();
-        return out;
-      }
-
-      if (*p == '\0') break;
-      currentLine++;
-      lineStart = p + 1;
-    }
-  }
-
-  return "";
-}
-
-static void requestSpotifyCover(const String& url);
-static void scheduleSpotifyCover(const String& url);
-
-static void updateSpotifyTrackMetadata(const char* text)
-{
-  String previousCoverUrl = spotifyTrackCoverUrl;
-  spotifyTrackTitle = spotifyMetadataLine(text, 0);
-  spotifyTrackArtist = spotifyMetadataLine(text, 1);
-  spotifyTrackCoverUrl = spotifyMetadataLine(text, 2);
-  Serial.printf("[spotify] cover metadata: %s\n",
-                spotifyTrackCoverUrl.length() > 0 ? spotifyTrackCoverUrl.c_str() : "(none)");
-  if (spotifyTrackCoverUrl != previousCoverUrl)
-  {
-    scheduleSpotifyCover(spotifyTrackCoverUrl);
-  }
-}
-
-static void clearSpotifyTrackMetadata()
-{
-  spotifyTrackTitle = "";
-  spotifyTrackArtist = "";
-  spotifyTrackCoverUrl = "";
-  spotifyCoverPendingUrl = "";
-  spotifyCoverRequestDueMs = 0;
-  requestSpotifyCover("");
-}
-
-#if ENABLE_SPOTIFY_CONNECT
-static bool downloadSpotifyCoverJpeg(const char* url, uint8_t** outData, size_t* outLen)
-{
-  *outData = nullptr;
-  *outLen = 0;
-
-  if (!url || !url[0] || WiFi.status() != WL_CONNECTED) return false;
-
-  String requestUrl(url);
-  if (requestUrl.startsWith("https://i.scdn.co/"))
-  {
-    requestUrl.replace("https://", "http://");
-  }
-  requestUrl.replace("00001e02", "00004851");
-  requestUrl.replace("0000b273", "00004851");
-  requestUrl.replace("000082c1", "00004851");
-  Serial.printf("[spotify] cover request: %s\n", requestUrl.c_str());
-
-  WiFiClient client;
-
-  HTTPClient http;
-  http.setTimeout(8000);
-  http.setReuse(false);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-  if (!http.begin(client, requestUrl))
-  {
-    Serial.println("[spotify] cover http begin failed");
-    return false;
-  }
-
-  const int httpCode = http.GET();
-  Serial.printf("[spotify] cover http code=%d len=%d\n", httpCode, http.getSize());
-  if (httpCode != HTTP_CODE_OK)
-  {
-    Serial.printf("[spotify] cover http code=%d\n", httpCode);
-    http.end();
-    return false;
-  }
-
-  const int contentLength = http.getSize();
-  if (contentLength <= 0 || (size_t)contentLength > SPOTIFY_COVER_JPEG_MAX)
-  {
-    Serial.printf("[spotify] cover invalid size=%d\n", contentLength);
-    http.end();
-    return false;
-  }
-
-  uint8_t* data = (uint8_t*)heap_caps_malloc((size_t)contentLength, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!data)
-  {
-    data = (uint8_t*)malloc((size_t)contentLength);
-  }
-  if (!data)
-  {
-    Serial.println("[spotify] cover jpeg alloc failed");
-    http.end();
-    return false;
-  }
-
-  WiFiClient* stream = http.getStreamPtr();
-  int totalRead = 0;
-  uint32_t lastProgressMs = millis();
-
-  while (totalRead < contentLength)
-  {
-    if ((int32_t)(millis() - lastProgressMs) > 10000)
-    {
-      Serial.println("[spotify] cover download timeout");
-      free(data);
-      http.end();
-      return false;
-    }
-
-    int available = stream->available();
-    if (available <= 0)
-    {
-      delay(5);
-      continue;
-    }
-
-    int chunk = contentLength - totalRead;
-    if (chunk > available) chunk = available;
-    if (chunk > 1024) chunk = 1024;
-
-    const int readNow = stream->readBytes(data + totalRead, chunk);
-    if (readNow > 0)
-    {
-      totalRead += readNow;
-      lastProgressMs = millis();
-    }
-    else
-    {
-      delay(5);
-    }
-  }
-
-  http.end();
-  *outData = data;
-  *outLen = (size_t)totalRead;
-  Serial.printf("[spotify] cover downloaded %u bytes\n", (unsigned)*outLen);
-  return true;
-}
-
-struct SpotifyJpegDecodeContext
-{
-  const uint8_t* data;
-  size_t len;
-  size_t pos;
-  uint16_t* tempPixels;
-  uint16_t tempWidth;
-  uint16_t tempHeight;
-};
-
-static UINT spotifyJpegInput(JDEC* decoder, BYTE* buffer, UINT byteCount)
-{
-  SpotifyJpegDecodeContext* ctx = (SpotifyJpegDecodeContext*)decoder->device;
-  if (!ctx) return 0;
-
-  const size_t remaining = ctx->len - ctx->pos;
-  UINT toRead = byteCount;
-  if (toRead > remaining) toRead = (UINT)remaining;
-
-  if (buffer && toRead > 0)
-  {
-    memcpy(buffer, ctx->data + ctx->pos, toRead);
-  }
-  ctx->pos += toRead;
-  return toRead;
-}
-
-static UINT spotifyJpegOutput(JDEC* decoder, void* bitmap, JRECT* rect)
-{
-  SpotifyJpegDecodeContext* ctx = (SpotifyJpegDecodeContext*)decoder->device;
-  if (!ctx || !bitmap || !rect) return 0;
-
-  const uint16_t blockWidth = rect->right - rect->left + 1;
-  const uint16_t blockHeight = rect->bottom - rect->top + 1;
-  const uint8_t* src = (const uint8_t*)bitmap;
-
-  for (uint16_t y = 0; y < blockHeight; y++)
-  {
-    const uint16_t dstY = rect->top + y;
-    if (dstY >= ctx->tempHeight) continue;
-
-    for (uint16_t x = 0; x < blockWidth; x++)
-    {
-      const uint16_t dstX = rect->left + x;
-      if (dstX >= ctx->tempWidth) continue;
-
-      const size_t srcIndex = ((size_t)y * blockWidth + x) * 3;
-      const uint8_t r = src[srcIndex + 0];
-      const uint8_t g = src[srcIndex + 1];
-      const uint8_t b = src[srcIndex + 2];
-      uint16_t color = ((uint16_t)(r & 0xF8) << 8) |
-                       ((uint16_t)(g & 0xFC) << 3) |
-                       (uint16_t)(b >> 3);
-      color = (uint16_t)((color << 8) | (color >> 8));
-      ctx->tempPixels[(size_t)dstY * ctx->tempWidth + dstX] = color;
-    }
-  }
-
-  return 1;
-}
-
-static uint8_t spotifyJpegScaleFor(uint16_t width, uint16_t height)
-{
-  uint16_t maxDim = width > height ? width : height;
-  uint8_t scale = 0;
-  while (scale < 3 && (maxDim >> scale) > (SPOTIFY_COVER_SIZE * 2))
-  {
-    scale++;
-  }
-  return scale;
-}
-
-static bool decodeSpotifyCoverJpeg(const uint8_t* jpegData, size_t jpegLen, uint16_t* scaledPixels)
-{
-  constexpr size_t WORK_POOL_SIZE = 8192;
-  void* workPool = heap_caps_malloc(WORK_POOL_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!workPool)
-  {
-    workPool = malloc(WORK_POOL_SIZE);
-  }
-  if (!workPool)
-  {
-    Serial.println("[spotify] cover work pool alloc failed");
-    return false;
-  }
-
-  SpotifyJpegDecodeContext ctx = {};
-  ctx.data = jpegData;
-  ctx.len = jpegLen;
-
-  JDEC decoder = {};
-  JRESULT result = jd_prepare(&decoder, spotifyJpegInput, workPool, WORK_POOL_SIZE, &ctx);
-  if (result != JDR_OK)
-  {
-    Serial.printf("[spotify] cover jpeg prepare failed=%d\n", (int)result);
-    free(workPool);
-    return false;
-  }
-
-  const uint8_t scale = spotifyJpegScaleFor(decoder.width, decoder.height);
-  ctx.tempWidth = (decoder.width + (1U << scale) - 1U) >> scale;
-  ctx.tempHeight = (decoder.height + (1U << scale) - 1U) >> scale;
-
-  const size_t tempPixelsCount = (size_t)ctx.tempWidth * ctx.tempHeight;
-  if (tempPixelsCount == 0 || tempPixelsCount > (220U * 220U))
-  {
-    Serial.printf("[spotify] cover temp size rejected %ux%u\n", ctx.tempWidth, ctx.tempHeight);
-    free(workPool);
-    return false;
-  }
-
-  ctx.tempPixels = (uint16_t*)heap_caps_malloc(tempPixelsCount * sizeof(uint16_t),
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!ctx.tempPixels)
-  {
-    ctx.tempPixels = (uint16_t*)malloc(tempPixelsCount * sizeof(uint16_t));
-  }
-  if (!ctx.tempPixels)
-  {
-    Serial.println("[spotify] cover temp pixels alloc failed");
-    free(workPool);
-    return false;
-  }
-  memset(ctx.tempPixels, 0, tempPixelsCount * sizeof(uint16_t));
-
-  result = jd_decomp(&decoder, spotifyJpegOutput, scale);
-  free(workPool);
-
-  if (result != JDR_OK)
-  {
-    Serial.printf("[spotify] cover jpeg decode failed=%d\n", (int)result);
-    free(ctx.tempPixels);
-    return false;
-  }
-
-  for (int y = 0; y < SPOTIFY_COVER_SIZE; y++)
-  {
-    const uint32_t srcY = ((uint32_t)y * ctx.tempHeight) / SPOTIFY_COVER_SIZE;
-    for (int x = 0; x < SPOTIFY_COVER_SIZE; x++)
-    {
-      const uint32_t srcX = ((uint32_t)x * ctx.tempWidth) / SPOTIFY_COVER_SIZE;
-      scaledPixels[y * SPOTIFY_COVER_SIZE + x] =
-        ctx.tempPixels[srcY * ctx.tempWidth + srcX];
-    }
-  }
-
-  Serial.printf("[spotify] cover decoded %ux%u scale=%u -> %dx%d\n",
-                decoder.width, decoder.height, scale, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE);
-  free(ctx.tempPixels);
-  return true;
-}
-
-static void spotifyCoverTask(void*)
-{
-  SpotifyCoverRequest req = {};
-  while (true)
-  {
-    if (xQueueReceive(spotifyCoverQueue, &req, portMAX_DELAY) != pdTRUE) continue;
-
-    SpotifyCoverRequest latest = {};
-    while (xQueueReceive(spotifyCoverQueue, &latest, 0) == pdTRUE)
-    {
-      req = latest;
-    }
-
-    uint16_t* scaledPixels = (uint16_t*)heap_caps_malloc(
-      SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t),
-      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!scaledPixels)
-    {
-      scaledPixels = (uint16_t*)malloc(SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t));
-    }
-
-    uint8_t* jpegData = nullptr;
-    size_t jpegLen = 0;
-    bool ok = scaledPixels &&
-              downloadSpotifyCoverJpeg(req.url, &jpegData, &jpegLen) &&
-              decodeSpotifyCoverJpeg(jpegData, jpegLen, scaledPixels);
-
-    if (jpegData) free(jpegData);
-
-    if (ok && req.generation == spotifyCoverGeneration)
-    {
-      if (!spotifyCoverPixels)
-      {
-        spotifyCoverPixels = (uint16_t*)heap_caps_malloc(
-          SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t),
-          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!spotifyCoverPixels)
-        {
-          spotifyCoverPixels = (uint16_t*)malloc(SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t));
-        }
-      }
-
-      if (spotifyCoverPixels)
-      {
-        memcpy(spotifyCoverPixels, scaledPixels, SPOTIFY_COVER_SIZE * SPOTIFY_COVER_SIZE * sizeof(uint16_t));
-        spotifyCoverPixelsReady = true;
-        spotifyCoverNeedsDraw = true;
-      }
-      else
-      {
-        ok = false;
-      }
-    }
-
-    if (!ok && req.generation == spotifyCoverGeneration)
-    {
-      spotifyCoverPixelsReady = false;
-      spotifyCoverNeedsDraw = true;
-      Serial.println("[spotify] cover unavailable");
-    }
-
-    if (scaledPixels) free(scaledPixels);
-  }
-}
-
-static void requestSpotifyCover(const String& url)
-{
-  spotifyCoverGeneration++;
-  spotifyCoverPixelsReady = false;
-  spotifyCoverNeedsDraw = true;
-
-  if (url.length() == 0)
-  {
-    Serial.println("[spotify] cover request cleared");
-    return;
-  }
-
-  if (!spotifyCoverQueue)
-  {
-    spotifyCoverQueue = xQueueCreate(1, sizeof(SpotifyCoverRequest));
-  }
-  if (!spotifyCoverQueue)
-  {
-    Serial.println("[spotify] cover queue create failed");
-    return;
-  }
-
-  if (!spotifyCoverTaskH)
-  {
-    const BaseType_t rc = xTaskCreatePinnedToCore(
-      spotifyCoverTask, "spotifyCover", 12288, nullptr, 1, &spotifyCoverTaskH, 0);
-    if (rc != pdPASS)
-    {
-      Serial.printf("[spotify] cover task create failed rc=%ld\n", (long)rc);
-      spotifyCoverTaskH = nullptr;
-      return;
-    }
-  }
-
-  SpotifyCoverRequest req = {};
-  url.toCharArray(req.url, sizeof(req.url));
-  req.generation = spotifyCoverGeneration;
-  Serial.printf("[spotify] cover queued gen=%lu url=%s\n",
-                (unsigned long)req.generation, req.url);
-  xQueueOverwrite(spotifyCoverQueue, &req);
-}
-
-static void scheduleSpotifyCover(const String& url)
-{
-  spotifyCoverPendingUrl = "";
-  spotifyCoverRequestDueMs = 0;
-
-  if (url.length() == 0)
-  {
-    requestSpotifyCover("");
-    return;
-  }
-
-  spotifyCoverPixelsReady = false;
-  spotifyCoverNeedsDraw = true;
-  spotifyCoverPendingUrl = url;
-  spotifyCoverRequestDueMs = millis() + SPOTIFY_COVER_DELAY_MS;
-  Serial.printf("[spotify] cover scheduled in %lu ms\n",
-                (unsigned long)SPOTIFY_COVER_DELAY_MS);
-}
-
-static void drawSpotifyCoverPlaceholder()
-{
-  tft.fillRect(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, TFT_BLACK);
-  tft.drawRect(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, TFT_GREY);
-}
-
-static void drawSpotifyCover()
-{
-  if (spotifyCoverPixelsReady && spotifyCoverPixels)
-  {
-    const bool oldSwap = tft.getSwapBytes();
-    tft.setSwapBytes(false);
-    tft.pushImage(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, spotifyCoverPixels);
-    tft.setSwapBytes(oldSwap);
-    tft.drawRect(SPOTIFY_COVER_X, SPOTIFY_COVER_Y, SPOTIFY_COVER_SIZE, SPOTIFY_COVER_SIZE, TFT_GREY);
-  }
-  else
-  {
-    drawSpotifyCoverPlaceholder();
-  }
-  spotifyCoverNeedsDraw = false;
-}
-
-static void serviceSpotifyCoverDisplay()
-{
-  if (spotifyCoverPendingUrl.length() > 0 &&
-      spotifyPlaybackActive &&
-      spotifyCoverRequestDueMs != 0 &&
-      (int32_t)(millis() - spotifyCoverRequestDueMs) >= 0)
-  {
-    String url = spotifyCoverPendingUrl;
-    spotifyCoverPendingUrl = "";
-    spotifyCoverRequestDueMs = 0;
-    requestSpotifyCover(url);
-  }
-
-  if (!spotifyCoverNeedsDraw || Bdonate) return;
-  if (!spotifyPlaybackActive && !spotifyConnectActive())
-  {
-    spotifyCoverNeedsDraw = false;
-    return;
-  }
-
-  tft.setRotation(1);
-  drawSpotifyCover();
-}
-#else
-static void requestSpotifyCover(const String&) {}
-static void scheduleSpotifyCover(const String&) {}
-static void drawSpotifyCoverPlaceholder() {}
-static void serviceSpotifyCoverDisplay() {}
-#endif
-
-static String fitSpotifyText(String text, uint8_t font, int maxWidth)
-{
-  text.trim();
-  if (text.length() == 0) return "";
-  if (tft.textWidth(text, font) <= maxWidth) return text;
-
-  while (text.length() > 0)
-  {
-    text.remove(text.length() - 1);
-    text.trim();
-
-    String candidate = text;
-    candidate += "...";
-    if (tft.textWidth(candidate, font) <= maxWidth)
-    {
-      return candidate;
-    }
-  }
-
-  return "...";
-}
-
-static void drawSpotifyTextLine(const String& text, int y, uint8_t font, uint16_t color)
-{
-  const bool hasCover = spotifyTrackCoverUrl.length() > 0;
-  const int centerX = hasCover ? 212 : 200;
-  const int maxWidth = hasCover ? 202 : 232;
-  String fitted = fitSpotifyText(text, font, maxWidth);
-  if (fitted.length() == 0) return;
-
-  tft.setTextColor(color, TFT_BLACK);
-  tft.drawString(fitted, centerX, y, font);
-}
-
-static void drawSpotifyStatus(const char* line)
-{
-  tft.setRotation(1);
-  tft.fillRect(8, 78, 312, 112, TFT_BLACK);
-#if ENABLE_SPOTIFY_CONNECT
-  if (spotifyTrackCoverUrl.length() > 0)
-  {
-    drawSpotifyCoverPlaceholder();
-    if (spotifyCoverPixelsReady) spotifyCoverNeedsDraw = true;
-  }
-#endif
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("Spotify Connect", spotifyTrackCoverUrl.length() > 0 ? 212 : 200, 86, 4);
-
-  const bool hasTrack = spotifyTrackTitle.length() > 0 || spotifyTrackArtist.length() > 0;
-  if (hasTrack)
-  {
-    drawSpotifyTextLine(spotifyTrackTitle.length() > 0 ? spotifyTrackTitle : "Unknown title", 122, 4, TFT_WHITE);
-    drawSpotifyTextLine(spotifyTrackArtist.length() > 0 ? spotifyTrackArtist : "Unknown artist", 151, 2, TFT_GREY);
-
-    if (line && strcmp(line, "Spotify paused") == 0)
-    {
-      drawSpotifyTextLine("Paused", 172, 2, TFT_YELLOW);
-    }
-  }
-  else
-  {
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    if (line && line[0])
-    {
-      drawSpotifyTextLine(line, 135, 2, TFT_WHITE);
-    }
-    else
-    {
-      drawSpotifyTextLine(spotifyConnectDeviceName(), 135, 2, TFT_WHITE);
-    }
-  }
-}
-
-static void handleSpotifyConnectEvent(SpotifyConnectEvent event, uint32_t value, const char* text)
-{
-  switch (event)
-  {
-    case SpotifyConnectEvent::Ready:
-      printf("[spotify] ready: %s\n", text ? text : spotifyConnectDeviceName());
-      break;
-    case SpotifyConnectEvent::Active:
-      spotifyPlaybackActive = true;
-      spotifyRadioResumeAtMs = 0;
-      audio.stopSong();
-      connected = false;
-      refreshVolume();
-      drawSpotifyStatus(text ? text : spotifyConnectDeviceName());
-      break;
-    case SpotifyConnectEvent::Paused:
-      spotifyPlaybackActive = true;
-      refreshVolume();
-      drawSpotifyStatus(text ? text : "Spotify paused");
-      break;
-    case SpotifyConnectEvent::Inactive:
-      spotifyRadioResumeAtMs = millis() + 1500;
-      spotifyPlaybackActive = false;
-      connected = false;
-      clearSpotifyTrackMetadata();
-      refreshVolume();
-      drawSpotifyStatus(text ? text : "Radio resumes...");
-      break;
-    case SpotifyConnectEvent::Track:
-      updateSpotifyTrackMetadata(text);
-      drawSpotifyStatus(nullptr);
-      break;
-    case SpotifyConnectEvent::Volume:
-    {
-      int newVol = (int)((value * maxVol + 32767UL) / 65535UL);
-      if (newVol < 0) newVol = 0;
-      if (newVol > maxVol) newVol = maxVol;
-      if (newVol != vol)
-      {
-        vol = newVol;
-        V = vol * pos360 / maxVol;
-        PV = V;
-        volEncoder.setCount(V);
-        refreshVolume();
-        toDisplay = 3;
-      }
-      break;
-    }
-    default:
-      break;
-  }
 }
 
 int16_t xpos = 0;
@@ -2040,7 +1573,7 @@ void pngDraw(PNGDRAW *pDraw) {
   tft.pushImage(xpos, ypos + pDraw->y, pDraw->iWidth, 1, lineBuffer);
 }
 
-void drawImage(char* f, int x, int y)
+void drawImage(const char* f, int x, int y)
 {
   xpos = x; ypos = y;
   int16_t rc = png.open(f, pngOpen, pngClose, pngRead, pngSeek, pngDraw);
@@ -2144,7 +1677,7 @@ static void debugAdcButtonsTick()
 #endif
 }
 
-static int readAdcButtonIndex(int *rawOut = nullptr, int *diffOut = nullptr)
+static int readAdcButtonIndex(int *rawOut, int *diffOut)
 {
   int adcValue = readAdcButtonsRaw();
   int bestDiff = 0;
@@ -2176,17 +1709,30 @@ static bool consumeAdcButtonEvent(int index)
 static void keyb(void* pdata)
 {
   int adcHeldButton = -1;
+  uint32_t adcPressedAtMs = 0;
+  bool adcLongPressSent = false;
 
   while (1)
   {
     int adcRaw = 0;
     int adcDiff = 0;
     int adcButton = readAdcButtonIndex(&adcRaw, &adcDiff);
-    if (adcButton >= 0 && adcHeldButton < 0) {
-      pushAdcButtonEvent(adcButton);
-      printf("ADC event button=%d raw=%d diff=%d\n", adcButton + 1, adcRaw, adcDiff);
+    if (adcButton != adcHeldButton) {
+      adcHeldButton = adcButton;
+      adcPressedAtMs = millis();
+      adcLongPressSent = false;
+      if (adcButton >= sw0 && adcButton <= sw2) {
+        pushAdcButtonEvent(adcButton);
+        printf("ADC preset event button=%d raw=%d diff=%d\n",
+               adcButton + 1, adcRaw, adcDiff);
+      }
+    } else if (adcButton == sw3 && !adcLongPressSent &&
+               (millis() - adcPressedAtMs) >= ADC_SETTINGS_HOLD_MS) {
+      adcLongPressSent = true;
+      pushAdcButtonEvent(sw3);
+      printf("ADC settings event: check button held %u ms\n",
+             (unsigned)ADC_SETTINGS_HOLD_MS);
     }
-    adcHeldButton = adcButton;
 
     //   printf("CLICK1 = %d   CLICK2 = %d\n", gpio_get_level(CLICK1), gpio_get_level(CLICK2));
     if ((gpio_get_level(CLICK1) == 0) && (CLICK1B == false)) CLICK1E = true;
@@ -2214,78 +1760,72 @@ static void keyb(void* pdata)
 }
 
 
-/////////////////////////////////////////////////////////////////////////////
-// gets station link from LittleFS file "/linkS"
-//
-/////////////////////////////////////////////////////////////////////////////
-char* Rlink(int st)
+static bool reloadRadioPresetCache()
 {
-  static char out[RADIO_URL_MAX];
-  out[0] = 0;
-  if (st < 0 || st >= RADIO_PRESET_MAX) return out;
-  File ln = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
-  if (!ln) return out;
-
-  int slot = 0;
-  while (ln.available() && slot <= st) {
-    String line = ln.readStringUntil('\n');
-    line.trim();
-    if (slot == st && line.length() > 0) {
-      line.toCharArray(out, sizeof(out));
-      break;
+  if (radioPresetCache == nullptr) {
+    radioPresetCache = (CachedRadioPreset *)heap_caps_calloc(
+      RADIO_PRESET_MAX, sizeof(CachedRadioPreset), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    radioPresetCacheInPsram = (radioPresetCache != nullptr);
+    if (radioPresetCache == nullptr) {
+      radioPresetCache = (CachedRadioPreset *)heap_caps_calloc(
+        RADIO_PRESET_MAX, sizeof(CachedRadioPreset), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    slot++;
   }
-  ln.close();
-  return out;
-}
-/////////////////////////////////////////////////////////////////////////////////
-//  gets station name from LittleFS file "/namS"
-//
-/////////////////////////////////////////////////////////////////////////////////
-char* Rname(int st)
-{
-  static char out[RADIO_NAME_MAX];
-  snprintf(out, sizeof(out), "Preset %d", st + 1);
-  if (st < 0 || st >= RADIO_PRESET_MAX) return out;
-  File ln = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
-  if (!ln) return out;
+  if (radioPresetCache == nullptr) return false;
+  memset(radioPresetCache, 0, RADIO_PRESET_MAX * sizeof(CachedRadioPreset));
 
-  int slot = 0;
-  while (ln.available() && slot <= st) {
-    String line = ln.readStringUntil('\n');
-    line.trim();
-    if (slot == st && line.length() > 0) {
-      line.toCharArray(out, sizeof(out));
-      break;
-    }
-    slot++;
+  File nameFile = LittleFS.open(RADIO_NAME_PATH, FILE_READ);
+  File linkFile = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
+  if (!nameFile || !linkFile) {
+    if (nameFile) nameFile.close();
+    if (linkFile) linkFile.close();
+    radioPresetCacheCount = 0;
+    return false;
   }
-  ln.close();
-  return out;
-}
-/////////////////////////////////////////////////////////////////////////
-//  defines how many stations in LittleFS file "/linkS"
-//
-////////////////////////////////////////////////////////////////////////
-int maxStation(void)
-{
-  File ln = LittleFS.open(RADIO_LINK_PATH, FILE_READ);
-  if (!ln) {
-    printf("=========> 0 \n");
-    return 0;
-  }
+
   int slot = 0;
   int highestUsedSlot = 0;
-  while (ln.available() && slot < RADIO_PRESET_MAX) {
-    String line = ln.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) highestUsedSlot = slot + 1;
+  while (slot < RADIO_PRESET_MAX && (nameFile.available() || linkFile.available())) {
+    String name = nameFile.available() ? nameFile.readStringUntil('\n') : "";
+    String url = linkFile.available() ? linkFile.readStringUntil('\n') : "";
+    name.trim();
+    url.trim();
+    if (url.length() > 0 && isValidRadioUrl(url)) {
+      if (!name.length()) name = "Preset " + String(slot + 1);
+      name.toCharArray(radioPresetCache[slot].name, sizeof(radioPresetCache[slot].name));
+      url.toCharArray(radioPresetCache[slot].url, sizeof(radioPresetCache[slot].url));
+      highestUsedSlot = slot + 1;
+    }
     slot++;
   }
-  ln.close();
-  printf("=========> %d \n", highestUsedSlot);
-  return highestUsedSlot;
+  nameFile.close();
+  linkFile.close();
+  radioPresetCacheCount = highestUsedSlot;
+  printf("Radio cache loaded: %d slots (%s)\n", radioPresetCacheCount,
+         radioPresetCacheInPsram ? "PSRAM" : "internal RAM");
+  return radioPresetCacheCount > 0;
+}
+
+char* Rlink(int st)
+{
+  static char empty[1] = {0};
+  if (radioPresetCache == nullptr || st < 0 || st >= RADIO_PRESET_MAX) return empty;
+  return radioPresetCache[st].url;
+}
+
+char* Rname(int st)
+{
+  static char fallback[RADIO_NAME_MAX];
+  if (radioPresetCache != nullptr && st >= 0 && st < RADIO_PRESET_MAX && radioPresetCache[st].name[0]) {
+    return radioPresetCache[st].name;
+  }
+  snprintf(fallback, sizeof(fallback), "Preset %d", st + 1);
+  return fallback;
+}
+
+int maxStation(void)
+{
+  return radioPresetCacheCount;
 }
 
 static bool stationSlotHasUrl(int slot)
@@ -2329,7 +1869,8 @@ static void stopRuntimeTasksForSettings()
 
 static void enterSettingsFromButton()
 {
-  printf("ADC action button1: open settings portal\n");
+  printf("ADC action check hold: open settings portal\n");
+  captiveReturnToRadioEnabled = true;
   BSettings = true;
   toDisplay = 0;
   displayON();
@@ -2337,6 +1878,35 @@ static void enterSettingsFromButton()
   connected = false;
   stopRuntimeTasksForSettings();
   settings();
+}
+
+static void selectRadioPresetDirect(int presetIndex)
+{
+  if (presetIndex < 0 || presetIndex >= 3) return;
+  displayON();
+  if (!stationSlotHasUrl(presetIndex)) {
+    wakeTftBacklight();
+    tft.setRotation(1);
+    tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString(("Preset " + String(presetIndex + 1) + " empty").c_str(), 180, 105, 4);
+    printf("ADC preset %d ignored: empty\n", presetIndex + 1);
+    return;
+  }
+
+  station = presetIndex;
+  S = presetIndex * 2;
+  VS = S;
+  staEncoder.setCount(S);
+  modSta = false;
+  CLICK2B = false;
+  stationDisplayPending = true;
+  toDisplay = 2;
+  if (!saveStoredInt("/station", station)) {
+    printf("Failed to persist direct preset %d\n", presetIndex + 1);
+  }
+  printf("ADC direct preset=%d name=%s\n", presetIndex + 1, Rname(presetIndex));
 }
 
 static void drawStationSelectScreen()
@@ -2367,44 +1937,53 @@ static void drawStationSelectScreen()
 static void playRadio(void* data)
 {
   while (started == false) delay(100);
+  uint32_t nextConnectAttemptMs = 0;
+  uint32_t retryDelayMs = 1000;
   while (1)
   {
-    if (spotifyPlaybackActive || spotifyConnectActive() ||
-        (spotifyRadioResumeAtMs != 0 && (int32_t)(millis() - spotifyRadioResumeAtMs) < 0))
-    {
-      vTaskDelay(20 / portTICK_PERIOD_MS);
-      continue;
-    }
-    // printf("st %d prev %d\n",station,previousStation);
-    if ((station != previousStation) || (connected == false))
-    {
-      printf("station no %d %s\n", station, Rname(station));
-      delay(500);
+    const int requestedStation = station;
+    if (requestedStation != previousStation) {
       audio.stopSong();
       connected = false;
-      //delay(100);
-      linkS = Rlink(station);
-      if (!linkS || linkS[0] == 0) {
-        printf("station no %d empty, skipping\n", station);
-        station = normalizeStationSlot(station, 1, maxStation());
-        previousStation = -1;
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-        continue;
-      }
-      mes[0] = 0;
-      audio.connecttohost(linkS);
-      previousStation = station;
-      refreshVolume();
-      tft.setRotation(1);
-      tft.fillRect(80, 90, 240, 60, TFT_BLACK);
-      tft.setTextColor(TFT_STATION);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString(Rname(station), 180, 105, 4);
-
-      //    staEncoder.setCount(station);
-      if (connected == false) delay(50);
-      toDisplay = 2;
+      previousStation = requestedStation;
+      nextConnectAttemptMs = 0;
+      retryDelayMs = 1000;
     }
+
+    if (!connected && (int32_t)(millis() - nextConnectAttemptMs) >= 0) {
+      if (WiFi.status() != WL_CONNECTED) {
+        printf("Radio waiting for WiFi; retry in %u ms\n", retryDelayMs);
+        wifiMulti.run(5000);
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        const int activeStation = station;
+        const char *url = Rlink(activeStation);
+        if (!url || !url[0]) {
+          station = normalizeStationSlot(activeStation, 1, maxStation());
+          previousStation = -1;
+        } else {
+          printf("Radio connect preset=%d name=%s url=%s\n", activeStation + 1, Rname(activeStation), url);
+          mes[0] = 0;
+          audio.stopSong();
+          connected = audio.connecttohost(url);
+          if (connected) {
+            retryDelayMs = 1000;
+            stationDisplayPending = true;
+            toDisplay = 2;
+            refreshVolume();
+          } else {
+            printf("Radio connection rejected; retry in %u ms\n", retryDelayMs);
+          }
+        }
+      }
+
+      if (!connected) {
+        nextConnectAttemptMs = millis() + retryDelayMs;
+        retryDelayMs = retryDelayMs < 7500 ? retryDelayMs * 2 : 15000;
+      }
+    }
+
     audio.loop();
     vTaskDelay(1);
   }
@@ -2424,12 +2003,14 @@ static void jack(void* data)
       if (jackON == false)
       {
         printf("Jack ON\n");
+        xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
         gpio_set_level(PA, 0);          // amp off
         ES8388_Write_Reg(29, 0x00);     // stereo
-        ES8388_Write_Reg(28, 0x08);     // no phase inversion + click free power up/down
+        ES8388_Write_Reg(28, 0x04);     // no phase inversion + click free power up/down
         ES8388_Write_Reg(4, 0x0C);     // Rout2/Lout2
         jackON = true;
         refreshVolume();
+        xSemaphoreGiveRecursive(codecMutex);
       }
     }
     else
@@ -2437,12 +2018,14 @@ static void jack(void* data)
       if (jackON == true)
       {
         printf("Jack OFF\n");
+        xSemaphoreTakeRecursive(codecMutex, portMAX_DELAY);
         gpio_set_level(PA, 1);          // amp on
         ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
-        ES8388_Write_Reg(28, 0x18);     // Right DAC phase inversion + click free power up/down
+        ES8388_Write_Reg(28, 0x14);     // Right DAC phase inversion + click free power up/down
         ES8388_Write_Reg(4, 0x30);      // Rout1/Lout1
         jackON = false;
         refreshVolume();
+        xSemaphoreGiveRecursive(codecMutex);
       }
     }
     delay(1000);
@@ -2553,13 +2136,12 @@ void retrieveDisplay(void)
   tft.setTextColor(TFT_WHITE);
   tft.setTextDatum(TC_DATUM);
   tft.drawCircle(50, 35, 18, TFT_WHITE);
-  if (mode == '0')  tft.drawString("4G", 50, 27, 2);
-  else tft.drawString("WiFi", 50, 27, 2);
+  tft.drawString("WiFi", 50, 27, 2);
 
 
   tft.setTextColor(TFT_GREY, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
-  tft.drawString("1-Settings portal", 20, 220, 2);
+  tft.drawString("1/2/3: presets | Hold CHECK 5s: portal", 10, 220, 1);
   tft.drawString(version, 280, 220, 2);
 
   // restart battery display and display on/off
@@ -2617,7 +2199,7 @@ void settings(void)
   startWifiCaptivePortal();
   if (!captiveManualFallbackRequested) return;
 
-  int j;
+  int j = 0;
   int pos;
   char charSet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=%*&-_(){}[]@,;:?./X";
   int charSetLength = strlen(charSet);
@@ -2661,11 +2243,6 @@ void settings(void)
   }
 
 
-  uint8_t bm = 0x31;
-  File ln = LittleFS.open("/mode", FILE_WRITE);
-  ln.write(&bm, 1);
-  ln.close();
-
   if (pos == 0)
   {
     headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
@@ -2679,6 +2256,12 @@ void settings(void)
 
     int nSsid = WiFi.scanNetworks();
     printf("ssid# %d\n", nSsid);
+    if (nSsid <= 0) {
+      tft.drawString("No WiFi network found", 160, 110, 2);
+      tft.drawString("Restarting portal...", 160, 145, 2);
+      delay(2000);
+      ESP.restart();
+    }
     if (nSsid > 6) nSsid = 6;
     staEncoder.setCount(0);
     while (gpio_get_level(CLICK2) == 1)
@@ -2705,11 +2288,6 @@ void settings(void)
     }
     strcpy((char*)ssid, WiFi.SSID(j).c_str());
     printf("ssid = %s\n", ssid);
-    // Keep legacy file for compatibility but main storage is wifi.json
-    ln = LittleFS.open("/ssid", FILE_WRITE);
-    ln.write(ssid, strlen((char*)ssid) + 1);
-    ln.close();
-
     delay(1000);
     headerL("SETTINGS", "2- Select your Wifi credentials", TFT_NAVY);
     tft.setTextColor(TFT_RED);
@@ -2803,7 +2381,13 @@ void settings(void)
     }
     printf("ssid: %s   pwd: %s\n", ssid, pwd);
 
-    saveWifiCredential((char*)ssid, (char*)pwd);
+    if (!saveWifiCredential((char*)ssid, (char*)pwd)) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextColor(TFT_RED);
+      tft.drawString("WiFi save failed", 160, 105, 4);
+      delay(3000);
+    }
   }
   //  }
   tft.fillScreen(TFT_NAVY);
@@ -2828,135 +2412,39 @@ void settings(void)
   */
 }
 ///////////////////////////////////////////////////////////////////////
-// init WiFi credentials using Improv
-////////////////////////////////////////////////////////////////////////
-ImprovWiFi improvSerial(&USBSerial);
-
-void WiFiConnected(const char *ssid, const char *password)
-{
-  //  printf("%s   %s\n", ssid, password);
-  saveWifiCredential(ssid, password);
-  if (radioH) vTaskDelete(radioH);
-  if (keybH) vTaskDelete(keybH);
-  if (batteryH) vTaskDelete(batteryH);
-  if (jackH) vTaskDelete(jackH);
-  if (remoteH) vTaskDelete(remoteH);
-  if (displayONOFFH) vTaskDelete(displayONOFFH);
-
-
-  tft.fillScreen(TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_GREEN);
-  tft.drawString("Restarting...", 150, 105, 4);
-
-  delay(1000);
-  esp_restart();
-  /*
-    gpio_set_level(backLight, 1);
-    tft.fillScreen(TFT_NAVY);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(TFT_GREEN);
-    tft.drawString("Settings modified!", 150, 85, 4);
-    tft.setTextColor(TFT_RED);
-    tft.drawString("Please, restart!", 150, 125, 4);
-    tft.setTextColor(TFT_YELLOW);
-    tft.drawString("(power switch => OFF/ON)", 150, 155, 2);
-    for(;;);
-  */
-}
-static void improvWiFiInit(void* data)
-{
-  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_S3, "Radio", "1.5", "Raspiaudio Radio");
-  improvSerial.onImprovConnected(WiFiConnected);
-  delay(500);
-  while (true)
-  {
-    improvSerial.handleSerial();
-    vTaskDelay(10 / portTICK_PERIOD_MS); // Use FreeRTOS delay
-  }
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// .ota bin loading
-//////////////////////////////////////////////////////////////////////////////////////////////////
-void loadLastOTA(void)
-{
-  delay(1000);
-  // Configure custom Root CA
-  tft.fillRect(0, 0, 320, 240, TFT_BLACK);
-  tft.setTextColor(TFT_RED);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("Loading last binary...", 180, 105, 4);
-  ota.setCACert(root_ca);
-  printf("6\n");
-  printf("Initializing OTA storage\n");
-  if ((ota_err = ota.begin()) != Arduino_ESP32_OTA::Error::None)
-  {
-    printf  ("Arduino_ESP_OTA::begin() failed with error code: %d\n", (int)ota_err);
-    return;
-  }
-  printf("7\n");
-
-  printf("Starting download to flash ...\n");
-  int const ota_download = ota.download(OTA_FILE_LOCATION);
-  if (ota_download <= 0)
-  {
-    printf  ("Arduino_ESP_OTA::download failed with error code: %d\n ", ota_download);
-    return;
-  }
-  printf  ("%d bytes stored \n", ota_download);
-
-
-  printf("Verify update integrity and apply ...\n");
-  if ((ota_err = ota.update()) != Arduino_ESP32_OTA::Error::None)
-  {
-    printf  ("ota.update() failed with error code: %d\n ", (int)ota_err);
-    return;
-  }
-
-  printf("Performing a reset after which the bootloader will start the new firmware.\n");
-  tft.fillRect(0, 0, 320, 240, TFT_BLACK);
-  tft.setTextColor(TFT_BLUE);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("Restarting...", 180, 105, 4);
-  delay(2000); // Make sure the serial message gets out before the reset.
-  ota.reset();
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
 
   uint8_t res;
-  USBSerial.begin(115200);
-  printf("PSRAM: %s, size=%u, free=%u\n",
+  Serial.begin(115200);
+  const uint32_t serialWaitStartedAt = millis();
+  while (!Serial && millis() - serialWaitStartedAt < 1000) delay(10);
+  Serial.printf("\nMuse Radio %s booting\n", version);
+  Serial.printf("PSRAM: %s, size=%u, free=%u\n",
          psramFound() ? "yes" : "no",
          (unsigned)ESP.getPsramSize(),
          (unsigned)ESP.getFreePsram());
 
-  // Start the Improv Wi-Fi over Serial task immediately
-  xTaskCreatePinnedToCore(improvWiFiInit, "improvWiFiInit", 5000, NULL, 5, &improvWiFiInitH, 1);
-
-  // Small delay to ensure Improv Serial is ready
-  vTaskDelay(100 / portTICK_PERIOD_MS);
-
   /////////////////////////////////////////////////////
   // Little FS init
   /////////////////////////////////////////////////////
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS initialisation failed!");
-    while (1) for (;;);
+  if (!LittleFS.begin(false)) {
+    Serial.println("LittleFS initialisation failed; preserving data and restarting in 5 seconds.");
+    delay(5000);
+    ESP.restart();
   }
   //    LittleFS.format();
-  File root = LittleFS.open("/", "r");
-  File file = root.openNextFile();
-  while (file) {
-    printf("FILE: /%s\n", file.name());
-    file = root.openNextFile();
-    delay(100);
-  }
+  Serial.printf("LittleFS: used=%u total=%u bytes\n",
+         (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+  recoverStoredFiles();
   ensureLocalRadioData();
+  if (!reloadRadioPresetCache()) {
+    Serial.println("No valid local radio preset; restoring defaults.");
+    if (!writeDefaultPresets() || !reloadRadioPresetCache()) {
+      Serial.println("Radio preset storage failed; restarting in 5 seconds.");
+      delay(5000);
+      ESP.restart();
+    }
+  }
 
   //////////////////////////////////////////////////
   //Encoders init
@@ -2998,18 +2486,6 @@ void setup() {
   gpio_set_pull_mode(EN_4G, GPIO_PULLUP_ONLY);
   initAdcButtons();
 
-  //////////////////////////////////////////////////////
-  // request to load the last version
-  //////////////////////////////////////////////////////
-  delay(100);
-  BOTA = false;
-  if (gpio_get_level(CLICK1) == 0) BOTA = true;
-
-  ///////////////////////////////////////////////////////
-  // to run the Factory Test
-  //////////////////////////////////////////////////////
-  if (gpio_get_level(CLICK2) == 0) FactoryTest();
-
   ///////////////////////////////////////////////////////
   //enable remote
   ///////////////////////////////////////////////////////
@@ -3019,24 +2495,10 @@ void setup() {
 
 
 
-  File ln = LittleFS.open("/mode", FILE_READ);
-  // If mode is not defined, default to WiFi and let the captive portal handle credentials.
-  if (!ln) {
-    mode = '1';
-    File modeFile = LittleFS.open("/mode", FILE_WRITE);
-    if (modeFile) {
-      modeFile.write(&mode, 1);
-      modeFile.close();
-    }
-  } else {
-    ln.read(&mode, 1);
-    ln.close();
-  }
-  printf("mode = %c\n", mode);
   //////////////////////////////////////////////////////
   //Screen init
   //////////////////////////////////////////////////////
-  printf("screen init...\n");
+  Serial.printf("screen init...\n");
   //  tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_WHITE);
@@ -3045,10 +2507,8 @@ void setup() {
   tft.drawString(version, 280, 220, 2);
   delay(2000);
 
-  {
-    printf("WiFi\n");
-    gpio_set_level(EN_4G, 0);
-  }
+  Serial.printf("WiFi\n");
+  gpio_set_level(EN_4G, 0);
   ////////////////////////////////////////////////
   // WiFi init
   ////////////////////////////////////////////////
@@ -3057,28 +2517,24 @@ void setup() {
   int wifiCount = loadWifiList(wifiList, WIFI_MAX_NETWORKS);
   if (wifiCount == 0) {
     // No credentials yet, start the phone-friendly captive portal.
+    captiveReturnToRadioEnabled = false;
     settings();
   }
 
   WiFi.useStaticBuffers(true);
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
   wifiMultiFromList(wifiMulti, wifiList, wifiCount);
   //   wifiMulti.run();
   const uint32_t connectTimeoutMs = 20000;
   if (wifiMulti.run(connectTimeoutMs) == WL_CONNECTED) {
-    USBSerial.print("WiFi connected: ");
-    USBSerial.print(WiFi.SSID());
-    USBSerial.print(" ");
-    USBSerial.println(WiFi.RSSI());
+    Serial.print("WiFi connected: ");
+    Serial.print(WiFi.SSID());
+    Serial.print(" ");
+    Serial.println(WiFi.RSSI());
     started = true;
-
-    ////////////////////////////////////////////////////////////////
-    //last version .ota loading
-    ////////////////////////////////////////////////////////////////
-    if (BOTA == true)loadLastOTA();
-
-    fetchStationList();
-
 
   }
   else {
@@ -3090,6 +2546,7 @@ void setup() {
     tft.setTextColor(TFT_YELLOW);
     tft.drawString("Starting WiFi setup...", 160, 125, 2);
     delay(1000);
+    captiveReturnToRadioEnabled = false;
     settings();
   }
 
@@ -3099,10 +2556,30 @@ void setup() {
   // Audio init
   //////////////////////////////////////////////////////////////
   //ES8388 codec init
+  codecMutex = xSemaphoreCreateRecursiveMutex();
+  if (codecMutex == nullptr) {
+    Serial.println("Codec mutex allocation failed; restarting.");
+    delay(2000);
+    ESP.restart();
+  }
   Wire.setPins(SDA, SCL);
   Wire.begin();
-  res = ES8388_Init();
-  if (res == 0)printf("Codec init OK\n"); else printf("Codec init failed\n");
+  res = 1;
+  for (int attempt = 1; attempt <= 3 && res != 0; attempt++) {
+    res = ES8388_Init();
+    Serial.printf("Codec init attempt %d: %s (status=%u)\n", attempt, res == 0 ? "OK" : "failed", res);
+    if (res != 0) delay(100);
+  }
+  if (res != 0) {
+    gpio_set_level(PA, 0);
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("Audio codec error", 160, 95, 4);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("Power cycle the radio", 160, 135, 2);
+    while (true) delay(1000);
+  }
 
   // audio lib init
   Audio::audio_info_callback = audioEvent;
@@ -3113,7 +2590,7 @@ void setup() {
   // connections init
   if (gpio_get_level(JACK_DETECT) == 0)
   {
-    printf("Jack ON\n");
+    Serial.printf("Jack ON\n");
     gpio_set_level(PA, 0);          // amp off
     ES8388_Write_Reg(29, 0x00);     // stereo
     ES8388_Write_Reg(28, 0x04);     // no phase inversion + click free power up/down
@@ -3123,7 +2600,7 @@ void setup() {
   }
   else
   {
-    printf("Jack OFF\n");
+    Serial.printf("Jack OFF\n");
     gpio_set_level(PA, 1);          // amp on
     ES8388_Write_Reg(29, 0x20);     // mono (L+R)/2
     ES8388_Write_Reg(28, 0x14);     // Right DAC phase inversion + click free power up/down
@@ -3136,19 +2613,8 @@ void setup() {
   // recovering params (station & vol)
   ///////////////////////////////////////////////////////////////
 
-  // previous station
-  ln = LittleFS.open("/station", "r");
-  ln.read((uint8_t*)b, 2);
-  b[2] = 0;
-  station = atoi(b);
-  ln.close();
-  // previous volume
-  ln = LittleFS.open("/volume", "r");
-  ln.read((uint8_t*)b, 2);
-  b[2] = 0;
-  vol = atoi(b);
-
-  ln.close();
+  station = loadStoredInt("/station", 0, 0, RADIO_PRESET_MAX - 1);
+  vol = loadStoredInt("/volume", 15, 0, maxVol);
   MS = maxStation() - 1;
   if (MS < 0) {
     writeDefaultPresets();
@@ -3156,21 +2622,15 @@ void setup() {
   }
   if (station < 0 || station > MS || !stationSlotHasUrl(station)) {
     station = normalizeStationSlot(0, 1, MS + 1);
-    File stationFile = LittleFS.open("/station", "w");
-    if (stationFile) {
-      sprintf(b, "%02d", station);
-      stationFile.write((uint8_t*)b, 2);
-      stationFile.close();
-    }
+    saveStoredInt("/station", station);
   }
   previousStation = -1;
-  printf("station = %d    vol = %d\n", station, vol);
+  Serial.printf("station = %d    vol = %d\n", station, vol);
   // volume encoder init
   V = vol * pos360 / maxVol;
   volEncoder.setCount(V);
   PV = V;
   refreshVolume();
-  spotifyConnectBegin(audio, handleSpotifyConnectEvent);
   // station encoder init
   staEncoder.setCount(station * 2);
   S = VS = station * 2;
@@ -3188,12 +2648,11 @@ void setup() {
   // tft.fillCircle(50, 35, 18, TFT_WHITE);
   //tft.fillCircle(50, 35, 16, TFT_BLACK);
   tft.drawCircle(50, 35, 18, TFT_WHITE);
-  if (mode == '0')  tft.drawString("4G", 50, 27, 2);
-  else tft.drawString("WiFi", 50, 27, 2);
+  tft.drawString("WiFi", 50, 27, 2);
 
   tft.setTextColor(TFT_GREY, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);  // Set text datum to top-left
-  tft.drawString("1-Settings portal", 20, 220, 2);
+  tft.drawString("1/2/3: presets | Hold CHECK 5s: portal", 10, 220, 1);
   tft.drawString(version, 280, 220, 2);
   toDisplay = 0;
   displayON();
@@ -3218,14 +2677,26 @@ void setup() {
 
 void loop() {
 
-
-  if (consumeAdcButtonEvent(sw0))
-  {
-    if (BSettings == false) enterSettingsFromButton();
-    else printf("ADC action button1 ignored: settings already active\n");
+  if (stationDisplayPending) {
+    stationDisplayPending = false;
+    tft.setRotation(1);
+    tft.fillRect(80, 90, 240, 60, TFT_BLACK);
+    tft.setTextColor(TFT_STATION);
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString(Rname(station), 180, 105, 4);
+  }
+  for (int presetIndex = 0; presetIndex < 3; presetIndex++) {
+    if (consumeAdcButtonEvent(presetIndex)) {
+      selectRadioPresetDirect(presetIndex);
+    }
   }
 
-  serviceSpotifyCoverDisplay();
+  if (consumeAdcButtonEvent(sw3))
+  {
+    if (BSettings == false) enterSettingsFromButton();
+    else printf("ADC settings hold ignored: settings already active\n");
+  }
+
   debugAdcButtonsTick();
 
   //////////////////////////////////////////////////////////////////////
@@ -3242,10 +2713,8 @@ void loop() {
     vol = V * maxVol / pos360;
     refreshVolume();
     printf("============> %d  %d\n", V, vol);
-    sprintf(b, "%02d", vol);
-    File ln = LittleFS.open("/volume", "w");
-    ln.write((uint8_t*)b, 2);
-    ln.close();
+    volumeSavePending = true;
+    volumeChangedAtMs = millis();
     toDisplay = 3;
   }
   //////////////////////////////////////////////////////////////////////
@@ -3264,10 +2733,8 @@ void loop() {
     if (vol < 0) vol = 0;
     refreshVolume();
     volEncoder.setCount(vol * pos360 / maxVol);
-    sprintf(b, "%02d", vol);
-    File ln = LittleFS.open("/volume", "w");
-    ln.write((uint8_t*)b, 2);
-    ln.close();
+    volumeSavePending = true;
+    volumeChangedAtMs = millis();
     toDisplay = 3;
   }
 
@@ -3357,11 +2824,9 @@ void loop() {
         station = selectedStation;
         printf("station = %d\n", station);
         staEncoder.setCount(S);
-        char b[4];
-        sprintf(b, "%02d", station);
-        File ln = LittleFS.open("/station", "w");
-        ln.write((uint8_t*)b, 2);
-        ln.close();
+        if (!saveStoredInt("/station", station)) {
+          printf("Failed to persist station %d\n", station);
+        }
         CLICK2B = false;
         if (muteON == true)
         {
@@ -3390,13 +2855,6 @@ void loop() {
     }
 
   }
-
-  if (consumeAdcButtonEvent(sw1))
-  {
-    printf("ADC action button2: unused\n");
-  }
-
-
 
   /////////////////////////////////////////////////////////////////////////
   // Display refresh
@@ -3458,6 +2916,15 @@ void loop() {
 
 
   }
+  if (volumeSavePending && (uint32_t)(millis() - volumeChangedAtMs) >= 750) {
+    if (saveStoredInt("/volume", vol)) {
+      volumeSavePending = false;
+    } else {
+      printf("Failed to persist volume %d; retrying\n", vol);
+      volumeChangedAtMs = millis();
+    }
+  }
+
   /*
     ///////////////////////////////////////////////////////////////////////////////////
     //test remote keys
@@ -3475,95 +2942,16 @@ void loop() {
 }
 
 void audio_info(const char *info) {
-#define maxRetries 4
-  // Serial.print("info        "); Serial.println(info);
   if (strstr(info, "SampleRate=") != nullptr)
   {
     sscanf(info, "SampleRate=%d", &sampleRate);
-    printf("==================>>>>>>>>>>%d\n", sampleRate);
+    printf("Audio sample rate: %u Hz\n", sampleRate);
+    connected = true;
   }
-  connected = true;
-  if (strstr(info, "failed") != nullptr) {
+  if (strstr(info, "failed") || strstr(info, "Failed") || strstr(info, "ERROR") ||
+      strstr(info, "error") || strstr(info, "disconnected") || strstr(info, "connection lost")) {
     connected = false;
-    printf("failed\n");
-
-    tft.fillRect(80, 90, 240, 60, TFT_BLACK);
-    tft.setTextColor(TFT_RED);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString("Connecting...", 200, 105, 4);
-    delay(500);
-    printf("RSSI = %d dB\n", WiFi.RSSI());
-
-
-    //    printf("RSSI = %d dB\n", WiFi.RSSI());
-    wifiMulti.run();
-
-
-    if (WiFi.status() != WL_CONNECTED )
-    {
-      WiFi.disconnect(true);
-      wifiMulti.run();
-      delay(1500);
-    }
-
-  }
-}
-
-void QRcreate(void)
-{
-  tft.fillScreen(TFT_WHITE);  // Changed to white background for better contrast
-
-  // Read the URL stored in the file
-  File ln = LittleFS.open("/QR", FILE_READ);
-  if (!ln) {
-    printf("Error: Unable to open file /QR\n");
-    return;
-  }
-
-  // Read file data and store URL in a buffer
-  char baseUrl[120];  // Maximum URL size
-  ln.read((uint8_t*)baseUrl, sizeof(baseUrl) - 1);
-  baseUrl[ln.size()] = 0;  // Terminate the string
-  ln.close();
-
-  // Get ESP32 MAC address
-  String macAddress = WiFi.macAddress();
-  macAddress.replace(":", "");  // Remove colons
-
-  // Build complete URL with MAC address
-  String fullUrl = String(baseUrl) + "?serial=" + macAddress;
-
-  // Log to verify complete URL
-  printf("Complete URL: %s\n", fullUrl.c_str());
-
-  // Convert string to char array for QRCode library
-  char qrData[256];  // Maximum QR buffer size, increase if necessary
-  fullUrl.toCharArray(qrData, sizeof(qrData));
-
-  // Generate QR code from complete URL
-  QRCode qrcode;
-  uint8_t qrcodeData[qrcode_getBufferSize(4)];  // Use version 4 for more capacity
-  qrcode_initText(&qrcode, qrcodeData, 4, 0, qrData);
-
-  // Display text above QR code
-
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_WHITE, TFT_BLUE);
-  tft.setTextDatum(TC_DATUM);
-
-  tft.setCursor((tft.width() - tft.textWidth("Scan to add radio stations")) / 2, 20);
-  tft.print("Scan to add radio stations");
-  tft.setTextSize(1);
-  // Display QR code on TFT screen
-  uint16_t scale = 5;  // Increase scale to make QR code more readable
-  uint16_t offsetX = (tft.width() - qrcode.size * scale) / 2;
-  uint16_t offsetY = (tft.height() - qrcode.size * scale) / 2 + 20;  // Add 20 pixels to move QR code down
-
-  for (uint8_t y = 0; y < qrcode.size; y++) {
-    for (uint8_t x = 0; x < qrcode.size; x++) {
-      uint16_t color = qrcode_getModule(&qrcode, x, y) ? TFT_BLACK : TFT_WHITE;
-      tft.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, color);
-    }
+    printf("Audio stream failure: %s (RSSI=%d dBm)\n", info, WiFi.RSSI());
   }
 }
 
@@ -3616,833 +3004,32 @@ static void audioEvent(Audio::msg_t msg) {
       break;
     case Audio::evt_eof:
       audio_eof_mp3(info);
+      connected = false;
       break;
     case Audio::evt_name:
       audio_showstation(info);
+      connected = true;
       break;
     case Audio::evt_icydescription:
       audio_showstreaminfo(info);
+      connected = true;
       break;
     case Audio::evt_streamtitle:
       audio_showstreamtitle(info);
+      connected = true;
       break;
     case Audio::evt_bitrate:
       audio_bitrate(info);
+      connected = true;
       break;
     case Audio::evt_icyurl:
       audio_icyurl(info);
       break;
     case Audio::evt_lasthost:
       audio_lasthost(info);
+      connected = true;
       break;
     default:
       break;
   }
-}
-
-void fetchStationList() {
-  ensureLocalRadioData();
-  printf("Local radio presets/catalog ready; remote station server disabled.\n");
-  return;
-#if 0
-  // Lire l'URL de base à partir du fichier /QR
-  File ln = LittleFS.open("/QR", FILE_READ);
-  if (!ln) {
-    printf("Erreur : Impossible d'ouvrir le fichier /QR\n");
-    return;
-  }
-  char baseUrl[120];  // Ajustez la taille si nécessaire
-  size_t len = ln.readBytes(baseUrl, sizeof(baseUrl) - 1);
-  baseUrl[len] = '\0';  // Terminer la chaîne de caractères
-  ln.close();
-
-  // Obtenir l'adresse MAC
-  String macAddress = WiFi.macAddress();
-  macAddress.replace(":", "");  // Supprimer les deux-points
-
-  // Construire l'URL complète
-  String fullUrl = String(baseUrl) + "?serial=" + macAddress + "&action=get";
-
-  printf("Récupération de la liste des stations à partir de: %s\n", fullUrl.c_str());
-
-  // Effectuer une requête HTTP GET
-  HTTPClient http;
-  http.begin(fullUrl);
-
-  int httpCode = http.GET();
-  if (httpCode > 0) {
-    printf("Code retour HTTP GET : %d\n", httpCode);
-
-    // Si le serveur retourne un code 302 (Redirection)
-    if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) { // 302 is HTTP_CODE_FOUND
-      String newLocation = http.header("Location"); // Lire l'en-tête "Location"
-      if (newLocation.length() > 0) {
-        printf("Redirection vers: %s\n", newLocation.c_str());
-
-        // Suivre la redirection
-        http.end(); // Fermer la première connexion
-        http.begin(newLocation); // Effectuer une nouvelle requête vers la nouvelle URL
-
-        httpCode = http.GET(); // Envoyer la nouvelle requête
-        printf("Code retour après redirection: %d\n", httpCode);
-      } else {
-        printf("Erreur: Aucun en-tête 'Location' trouvé pour la redirection\n");
-        http.end();
-        return;
-      }
-    }
-
-    if (httpCode == HTTP_CODE_OK) {
-      String payload = http.getString();
-      printf("Payload reçu :\n%s\n", payload.c_str());
-
-      // Parser la réponse JSON
-      DynamicJsonDocument doc(2048);  // Ajustez la taille si nécessaire
-
-      DeserializationError error = deserializeJson(doc, payload);
-      if (error) {
-        printf("Erreur de désérialisation JSON: %s\n", error.c_str());
-        return;
-      }
-
-      if (doc.is<JsonArray>()) {
-        JsonArray stations = doc.as<JsonArray>();
-        if (stations.size() > 0) {
-          // Mettre à jour les fichiers /linkS et /nameS
-          File linkFile = LittleFS.open("/linkS", FILE_WRITE);
-          File nameFile = LittleFS.open("/nameS", FILE_WRITE);
-          if (!linkFile || !nameFile) {
-            printf("Erreur : Impossible d'ouvrir les fichiers /linkS ou /nameS en écriture\n");
-            return;
-          }
-
-          for (JsonObject station : stations) {
-            const char* name = station["name"];
-            const char* url = station["url"];
-            // Écrire dans les fichiers
-            nameFile.println(name);
-            linkFile.println(url);
-          }
-
-          linkFile.close();
-          nameFile.close();
-
-          printf("Liste des stations mise à jour depuis le serveur\n");
-        } else {
-          printf("Aucune station trouvée dans la réponse du serveur, utilisation des stations par défaut\n");
-        }
-      } else {
-        printf("La réponse du serveur n'est pas un tableau JSON\n");
-      }
-
-    } else {
-      printf("Code HTTP inattendu après redirection: %d\n", httpCode);
-    }
-  } else {
-    printf("Échec de la requête HTTP GET, erreur: %s\n", http.errorToString(httpCode).c_str());
-  }
-  http.end();
-#endif
-}
-void FactoryTest() {
-
-  int FILESIZE;
-#define bytesToRead 128
-  uint8_t b[bytesToRead];
-  //bool started = false;
-  // SD 1 wire
-#define clk         14
-#define cmd         15
-#define d0          2
-
-#define SDA         18
-#define SCL         11
-
-
-#define I2S_DOUT      17
-#define I2S_BCLK      5
-#define I2S_LRC       16
-#define I2S_DIN       4
-#if ENABLE_LEGACY_FACTORY_I2S
-#define I2SW (i2s_port_t)0
-#define I2SR (i2s_port_t)1
-#endif
-
-  // SD 1 wire
-#define clk         14
-#define cmd         15
-#define d0          2
-#define EN_4G           GPIO_NUM_38
-#define nominalVal 2700
-#define alertVal  350
-#define zeroVal   2000
-
-  int adcValue;
-  int res;
-  int vol = 20;
-#define maxVol 31
-
-
-  gpio_set_level(EN_4G, 1);
-
-  IRrecv irrecv(IR);
-  decode_results results;
-
-
-  WiFiClient espClient;
-  PubSubClient client(espClient);
-  bool testON;
-  time_t now;
-  struct tm timeinfo;
-  char timeStr[60];
-
-  uint8_t header[] = {
-    0x52, 0x49, 0x46, 0x46, //"RIFF"
-    0x24, 0x7D, 0x00, 0x00, //taille fichier - 8 (little endian)
-    0x57, 0x41, 0x56, 0x45, //"WAVE"
-    0x66, 0x6d, 0x74, 0x20, //"fmt "
-    0x10, 0x00, 0x00, 0x00, //nb d'octets du bloc
-    0x01, 0x00,             //format PCM
-    0x02, 0x00,             //nombre de canaux
-    0x40, 0x1F, 0x00, 0x00, //frequence d'echantillonnage 8000
-    0x00, 0x7D, 0x00, 0x00, //nombre d'octets a lire par seconde   32000
-    0x02, 0x00,             //nombre d'octets par bloc d'échantillonnage
-    0x10, 0x00,             //nb de bits par echantillon
-    0x64, 0x61, 0x74, 0x61, //"data"
-    0x00, 0x7D, 0x00, 0x00
-  };   //nombre d'octets de donnees
-
-#define BLOCK_SIZE 128
-
-  // Configuration pour I2S0 (écriture)
-#if ENABLE_LEGACY_FACTORY_I2S
-  i2s_config_t i2s_config_write = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 8000,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 128/*,
-
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
-*/
-  };
-
-  // Configuration pour I2S1 (lecture)
-  i2s_config_t i2s_config_read = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = 8000,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 128/*,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
-*/
-  };
-
-  // Configuration des broches pour I2S0 (écriture)
-  i2s_pin_config_t pin_config_write = {
-    .bck_io_num = I2S_BCLK,
-    .ws_io_num = I2S_LRC,
-    .data_out_num = I2S_DOUT,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-
-  // Configuration des broches pour I2S1 (lecture)
-  i2s_pin_config_t pin_config_read = {
-    .bck_io_num = I2S_BCLK,
-    .ws_io_num = I2S_LRC,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_DIN
-  };
-#endif
-
-
-
-#define RECB CLICK1B
-#define bytesToRead 128
-  //  uint8_t b[bytesToRead];
-  char buf[20];
-  Serial.begin(115200);
-
-  ///////////////////////////////////////////////////////
-  // init gpios
-  ///////////////////////////////////////////////////////
-  //gpio_reset_pin
-  gpio_reset_pin(CLICK1);
-  gpio_reset_pin(CLICK2);
-  gpio_reset_pin(EN_4G);
-  gpio_reset_pin(JACK_DETECT);
-  gpio_reset_pin(USB_DETECT);
-  //gpio_set_direction
-  gpio_set_direction(CLICK1, GPIO_MODE_INPUT);
-  gpio_set_direction(CLICK2, GPIO_MODE_INPUT);
-  gpio_set_direction(JACK_DETECT, GPIO_MODE_INPUT);
-  gpio_set_direction(USB_DETECT, GPIO_MODE_INPUT);
-  //gpio_set_pull_mode
-  gpio_set_pull_mode(CLICK1, GPIO_PULLUP_ONLY);
-  gpio_set_pull_mode(CLICK2, GPIO_PULLUP_ONLY);
-  gpio_set_pull_mode(JACK_DETECT, GPIO_PULLUP_ONLY);
-  gpio_set_pull_mode(USB_DETECT, GPIO_PULLUP_ONLY);
-  // power enable
-  gpio_reset_pin(PA);
-  gpio_set_direction(PA, GPIO_MODE_OUTPUT);
-  // 4G enable
-  gpio_set_direction(EN_4G, GPIO_MODE_OUTPUT);
-
-  //////////////////////////////////////////////////
-  //Encoders init
-  //////////////////////////////////////////////////
-  ESP32Encoder::useInternalWeakPullResistors = puType::up;
-  volEncoder.attachHalfQuad(ENC_A1, ENC_B1);
-  staEncoder.attachHalfQuad(ENC_A2, ENC_B2);
-
-
-  xTaskCreatePinnedToCore(keyb, "keyb", 5000, NULL, 5, NULL, 0);
-
-
-  //////////////////////////////////////////////////////
-  //Screen init
-  //////////////////////////////////////////////////////
-  printf("screen init...\n");
-  tft.init();
-  tft.setRotation(1);
-  headerS("Ros&Co", TFT_NAVY);
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextDatum(TC_DATUM);
-  //  tft.fillScreen(TFT_NAVY);
-  tft.drawString("FACTORY TEST", 160, 115, 4);
-
-
-  ///////////////////////////////////////////////////////
-  // test#1 buttons
-  //////////////////////////////////////////////////////
-
-  RECB = false;
-  delay(2000);
-  headerL("test#1 : Buttons", "try each, from left to right bottom to top", TFT_NAVY);
-  tft.fillRect(130, 100, 70, 70, TFT_WHITE);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  tft.setTextColor(TFT_RED);
-  tft.setTextDatum(TC_DATUM);
-  for (int i = 0; i < 4; i++)
-  {
-    while (button_get_level(i) == 1) delay(100);
-    sprintf(buf, "SW%d\n", i + 1);
-    tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-    tft.drawString(buf, 170, 125, 4);
-
-    delay(100);
-  }
-  RECB = false;
-  delay(500);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  delay(500);
-  tft.drawString("OK", 170, 125, 4);
-  delay(1000);
-
-
-  ///////////////////////////////////////////////////////
-  //test#2 Jack detect
-  ///////////////////////////////////////////////////////
-  headerL("test#2 : Jack detect", "plug an audio cable", TFT_NAVY);
-  tft.fillRect(130, 100, 70, 70, TFT_WHITE);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  int ndj = 0;
-  while (gpio_get_level(JACK_DETECT) == 1) delay(50);
-  delay(500);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  delay(500);
-  tft.setTextColor(TFT_RED);
-  tft.drawString("OK", 170, 125, 4);
-  delay(2000);
-
-
-
-  ///////////////////////////////////////////////////////
-  //test#2 USB detect
-  ///////////////////////////////////////////////////////
-  headerL("test#2 : USB detect", "plug an usb cable", TFT_NAVY);
-  tft.fillRect(130, 100, 70, 70, TFT_WHITE);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  while (gpio_get_level(USB_DETECT) == 0) delay(50);
-  delay(500);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  delay(500);
-  tft.setTextColor(TFT_RED);
-  tft.drawString("OK", 170, 125, 4);
-  delay(2000);
-
-
-  ///////////////////////////////////////////////////////
-  //test#3 volume encoder
-  ///////////////////////////////////////////////////////
-  headerL("test#3 : Volume encoder", "Turn right and left then click to terminate", TFT_NAVY);
-  tft.fillRect(130, 100, 70, 70, TFT_WHITE);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-#define maxC 10
-  volEncoder.setCount(0);
-  tft.setTextColor(TFT_RED);
-  tft.setTextDatum(TC_DATUM);
-  while (volEncoder.getCount() < maxC)
-  {
-    sprintf(buf, "%d\n", volEncoder.getCount());
-    tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-    tft.drawString(buf, 170, 125, 4);
-    delay(100);
-  }
-  volEncoder.setCount(maxC);
-  while (volEncoder.getCount() > -maxC)
-  {
-    if (volEncoder.getCount() > maxC) continue;
-    sprintf(buf, "%d\n", volEncoder.getCount());
-    tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-    tft.drawString(buf, 170, 125, 4);
-    delay(100);
-  }
-  sprintf(buf, "%d\n", -maxC);
-  tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-  tft.drawString(buf, 170, 125, 4);
-
-  while (gpio_get_level(CLICK1) == 1) delay(50);
-  tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-  tft.drawString("OK", 170, 125, 4);
-  delay(1000);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-
-
-  ///////////////////////////////////////////////////////
-  // test#4 stations encoder
-  ///////////////////////////////////////////////////////
-  headerL("test#4 : Stations encoder", "Turn right and left then click to terminate", TFT_NAVY);
-  tft.fillRect(130, 100, 70, 70, TFT_WHITE);
-  tft.fillRect(132, 102, 66, 66, TFT_NAVY);
-  staEncoder.setCount(0);
-  tft.setTextColor(TFT_RED);
-  tft.setTextDatum(TC_DATUM);
-  while (staEncoder.getCount() < maxC)
-  {
-    sprintf(buf, "%d\n", staEncoder.getCount());
-    tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-    tft.drawString(buf, 170, 125, 4);
-    delay(100);
-  }
-  staEncoder.setCount(maxC);
-  while (staEncoder.getCount() > -maxC)
-  {
-    if (staEncoder.getCount() > maxC) continue;
-    sprintf(buf, "%d\n", staEncoder.getCount());
-    tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-    tft.drawString(buf, 170, 125, 4);
-    delay(100);
-  }
-
-  sprintf(buf, "%d\n", -maxC);
-  tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-  tft.drawString(buf, 170, 125, 4);
-  while (gpio_get_level(CLICK2) == 1) delay(50);
-  tft.fillRect(150, 110, 35, 35, TFT_NAVY);
-  tft.drawString("OK", 170, 125, 4);
-  delay(1000);
-
-
-  ///////////////////////////////////////////////////////
-  // test#5 Battery
-  ///////////////////////////////////////////////////////
-#define adcVMAX  1000
-#define adcVMIN   200
-  headerL("test#5 : Battery adc line", "Nothing to do...", TFT_NAVY);
-  tft.fillRect(100, 100, 130, 70, TFT_WHITE);
-  tft.fillRect(102, 102, 126, 66, TFT_NAVY);
-  adcValue = analogRead(BAT_GAUGE_PIN) - zeroVal;
-  sprintf((char*)b, "V = %d\n", adcValue);
-  tft.setTextColor(TFT_RED);
-  tft.drawString((const char*)b, 170, 125, 4);
-  delay(2000);
-  if ((adcValue < adcVMAX) && (adcValue > adcVMIN))
-  {
-    tft.fillRect(102, 102, 126, 66, TFT_NAVY);
-    tft.drawString("OK", 170, 125, 4);
-    delay(1000);
-  }
-  else return;
-
-
-  ///////////////////////////////////////////////////////
-  // test#6 Remote
-  ///////////////////////////////////////////////////////
-  headerL("test#6: Remote", "Press the OK button", TFT_NAVY);
-  tft.fillRect(100, 100, 130, 70, TFT_WHITE);
-  tft.fillRect(102, 102, 126, 66, TFT_NAVY);
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-  irrecv.enableIRIn();
-  uint32_t v;
-  while (v != 0x609F)
-  {
-    if (irrecv.decode(&results)) {
-      if (results.decode_type == NEC)
-      {
-        v = results.value;
-        if (v != 0xffffffff) v = v & 0xFFFF;
-      }
-      irrecv.resume();  // Receive the next value
-
-      delay(100);
-    }
-  }
-  tft.fillRect(102, 102, 126, 66, TFT_NAVY);
-  tft.drawString("OK", 170, 125, 4);
-  delay(1000);
-
-  ///////////////////////////////////////////////////////
-  // test#7 SD
-  ///////////////////////////////////////////////////////
-  headerL("test#7: SD", "Nothing todo...", TFT_NAVY);
-  tft.fillRect(50, 100, 220, 40, TFT_WHITE);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-
-  if (! SD_MMC.setPins(clk, cmd, d0)) {
-    printf("Pin change failed!\n");
-    tft.drawString("SD Pin change failed", 160, 110, 2);
-    return;
-  }
-  if (!SD_MMC.begin("/sdcard", true)) {
-    printf("Card Mount Failed\n");
-    tft.drawString("Card mount failed", 160, 110, 2);
-    return;
-  }
-  uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
-    printf("No SD_MMC card attached\n");
-    tft.drawString("No SD_MMC card attached", 160, 110, 2);
-    return;
-  }
-  printf("SD init OK\n");
-  tft.drawString("SD init OK", 160, 110, 4);
-  File f = SD_MMC.open("/test", FILE_WRITE);
-  f.write((const uint8_t*)"1234567890", 11);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("Writing...", 160, 110, 4);
-  f.close();
-  delay(1000);
-  f = SD_MMC.open("/test", FILE_READ);
-  char bsd[15];
-  f.read((uint8_t*)bsd, 15);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("Reading...", 160, 110, 4);
-  f.close();
-  delay(1000);
-  if (strcmp(bsd, "1234567890") != 0) return;
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("OK", 160, 110, 4);
-
-
-  ///////////////////////////////////////////////////////
-  // test#8 WiFi
-  ///////////////////////////////////////////////////////
-  headerL("test#8: WiFi-> xhkap", "Nothing todo...", TFT_NAVY);
-  tft.fillRect(50, 100, 220, 40, TFT_WHITE);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-
-  tft.drawString("Connecting...", 160, 110, 4);
-#define TOMax 22
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin("xhkap", "12345678");
-  int to = 0;
-  while ((!WiFi.isConnected()) && (to < TOMax))
-  {
-    to++;
-    delay(1000);
-  }
-  printf("%d   %d\n", to, WiFi.isConnected());
-  if (to < TOMax)
-  {
-    printf("Connected to xhkap(4G)\n");
-    tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-    tft.drawString("Connected...", 160, 110, 4);
-  }
-  else
-  {
-    tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-    tft.drawString("Connection failed...", 160, 110, 4);
-    for (;;);
-  }
-  delay(1000);
-  sprintf((char*)b, "RSSI = %d dB\n", WiFi.RSSI());
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString((const char*)b, 160, 110, 4);
-  delay(2000);
-
-  ///////////////////////////////////////////////////////
-  // test#9 Audio => speaker
-  ///////////////////////////////////////////////////////
-#if ENABLE_LEGACY_FACTORY_I2S
-  headerL("test#9 Audio => Speaker", "nothing to do...", TFT_NAVY);
-  tft.fillRect(50, 100, 220, 40, TFT_WHITE);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-  //I2S init
-  i2s_driver_install(I2SW, &i2s_config_write, 0, NULL);
-  i2s_set_pin(I2SW, &pin_config_write);
-  i2s_set_clk(I2SW, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);
-  i2s_zero_dma_buffer(I2SW);
-  i2s_stop(I2SW);
-  delay(1000);
-
-
-  //ES8388 codec init
-  Wire.setPins(SDA, SCL);
-  Wire.begin();
-  res = ES8388_Init();
-  delay(500);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("Playing...", 160, 110, 4);
-  printf("mono\n");
-  gpio_set_level(PA, 1);
-  //mono (L+R)/2
-  ES8388_Write_Reg(29, 0x20);
-  // Right DAC phase inversion + click free power up/down
-  ES8388_Write_Reg(28, 0x14);
-  // DAC power-up LOUT1/ROUT1 enabled
-  ES8388_Write_Reg(4, 0x30);
-  i2s_start(I2SW);
-  LittleFS.begin();
-  int n;
-  size_t t;
-  f = LittleFS.open("/leftright.wav", FILE_READ);
-  f.seek(44);
-  do
-  {
-    n = f.read(b, BLOCK_SIZE );
-    i2s_write(I2SW, b, n, &t, portMAX_DELAY);
-  } while (n > 0);
-  i2s_zero_dma_buffer(I2SW);
-
-  f.close();
-  delay(500);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("  OK", 160, 110, 4);
-  delay(1000);
-
-  ///////////////////////////////////////////////////////
-  // test#10 Audio => headphones
-  ///////////////////////////////////////////////////////
-  headerL("test#10 Audio => HP", "plug in HP ", TFT_NAVY);
-  tft.fillRect(50, 100, 220, 40, TFT_WHITE);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.drawString("Playing...", 160, 110, 4);
-  tft.setTextDatum(TC_DATUM);
-  while (gpio_get_level(JACK_DETECT) == 1) delay(50);
-  delay(1000);
-  gpio_set_level(PA, 0);
-  //stereo
-  ES8388_Write_Reg(29, 0x00);
-  // no Right DAC phase inversion + click free power up/down
-  ES8388_Write_Reg(28, 0x10);
-  // DAC power-up LOUT2/ROUT2 enabled
-  ES8388_Write_Reg(4, 0x0C);
-  f = LittleFS.open("/leftright.wav", FILE_READ);
-  f.seek(44);
-  do
-  {
-    n = f.read(b, BLOCK_SIZE );
-    i2s_write(I2SW, b, n, &t, portMAX_DELAY);
-  } while (n > 0);
-  i2s_zero_dma_buffer(I2SW);
-  i2s_stop(I2SW);
-  f.close();
-  delay(500);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("  OK", 160, 110, 4);
-  delay(1000);
-
-
-  ///////////////////////////////////////////////////////////////////
-  // test #11 Microphones
-  ///////////////////////////////////////////////////////////////////
-  headerL("test#11 : Microphones", "Click1 and speak", TFT_NAVY);
-  tft.fillRect(50, 100, 220, 40, TFT_WHITE);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.setTextColor(TFT_RED, TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-  i2s_driver_install(I2SR, &i2s_config_read, 0, NULL);
-  i2s_set_pin(I2SR, &pin_config_read);
-  i2s_set_clk(I2SR, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);
-  i2s_stop(I2SR);
-  i2s_start(I2SR);
-  i2s_zero_dma_buffer(I2SR);
-  printf("mono\n");
-  gpio_set_level(PA, 1);
-  //mono (L+R)/2
-  ES8388_Write_Reg(29, 0x20);
-  // Right DAC phase inversion + click free power up/down
-  ES8388_Write_Reg(28, 0x14);
-  // DAC power-up LOUT1/ROUT1 enabled
-  ES8388_Write_Reg(4, 0x30);
-#define bytesToRead 128
-  // uint8_t b[bytesToRead];
-  printf("0\n");
-  RECB = false;
-  while (RECB == false) delay(10);
-
-  i2s_start(I2SR);
-  RECB = false;
-  testON = true;
-  printf("1\n");
-  f = SD_MMC.open("/record.wav", FILE_WRITE);
-  f.seek(44);
-  //    int n;
-  int i;
-  //   size_t t;
-  uint32_t s = 44;
-  headerL("test#11 : Microphones", "Click1 to stop recording", TFT_NAVY);
-  while (RECB == false)
-  {
-    i = 0;
-    n = 0;
-    do
-    {
-      while (n == 0) i2s_read(I2SR, &b[i], BLOCK_SIZE, (size_t*)&n, portMAX_DELAY);
-      i = i + n;
-    } while ((i < bytesToRead) && (RECB == false));
-
-    f.write(b, i);
-    s += i;
-  }
-
-  printf("writing header...\n");
-  f.seek(0);
-  header[40] = s & 0xFF;
-  header[41] = (s >> 8) & 0xFF;
-  header[42] = (s >> 16) & 0xFF;
-  header[43] = (s >> 24) & 0xFF;
-  header[4] = (s - 8) & 0xFF;
-  header[5] = ((s - 8) >> 8) & 0xFF;
-  header[6] = ((s - 8) >> 16) & 0xFF;
-  header[7] = ((s - 8) >> 24) & 0xFF;
-  f.write(header, 44);
-  printf("end\n");
-  f.seek(s);
-  f.close();
-  delay(100);
-  RECB = false;
-  //   while (RECB == false) delay(10);
-  headerL("test#11 : Microphones", "Playing...", TFT_NAVY);
-  i2s_stop(I2SR);
-  i2s_set_pin(I2SW, &pin_config_write);
-  i2s_set_clk(I2SW, 8000, (i2s_bits_per_sample_t)16, (i2s_channel_t)2);
-  i2s_start(I2SW);
-  f = SD_MMC.open("/record.wav", FILE_READ);
-  f.seek(44);
-  do
-  {
-    n = f.read(b, BLOCK_SIZE);
-    i2s_write(I2SW, b, n, &t, portMAX_DELAY);
-  } while (n > 0);
-  i2s_zero_dma_buffer(I2SW);
-  i2s_stop(I2SW);
-  f.close();
-  RECB = false;
-  testON = false;
-#else
-  headerL("test#9-11 Audio I2S", "disabled on Arduino 3", TFT_NAVY);
-  delay(1000);
-#endif
-
-
-  delay(500);
-  tft.setTextColor(TFT_WHITE, TFT_NAVY);
-  tft.setTextDatum(TC_DATUM);
-  tft.fillScreen(TFT_NAVY);
-
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("  OK", 160, 110, 4);
-  delay(1000);
-
-  //////////////////////////////////////////////////////////////////
-  // initialisation temps NTP
-  //
-  ////////////////////////////////////////////////////////////////////
-  // time zone init
-  setenv("TZ", "CEST-1", 1);
-  tzset();
-  //sntp init
-  sntp_setoperatingmode(SNTP_OPMODE_POLL);
-  sntp_setservername(0, "pool.ntp.org");
-  sntp_init();
-  int retry = 0;
-  while ((timeinfo.tm_year < (2016 - 1900)) && (++retry < 20))
-  {
-    delay(500);
-    time(&now);
-    localtime_r(&now, &timeinfo);
-  }
-  time(&now);
-  localtime_r(&now, &timeinfo);
-  sprintf(timeStr, "ID: %s Ok on : %4d %02d %02d  %02d:%02d:%02d\n", WiFi.macAddress().c_str(), timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-  printf("==>> %s\n", timeStr);
-
-
-
-  ////////////////////////////////////////////////////////////
-  // connecting to Google sheets
-  ////////////////////////////////////////////////////////////
-  delay(3000);
-  printf("Google sheets\n");
-  //    String uniqueID = String((uint32_t)(ESP.getEfuseMac() >> 32), HEX) + String((uint32_t)ESP.getEfuseMac(), HEX) ;
-  String uniqueID = String(timeStr);
-  String data = "id=" + uniqueID;
-  printf("1\n");
-  const char* googleScriptURL = "https://script.google.com/macros/s/AKfycbyNtmE7-G77xtEAAL8aoCWozyrNJcV2hoqTdlHBWbix1YImqDyb7lI8znLH3R11cq_s/exec";
-  printf("11\n");
-  HTTPClient http;
-  printf("12\n");
-  http.begin(googleScriptURL);
-  printf("13\n");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  printf("14\n");
-  int httpResponseCode = http.POST(data);
-  printf("15\n");
-  delay(3000);
-  printf("2\n");
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    printf("3\n");
-    printf("%x\n", httpResponseCode);
-    Serial.println(response);
-  } else {
-    Serial.print("Error on sending POST: ");
-    Serial.println(httpResponseCode);
-  }
-
-  http.end();
-
-  tft.fillRect(50, 100, 220, 40, TFT_WHITE);
-  tft.fillRect(52, 102, 216, 36, TFT_NAVY);
-  tft.drawString("Wait...", 160, 110, 4);
-  delay(2000);
-  tft.setRotation(1);
-  headerS("Ros&Co", TFT_NAVY);
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("TEST OK", 160, 115, 4);
-  delay(2000);
-  ESP.restart();
 }

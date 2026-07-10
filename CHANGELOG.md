@@ -1,44 +1,21 @@
 # Changelog
 
-## 1.5 - 2026-05-05
+## V1.0-radio - 2026-07-10
 
-- Stabilized Spotify Connect playback after the initial 1.4 POC.
-- Fixed Spotify audio fetching through the Spotify `spclient` storage-resolve endpoint with protobuf CDN URL parsing.
-- Added Spotify pause/resume handling in the local `cspot` track player.
-- Changed Spotify volume handling to drive the ES8388 codec output directly, avoiding software attenuation of PCM samples.
-- Added a short guard before radio resume after Spotify disconnects to reduce I2S/network task races.
-- Bumped the displayed firmware version and Improv device version to 1.5.
-
-## 1.4 - 2026-05-05
-
-- Added an isolated `muse_radio_spotify_poc` PlatformIO environment with `ENABLE_SPOTIFY_CONNECT=1`.
-- Added a native Spotify Connect POC using vendored `cspot` from `1b07a9c00ba6d5e878e5b33dcbf89bff493cde26`, with nested `bell` vendored from `e83737367a08b5a5a1f652a7ecb97a0d926929dd`.
-- Added `SpotifyConnectService` wiring for ZeroConf setup, LittleFS auth cache at `/spotify_auth.json`, Spotify active/inactive events, and radio resume after Spotify disconnects.
-- Added a minimal TFT `Spotify Connect` status screen; LVGL remains out of scope for this version.
-- Added raw 44.1 kHz / 16-bit stereo PCM output to the local `ESP32-audioI2S` copy so Spotify PCM can reuse the Muse ES8388 I2S path.
-- Added reproducible nanopb/protobuf generated files for the `cspot` build and PlatformIO/ESP-IDF compatibility shims.
-- Bumped the displayed firmware version and Improv device version to 1.4.
-- Documented the GPLv3/source-public direction, Spotify Premium requirement, and unofficial `cspot` risk.
-
-## 1.3 - 2026-05-04
-
-- Added a fallback captive Wi-Fi setup portal at `http://192.168.4.1` when no saved network connects.
-- Display a real Wi-Fi QR code for the fallback `MuseRadio-XXXX` access point on the TFT.
-- Added an OK/encoder button shortcut from the captive portal screen to manual credential entry.
-- Documented `firmware.with-data.bin`, a single flash image that includes the LittleFS data partition at `0x310000`.
-- Defaulted fresh installs without `/mode` to Wi-Fi mode so the captive portal starts on first boot.
-- Bumped the displayed firmware version and Improv device version to 1.3.
-
-## 1.2 - 2026-05-04
-
-- Added PlatformIO support for the Muse Radio ESP32-S3 build.
-- Moved the build to pioarduino stable with Arduino ESP32 core 3.3.8.
-- Updated `ESP32-audioI2S` to 3.4.5.
-- Enabled the ESP32-S3 N8R8 board profile for 8 MB flash and 8 MB PSRAM.
-- Confirmed PSRAM detection on boot.
-- Documented the combined `firmware.factory.bin` image, which must be flashed at address `0x0`.
-- Fixed TFT startup on ESP32-S3 by selecting HSPI and enabling the backlight.
-- Fixed ES8388 output with the new audio library by passing MCLK on GPIO0 to `audio.setPinout`.
-- Migrated audio metadata handling to the new `Audio::audio_info_callback` API.
-- Adapted bundled compatibility libraries for Arduino ESP32 3.x timer, Wi-Fi, and GPIO register changes.
-- Disabled legacy factory I2S audio tests by default because the old I2S driver conflicts with the new ESP-IDF 5 I2S driver.
+- Created the `radio-only-stable` branch from the last local-radio firmware base.
+- Reduced the firmware to internet radio, local presets, Wi-Fi setup, controls, display and ES8388 output.
+- Removed Spotify Connect, AirPlay, USB Audio, OTA, Improv Serial, MQTT, remote station-server and factory-test code.
+- Kept a captive Wi-Fi portal with scanned and manually editable SSIDs, multiple saved networks and network removal.
+- Kept a fully local station catalog, 99 presets and manual station name/URL entry.
+- Mapped ADC buttons 1, 2 and 3 to presets 1, 2 and 3, and mapped a 5-second CHECK hold to the settings portal.
+- Added CHECK-to-return and a 60-second no-client timeout to leave the portal, plus an automatic restart after saving Wi-Fi.
+- Live-checked all 18 default presets and 52 catalog entries, replacing ten obsolete stream URLs.
+- Replaced the France Culture Icecast URL with the Radio France high-quality HLS stream and migrated existing presets at boot.
+- Moved radio reconnect and retry handling into the radio task and kept TFT work out of audio callbacks.
+- Added PSRAM preset caching to avoid concurrent LittleFS reads during playback and station selection.
+- Added atomic LittleFS writes, paired preset-file rollback and interrupted-write recovery at boot.
+- Disabled automatic LittleFS formatting so a mount error cannot silently erase credentials.
+- Added validated restoration and debounced storage of station and volume settings.
+- Serialized ES8388 I2C access, added codec initialization retries and kept hardware codec volume at full PCM precision.
+- Corrected speaker/headphone routing and kept the power amplifier disabled when muted or on headphones.
+- Pinned the build to pioarduino 55.03.38 and Arduino ESP32 3.3.8 for the ESP32-S3 N8R8 target.
