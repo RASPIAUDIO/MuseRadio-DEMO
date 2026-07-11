@@ -59,10 +59,10 @@
 #define ENABLE_USB_DEBUG_CDC 0
 #endif
 
-// Provide a portable console alias: use USB CDC when available, else UART Serial
-// On ESP32-S2/S3 with "USB CDC On Boot" enabled, the core exposes `USBSerial`.
-// For other boards/configs, fall back to `Serial`.
-#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
+// The native USB-OTG CDC object is USBSerial. In USB-Serial/JTAG mode the
+// Arduino core exposes the console as Serial instead, even with CDC on boot.
+#if !defined(ARDUINO_USB_MODE) || ARDUINO_USB_MODE != 0 || \
+    !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
 #define USBSerial Serial
 #endif
 
@@ -73,7 +73,7 @@ PNG png;
 
 
 #ifndef MUSE_FIRMWARE_VERSION
-#define MUSE_FIRMWARE_VERSION "V2.0-rc1"
+#define MUSE_FIRMWARE_VERSION "V2.0-rc2"
 #endif
 
 #ifndef MUSE_IMPROV_VERSION
@@ -4235,9 +4235,17 @@ void setup() {
   /////////////////////////////////////////////////////
   littleFsMounted = LittleFS.begin(false);
   if (!littleFsMounted) {
-    debugPrintf("LittleFS initialisation failed; preserving data and restarting.\n");
-    delay(5000);
-    ESP.restart();
+    // A blank/corrupt data partition used to restart before the TFT was
+    // initialized, leaving the radio apparently dead. Only format after the
+    // non-destructive mount has failed.
+    debugPrintf("LittleFS mount failed; rebuilding local storage.\n");
+    littleFsMounted = LittleFS.begin(true);
+    if (!littleFsMounted) {
+      debugPrintf("LittleFS recovery failed; restarting.\n");
+      delay(5000);
+      ESP.restart();
+    }
+    debugPrintf("LittleFS rebuilt; restoring default local data.\n");
   }
   debugPrintf("LittleFS: used=%u total=%u bytes\n",
               (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());

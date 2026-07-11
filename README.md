@@ -19,12 +19,13 @@ The `radio-and-more` branch combines the stable local internet radio with Spotif
 - Optional Spotify Connect POC build through `cspot`.
 - Optional experimental AirPlay 1/RAOP receiver POC build.
 
-## Radio & more V2.0-rc1
+## Radio & more V2.0-rc2
 
 `muse_radio_radio_and_more` is the integrated product build. Audio ownership is centralized with this priority: USB Audio, Spotify Connect, AirPlay, then internet radio. Only the active source can write PCM or control the ES8388 volume, and the previous radio station resumes after an external source disconnects.
 
 - Local-first radio presets and catalog: no remote station server can overwrite the user's list.
 - Atomic LittleFS updates with recovery for Wi-Fi, presets, volume, station, Spotify auth, and USB display preference.
+- If LittleFS is blank or corrupt, the firmware rebuilds it and restores the local defaults instead of looping before the TFT starts. Saved Wi-Fi and presets cannot be recovered in that case.
 - Captive portal with multiple saved networks, scanned SSIDs, manual hidden-SSID entry, network removal, up to 99 radio presets, and manual stream URLs.
 - Hold the ADC check button for 5 seconds to open settings. ADC buttons 1, 2, and 3 select presets 1, 2, and 3 directly.
 - Spotify Connect metadata is displayed; album art remains experimental.
@@ -178,7 +179,7 @@ Version 1.3 is the captive-portal Wi-Fi release for Muse Radio. It keeps the Ard
 - Optional experimental AirPlay 1/RAOP POC is available in `muse_radio_airplay_poc`.
 - When no saved Wi-Fi network connects, the radio starts a captive setup portal at `http://192.168.4.1` and displays a Wi-Fi QR code on the TFT.
 - The captive portal screen also offers the OK/encoder button as a shortcut to manual credential entry.
-- The integrated firmware displays `V2.0-rc1`.
+- The integrated firmware displays `V2.0-rc2`.
 - Long Wi-Fi passwords wrap onto two lines for readability.
 - `USBSerial` falls back to `Serial` when native USB CDC is not enabled.
 
