@@ -25,7 +25,6 @@ The `radio-and-more` branch combines the stable local internet radio with Spotif
 
 - Local-first radio presets and catalog: no remote station server can overwrite the user's list.
 - Atomic LittleFS updates with recovery for Wi-Fi, presets, volume, station, Spotify auth, and USB display preference.
-- If LittleFS is blank or corrupt, the firmware rebuilds it and restores the local defaults instead of looping before the TFT starts. Saved Wi-Fi and presets cannot be recovered in that case.
 - Captive portal with multiple saved networks, scanned SSIDs, manual hidden-SSID entry, network removal, up to 99 radio presets, and manual stream URLs.
 - Hold the ADC check button for 5 seconds to open settings. ADC buttons 1, 2, and 3 select presets 1, 2, and 3 directly.
 - Spotify Connect metadata is displayed; album art remains experimental.

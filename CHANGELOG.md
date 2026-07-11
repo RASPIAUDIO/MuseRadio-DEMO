@@ -4,7 +4,6 @@
 
 - Disabled the experimental USB Display interface in the integrated build after it left the local TFT black and enumerated with a Windows driver error.
 - Kept the physical TFT, USB Audio and microphone, Spotify Connect, AirPlay, local radio and Wi-Fi portal enabled.
-- Recover a blank or corrupt LittleFS partition automatically, restoring local defaults instead of rebooting before the TFT starts.
 
 ## 2.0-rc1 - Unreleased
 

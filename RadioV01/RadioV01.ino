@@ -4235,17 +4235,9 @@ void setup() {
   /////////////////////////////////////////////////////
   littleFsMounted = LittleFS.begin(false);
   if (!littleFsMounted) {
-    // A blank/corrupt data partition used to restart before the TFT was
-    // initialized, leaving the radio apparently dead. Only format after the
-    // non-destructive mount has failed.
-    debugPrintf("LittleFS mount failed; rebuilding local storage.\n");
-    littleFsMounted = LittleFS.begin(true);
-    if (!littleFsMounted) {
-      debugPrintf("LittleFS recovery failed; restarting.\n");
-      delay(5000);
-      ESP.restart();
-    }
-    debugPrintf("LittleFS rebuilt; restoring default local data.\n");
+    debugPrintf("LittleFS initialisation failed; preserving data and restarting.\n");
+    delay(5000);
+    ESP.restart();
   }
   debugPrintf("LittleFS: used=%u total=%u bytes\n",
               (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
